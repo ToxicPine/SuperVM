@@ -1,6 +1,7 @@
 # SuperVM
 
-> [!WARNING] Experimental Demo, Not Audited! Works on x86_64.
+> [!WARNING]
+> Experimental Demo, Not Audited! Works on x86_64.
 
 SuperVM is an aggressively memory-optimized runner for heterogeneous VMs.
 SuperVM VMs can run different packages, services, etc, but must use NixOS. Any
