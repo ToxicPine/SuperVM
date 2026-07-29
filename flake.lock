@@ -1,0 +1,157 @@
+{
+  "nodes": {
+    "crosvm-super": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "path": "./crosvm-flake",
+        "type": "path"
+      },
+      "original": {
+        "path": "./crosvm-flake",
+        "type": "path"
+      },
+      "parent": []
+    },
+    "microvm-super": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "spectrum": "spectrum"
+      },
+      "locked": {
+        "lastModified": 1785353051,
+        "narHash": "sha256-FhoWwSFQZZTAUgMawW+F2/n5M5W72rHmNqBs3ruwirc=",
+        "owner": "ToxicPine",
+        "repo": "microvm.nix",
+        "rev": "5e4f8868413b69c93a8642a54de880076d332d96",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ToxicPine",
+        "ref": "supervm",
+        "repo": "microvm.nix",
+        "type": "github"
+      }
+    },
+    "microvm-vanilla": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "spectrum": "spectrum_2"
+      },
+      "locked": {
+        "lastModified": 1785246989,
+        "narHash": "sha256-7CjGBACbXXIJvGrPed75QI8ytqc48M78GP9aB/h2VSc=",
+        "owner": "ToxicPine",
+        "repo": "microvm.nix",
+        "rev": "39a499ab85311b56dddb09ec43351cc3658f22c1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ToxicPine",
+        "ref": "main",
+        "repo": "microvm.nix",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1785090369,
+        "narHash": "sha256-m0pDuRJG7EDo9ri+4Ksu83VsI+PlxNC9lNBfydejce4=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "624af665418d3c65d544145b4d34ad696439570e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "crosvm-super": "crosvm-super",
+        "microvm-super": "microvm-super",
+        "microvm-vanilla": "microvm-vanilla",
+        "nixpkgs": "nixpkgs",
+        "snix": "snix"
+      }
+    },
+    "snix": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "snix-src": "snix-src"
+      },
+      "locked": {
+        "path": "./snix-flake",
+        "type": "path"
+      },
+      "original": {
+        "path": "./snix-flake",
+        "type": "path"
+      },
+      "parent": []
+    },
+    "snix-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785179429,
+        "narHash": "sha256-Xk8+Yr+ZAJ1le7grjIhztW15vtprwUOuaaXdI29IJ9I=",
+        "ref": "refs/heads/canon",
+        "rev": "efbc95558ac72105dce13ee7bef679b766d0c69a",
+        "revCount": 22594,
+        "type": "git",
+        "url": "https://git.snix.dev/snix/snix.git"
+      },
+      "original": {
+        "rev": "efbc95558ac72105dce13ee7bef679b766d0c69a",
+        "type": "git",
+        "url": "https://git.snix.dev/snix/snix.git"
+      }
+    },
+    "spectrum": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783694892,
+        "narHash": "sha256-xO8f7Qng+18FK2UlB9vcrkxCaQMCt5WjCH24aW/11eg=",
+        "ref": "refs/heads/main",
+        "rev": "24c4346e30fdea8d8e80f34aec3554a15a667d24",
+        "revCount": 1410,
+        "type": "git",
+        "url": "https://spectrum-os.org/git/spectrum"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://spectrum-os.org/git/spectrum"
+      }
+    },
+    "spectrum_2": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783694892,
+        "narHash": "sha256-xO8f7Qng+18FK2UlB9vcrkxCaQMCt5WjCH24aW/11eg=",
+        "ref": "refs/heads/main",
+        "rev": "24c4346e30fdea8d8e80f34aec3554a15a667d24",
+        "revCount": 1410,
+        "type": "git",
+        "url": "https://spectrum-os.org/git/spectrum"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://spectrum-os.org/git/spectrum"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

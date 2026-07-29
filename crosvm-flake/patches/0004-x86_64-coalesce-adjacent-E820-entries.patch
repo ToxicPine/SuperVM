@@ -1,0 +1,93 @@
+From 563ea3efc07273fa9250a7852c2f39dc4f6366ce Mon Sep 17 00:00:00 2001
+From: Arbion Halili <99731180+ToxicPine@users.noreply.github.com>
+Date: Wed, 29 Jul 2026 00:57:48 +0100
+Subject: [PATCH 4/6] x86_64: coalesce adjacent E820 entries
+
+Merge adjacent E820 entries of the same type so private/shared host-backing
+boundaries do not become guest-visible firmware boundaries.
+---
+ x86_64/src/lib.rs | 54 ++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/x86_64/src/lib.rs b/x86_64/src/lib.rs
+index 80b739927..c580e8fe3 100644
+--- a/x86_64/src/lib.rs
++++ b/x86_64/src/lib.rs
+@@ -396,7 +396,7 @@ impl SetupDataEntries {
+     }
+ }
+ 
+-#[derive(Copy, Clone, Debug)]
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+ enum E820Type {
+     Ram = 0x01,
+     Reserved = 0x2,
+@@ -832,6 +832,20 @@ fn add_e820_entry(
+     range: AddressRange,
+     mem_type: E820Type,
+ ) -> Result<()> {
++    if let Some(previous) = e820_entries.last_mut() {
++        let previous_end = previous
++            .address
++            .checked_add(previous.len)
++            .ok_or(Error::E820Configuration)?;
++        if previous.mem_type == mem_type && previous_end.offset() == range.start {
++            previous.len = previous
++                .len
++                .checked_add(range.len().ok_or(Error::E820Configuration)?)
++                .ok_or(Error::E820Configuration)?;
++            return Ok(());
++        }
++    }
++
+     e820_entries.push(E820Entry {
+         address: GuestAddress(range.start),
+         len: range.len().ok_or(Error::E820Configuration)?,
+@@ -2602,6 +2616,44 @@ mod tests {
+         create_arch_memory_layout(&pci_config, false).unwrap()
+     }
+ 
++    #[test]
++    fn adjacent_e820_entries_with_the_same_type_are_coalesced() {
++        let mut entries = Vec::new();
++        add_e820_entry(
++            &mut entries,
++            AddressRange {
++                start: 0x1000,
++                end: 0x1fff,
++            },
++            E820Type::Ram,
++        )
++        .unwrap();
++        add_e820_entry(
++            &mut entries,
++            AddressRange {
++                start: 0x2000,
++                end: 0x2fff,
++            },
++            E820Type::Ram,
++        )
++        .unwrap();
++        add_e820_entry(
++            &mut entries,
++            AddressRange {
++                start: 0x3000,
++                end: 0x3fff,
++            },
++            E820Type::Reserved,
++        )
++        .unwrap();
++
++        assert_eq!(entries.len(), 2);
++        assert_eq!(entries[0].address, GuestAddress(0x1000));
++        assert_eq!(entries[0].len, 0x2000);
++        assert_eq!(entries[1].address, GuestAddress(0x3000));
++        assert_eq!(entries[1].len, 0x1000);
++    }
++
+     #[test]
+     fn regions_lt_4gb_nobios() {
+         let arch_memory_layout = setup();
+-- 
+2.51.2
+

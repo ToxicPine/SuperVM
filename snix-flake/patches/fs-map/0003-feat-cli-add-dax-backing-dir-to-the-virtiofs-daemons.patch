@@ -1,0 +1,126 @@
+From 15e6e8b9b0c1e20e689fada61da99736674a950d Mon Sep 17 00:00:00 2001
+From: SuperVM <supervm@localhost>
+Date: Tue, 28 Jul 2026 13:43:32 +0100
+Subject: [PATCH 3/6] feat(cli): configure the DAX backing directory
+
+Add `--dax-backing-dir` to both virtio-fs commands. Supplying a shared
+directory enables DAX mappings and cross-guest page sharing; omitting it keeps
+the ordinary read path.
+
+Change-Id: I9993fed69653dd8593e35aba6232e32ef7e17e83
+---
+ snix/cli/castore/src/main.rs | 27 ++++++++++++++++++++++++++-
+ snix/cli/store/src/main.rs   | 26 +++++++++++++++++++++++++-
+ 2 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/snix/cli/castore/src/main.rs b/snix/cli/castore/src/main.rs
+index f5cece6..1f9f4b1 100644
+--- a/snix/cli/castore/src/main.rs
++++ b/snix/cli/castore/src/main.rs
+@@ -86,6 +86,19 @@ enum Commands {
+         #[arg(long, default_value_t = true)]
+         /// Whether to expose blob and directory digests as extended attributes.
+         show_xattr: bool,
++
++        /// Directory backing DAX mappings. Enables serving the guest's file
++        /// contents through the VMM's DAX window instead of copying them
++        /// through read requests.
++        ///
++        /// Blobs are materialized into this directory on demand and are keyed
++        /// by their digest, so pointing several daemons at one directory lets
++        /// their guests share host page cache for the blobs they both map.
++        ///
++        /// Without this, mapping requests are declined and guests fall back to
++        /// ordinary reads.
++        #[clap(long, value_name = "PATH")]
++        dax_backing_dir: Option<PathBuf>,
+     },
+ }
+ 
+@@ -251,11 +264,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+             service_addrs,
+             uid_gid,
+             show_xattr,
++            dax_backing_dir,
+         } => {
+             let (blob_service, directory_service) =
+                 snix_castore::utils::construct_services(service_addrs).await?;
+ 
+-            use snix_castore::fs::{FSSettings, SnixStoreFs, virtiofs::start_virtiofs_daemon};
++            use snix_castore::fs::{
++                FSSettings, SnixStoreFs, dax::DaxCache, virtiofs::start_virtiofs_daemon,
++            };
+ 
+             let digest = digest.parse()?;
+             let directory = directory_service
+@@ -275,6 +291,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+                     },
+                     tokio::runtime::Handle::current(),
+                 );
++
++                let fs = match dax_backing_dir {
++                    Some(dir) => {
++                        tracing::info!(dax_backing_dir=?dir, "serving DAX mappings");
++                        fs.with_dax_cache(DaxCache::new(dir)?)
++                    }
++                    None => fs,
++                };
++
+                 tracing::info!(socket_path=?socket, "starting virtiofs-daemon");
+ 
+                 start_virtiofs_daemon(fs, socket)
+diff --git a/snix/cli/store/src/main.rs b/snix/cli/store/src/main.rs
+index 8187bab..c7d09ec 100644
+--- a/snix/cli/store/src/main.rs
++++ b/snix/cli/store/src/main.rs
+@@ -196,6 +196,19 @@ enum Commands {
+         #[arg(long, default_value_t = true)]
+         /// Whether to expose blob and directory digests as extended attributes.
+         show_xattr: bool,
++
++        /// Directory backing DAX mappings. Enables serving the guest's file
++        /// contents through the VMM's DAX window instead of copying them
++        /// through read requests.
++        ///
++        /// Blobs are materialized into this directory on demand and are keyed
++        /// by their digest, so pointing several daemons at one directory lets
++        /// their guests share host page cache for the blobs they both map.
++        ///
++        /// Without this, mapping requests are declined and guests fall back to
++        /// ordinary reads.
++        #[clap(long, value_name = "PATH")]
++        dax_backing_dir: Option<PathBuf>,
+     },
+ }
+ 
+@@ -676,11 +689,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+             list_root,
+             uid_gid,
+             show_xattr,
++            dax_backing_dir,
+         } => {
+             let (blob_service, directory_service, path_info_service, _nar_calculation_service) =
+                 snix_store::utils::construct_services(service_addrs).await?;
+ 
+-            use snix_castore::fs::{FSSettings, SnixStoreFs, virtiofs::start_virtiofs_daemon};
++            use snix_castore::fs::{
++                FSSettings, SnixStoreFs, dax::DaxCache, virtiofs::start_virtiofs_daemon,
++            };
+ 
+             let fs = SnixStoreFs::new(
+                 blob_service,
+@@ -694,6 +710,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                 tokio::runtime::Handle::current(),
+             );
+ 
++            let fs = match dax_backing_dir {
++                Some(dir) => {
++                    info!(dax_backing_dir=?dir, "serving DAX mappings");
++                    fs.with_dax_cache(DaxCache::new(dir)?)
++                }
++                None => fs,
++            };
++
+             tokio::task::spawn_blocking(move || {
+                 info!(socket_path=?socket, "starting virtiofs-daemon");
+ 

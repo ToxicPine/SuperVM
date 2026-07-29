@@ -1,0 +1,125 @@
+From d5ae251202db60c744f51c32fb627dc595a8bf4b Mon Sep 17 00:00:00 2001
+From: Arbion Halili <99731180+ToxicPine@users.noreply.github.com>
+Date: Tue, 28 Jul 2026 22:27:20 +0100
+Subject: [PATCH 4/4] fix(castore/fs): complete failed descriptors
+
+Return invalid descriptor chains and failed filesystem requests to the used
+ring with zero length instead of abandoning the queue.
+
+Change-Id: Ia5c6902c3ef854572651afef9f7a5b23426c1899
+---
+ snix/castore/src/fs/virtiofs.rs | 83 +++++++++++++++++++++------------
+ 1 file changed, 54 insertions(+), 29 deletions(-)
+
+diff --git a/snix/castore/src/fs/virtiofs.rs b/snix/castore/src/fs/virtiofs.rs
+index a7dffdcac..64e76536a 100644
+--- a/snix/castore/src/fs/virtiofs.rs
++++ b/snix/castore/src/fs/virtiofs.rs
+@@ -113,11 +113,6 @@ enum Error {
+     HandleEventNotEpollIn,
+     /// Failed to handle unknown event.
+     HandleEventUnknownEvent,
+-    /// Invalid descriptor chain.
+-    InvalidDescriptorChain,
+-    /// Failed to handle filesystem requests.
+-    #[allow(dead_code)]
+-    HandleRequests(fuse_backend_rs::Error),
+     /// Failed to construct new vhost user daemon.
+     NewDaemon,
+     /// Failed to create the vhost-user socket listener.
+@@ -158,6 +153,17 @@ impl<FS> VhostUserFsBackend<FS>
+ where
+     FS: FileSystem + Send + Sync,
+ {
++    fn complete_descriptor(
++        vring: &mut MutexGuard<VringState>,
++        memory: &GuestMemoryMmap,
++        head_index: u16,
++        len: u32,
++    ) {
++        if let Err(error) = vring.get_queue_mut().add_used(memory, head_index, len) {
++            error!(?error, head_index, "failed to add descriptor to used ring");
++        }
++    }
++
+     fn process_queue(&mut self, vring: &mut MutexGuard<VringState>) -> std::io::Result<bool> {
+         let mut used_descs = false;
+ 
+@@ -166,34 +172,53 @@ where
+             .pop_descriptor_chain(self.guest_mem.memory())
+         {
+             let memory = desc_chain.memory();
+-            let reader = Reader::from_descriptor_chain(memory, desc_chain.clone())
+-                .map_err(|_| Error::InvalidDescriptorChain)?;
+-            let writer = VirtioFsWriter::new(memory, desc_chain.clone())
+-                .map_err(|_| Error::InvalidDescriptorChain)?;
++            let head_index = desc_chain.head_index();
++            let reader = match Reader::from_descriptor_chain(memory, desc_chain.clone()) {
++                Ok(reader) => reader,
++                Err(error) => {
++                    error!(
++                        ?error,
++                        head_index, "completing invalid readable descriptor chain"
++                    );
++                    Self::complete_descriptor(vring, memory, head_index, 0);
++                    used_descs = true;
++                    continue;
++                }
++            };
++            let writer = match VirtioFsWriter::new(memory, desc_chain.clone()) {
++                Ok(writer) => writer,
++                Err(error) => {
++                    error!(
++                        ?error,
++                        head_index, "completing invalid writable descriptor chain"
++                    );
++                    Self::complete_descriptor(vring, memory, head_index, 0);
++                    used_descs = true;
++                    continue;
++                }
++            };
+ 
+             // Report the bytes written back through the used ring; recent
+             // kernels reject responses shorter than `fuse_out_header`.
+-            let len = self
+-                .server
+-                .handle_message(
+-                    reader,
+-                    writer.into(),
+-                    self.cache_req
+-                        .as_mut()
+-                        .map(|req| req as &mut dyn FsCacheReqHandler),
+-                    None,
+-                )
+-                .map_err(Error::HandleRequests)?;
+-
+-            if let Err(error) =
+-                vring
+-                    .get_queue_mut()
+-                    .add_used(memory, desc_chain.head_index(), len as u32)
+-            {
+-                error!(?error, "failed to add desc back to ring");
+-            }
++            let len = match self.server.handle_message(
++                reader,
++                writer.into(),
++                self.cache_req
++                    .as_mut()
++                    .map(|req| req as &mut dyn FsCacheReqHandler),
++                None,
++            ) {
++                Ok(len) => len,
++                Err(error) => {
++                    error!(?error, head_index, "completing failed filesystem request");
++                    Self::complete_descriptor(vring, memory, head_index, 0);
++                    used_descs = true;
++                    continue;
++                }
++            };
++
++            Self::complete_descriptor(vring, memory, head_index, len as u32);
+ 
+-            // TODO: What happens if we error out before here?
+             used_descs = true;
+         }
+ 

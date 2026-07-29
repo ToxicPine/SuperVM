@@ -1,0 +1,1395 @@
+From 1280f8312d0b9ee6390c906526e495289fee90a0 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <99731180+ToxicPine@users.noreply.github.com>
+Date: Wed, 29 Jul 2026 00:57:14 +0100
+Subject: [PATCH 2/6] vm_memory: support private anonymous regions
+
+Allow guest memory to mix descriptor-backed shared RAM with private anonymous
+RAM. Omit private regions from vhost-user tables, validate KSM ranges, and
+handle descriptor absence, discard, and snapshots explicitly.
+---
+ devices/src/virtio/media.rs                   |   2 +-
+ devices/src/virtio/vhost_user_frontend/mod.rs |  27 +-
+ devices/src/virtio/video/resource.rs          |   2 +-
+ hypervisor/src/gunyah/mod.rs                  |  13 +-
+ swap/src/controller.rs                        |  12 +-
+ swap/src/page_handler.rs                      |   2 +-
+ vm_memory/src/guest_memory.rs                 | 483 ++++++++++++++----
+ vm_memory/src/guest_memory/sys.rs             |   3 +-
+ vm_memory/src/guest_memory/sys/linux.rs       | 123 ++++-
+ vm_memory/src/guest_memory/sys/windows.rs     |   7 +
+ vm_memory/src/udmabuf/mod.rs                  |   4 +-
+ vm_memory/src/udmabuf/sys/linux.rs            |  10 +-
+ x86_64/src/lib.rs                             |  69 +--
+ 13 files changed, 582 insertions(+), 175 deletions(-)
+
+diff --git a/devices/src/virtio/media.rs b/devices/src/virtio/media.rs
+index 89603f449..018f74444 100644
+--- a/devices/src/virtio/media.rs
++++ b/devices/src/virtio/media.rs
+@@ -237,7 +237,7 @@ impl GuestMemoryMapping {
+             let len = len.next_multiple_of(page_size) as usize;
+             // TODO: find the offset from the region, this assumes a single
+             // region starting at address 0.
+-            let fd = mem.offset_region(region_first_page)?;
++            let fd = mem.backing_descriptor_at_offset(region_first_page)?;
+             // Always map whole pages
+             arena.add_fd_offset(pos, len, fd, region_first_page)?;
+ 
+diff --git a/devices/src/virtio/vhost_user_frontend/mod.rs b/devices/src/virtio/vhost_user_frontend/mod.rs
+index 802c4dd30..536ba45b0 100644
+--- a/devices/src/virtio/vhost_user_frontend/mod.rs
++++ b/devices/src/virtio/vhost_user_frontend/mod.rs
+@@ -17,6 +17,7 @@ use std::io::Write;
+ use anyhow::bail;
+ use anyhow::Context;
+ use base::error;
++use base::info;
+ use base::trace;
+ use base::AsRawDescriptor;
+ #[cfg(windows)]
+@@ -235,17 +236,31 @@ impl VhostUserFrontend {
+     }
+ 
+     fn set_mem_table(&mut self, mem: &GuestMemory) -> Result<()> {
++        let total_region_count = mem.regions().count();
+         let regions: Vec<_> = mem
+             .regions()
+-            .map(|region| VhostUserMemoryRegionInfo {
+-                guest_phys_addr: region.guest_addr.0,
+-                memory_size: region.size as u64,
+-                userspace_addr: region.host_addr as u64,
+-                mmap_offset: region.shm_offset,
+-                mmap_handle: region.shm.as_raw_descriptor(),
++            .filter_map(|region| {
++                region
++                    .backing
++                    .descriptor()
++                    .map(|descriptor| VhostUserMemoryRegionInfo {
++                        guest_phys_addr: region.guest_addr.0,
++                        memory_size: region.size as u64,
++                        userspace_addr: region.host_addr as u64,
++                        mmap_offset: region.backing_offset,
++                        mmap_handle: descriptor.as_raw_descriptor(),
++                    })
+             })
+             .collect();
+ 
++        let omitted_region_count = total_region_count - regions.len();
++        if omitted_region_count != 0 {
++            info!(
++                "omitting {omitted_region_count} descriptorless guest memory region(s) from the \
++                 vhost-user memory table"
++            );
++        }
++
+         self.backend_client
+             .set_mem_table(regions.as_slice())
+             .map_err(Error::SetMemTable)?;
+diff --git a/devices/src/virtio/video/resource.rs b/devices/src/virtio/video/resource.rs
+index 26fce39ef..d6ed6bad5 100644
+--- a/devices/src/virtio/video/resource.rs
++++ b/devices/src/virtio/video/resource.rs
+@@ -224,7 +224,7 @@ impl GuestResource {
+             Some(entry) => {
+                 let addr: u64 = entry.addr.into();
+ 
+-                mem.shm_region(GuestAddress(addr))
++                mem.backing_descriptor(GuestAddress(addr))
+                     .map_err(GuestMemResourceCreationError::CantGetShmRegion)?
+             }
+         };
+diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
+index 9b36276bf..fa313cc33 100644
+--- a/hypervisor/src/gunyah/mod.rs
++++ b/hypervisor/src/gunyah/mod.rs
+@@ -269,15 +269,22 @@ impl GunyahVm {
+             // already been handled.
+             if let Some(file_backed) = &region.options.file_backed {
+                 if !cma_mapped {
++                    let backing_descriptor = region
++                        .backing
++                        .descriptor()
++                        .ok_or_else(|| Error::new(EINVAL))?;
+                     map_cma_region(
+                         &vm_descriptor,
+                         region.index as MemSlot,
+                         lend,
+                         !file_backed.writable,
+                         region.guest_addr.offset(),
+-                        region.shm.as_raw_descriptor().try_into().unwrap(),
+-                        region.size.try_into().unwrap(),
+-                        region.shm_offset,
++                        backing_descriptor
++                            .as_raw_descriptor()
++                            .try_into()
++                            .map_err(|_| Error::new(EOVERFLOW))?,
++                        region.size.try_into().map_err(|_| Error::new(EOVERFLOW))?,
++                        region.backing_offset,
+                     )?;
+                     cma_mapped = true;
+                     continue;
+diff --git a/swap/src/controller.rs b/swap/src/controller.rs
+index c82661417..45f944b35 100644
+--- a/swap/src/controller.rs
++++ b/swap/src/controller.rs
+@@ -83,7 +83,11 @@ fn count_resident_pages(guest_memory: &GuestMemory) -> usize {
+     let mut pages = 0;
+     for region in guest_memory.regions() {
+         let mut resident_bytes = 0u64;
+-        for range in FileDataIterator::new(region.shm, region.shm_offset, region.size as u64) {
++        let Some(descriptor) = region.backing.descriptor() else {
++            error!("failed to count resident pages: guest memory has no backing descriptor");
++            return 0;
++        };
++        for range in FileDataIterator::new(descriptor, region.backing_offset, region.size as u64) {
+             let range = match range {
+                 Ok(r) => r,
+                 Err(e) => {
+@@ -840,6 +844,10 @@ fn move_guest_to_staging(
+     let mut pages = 0;
+ 
+     let result = guest_memory.regions().try_for_each(|region| {
++        let descriptor = region
++            .backing
++            .descriptor()
++            .context("guest memory has no backing descriptor")?;
+         // SAFETY:
+         // safe because:
+         // * all the regions are registered to all userfaultfd
+@@ -847,7 +855,7 @@ fn move_guest_to_staging(
+         // * page fault events are handled by PageHandler
+         // * wait for all the copy completed within _processes_guard
+         pages += unsafe {
+-            page_handler.move_to_staging(region.host_addr, region.shm, region.shm_offset)
++            page_handler.move_to_staging(region.host_addr, descriptor, region.backing_offset)
+         }
+         .context("move to staging")? as u64;
+         Ok(())
+diff --git a/swap/src/page_handler.rs b/swap/src/page_handler.rs
+index c48d4641f..aa7431637 100644
+--- a/swap/src/page_handler.rs
++++ b/swap/src/page_handler.rs
+@@ -411,7 +411,7 @@ impl<'a> PageHandler<'a> {
+         base_offset: u64,
+     ) -> Result<usize>
+     where
+-        T: AsRawDescriptor,
++        T: AsRawDescriptor + ?Sized,
+     {
+         let hugepage_size = *THP_SIZE;
+         let mut ctx = self.ctx.lock();
+diff --git a/vm_memory/src/guest_memory.rs b/vm_memory/src/guest_memory.rs
+index f584dd583..5adc76b80 100644
+--- a/vm_memory/src/guest_memory.rs
++++ b/vm_memory/src/guest_memory.rs
+@@ -71,12 +71,22 @@ pub enum Error {
+     MemoryMappingFailed(#[source] MmapError),
+     #[error("guest memory region {0}+{1:#x} is not page aligned")]
+     MemoryNotAligned(GuestAddress, u64),
++    #[error("guest memory region is not backed by private anonymous memory")]
++    MemoryRegionNotPrivateAnonymous,
+     #[error("memory regions overlap")]
+     MemoryRegionOverlap,
+     #[error("memory region size {0} is too large")]
+     MemoryRegionTooLarge(u128),
++    #[error("guest memory region has no backing descriptor")]
++    MemoryRegionWithoutDescriptor,
++    #[error("private anonymous guest memory does not support file-backed regions")]
++    PrivateMemoryFileBacking,
++    #[error("private anonymous guest memory is not supported on this platform")]
++    PrivateMemoryUnsupported,
+     #[error("punch hole failed {0}")]
+     PunchHole(#[source] base::Error),
++    #[error("shared memory pool missing for a shared RAM region")]
++    SharedMemoryPoolMissing,
+     #[error("incomplete read of {completed} instead of {expected} bytes")]
+     ShortRead { expected: usize, completed: usize },
+     #[error("incomplete write of {completed} instead of {expected} bytes")]
+@@ -89,39 +99,32 @@ pub enum Error {
+ 
+ pub type Result<T> = result::Result<T, Error>;
+ 
+-/// A file-like object backing `MemoryRegion`.
++/// The host-memory object backing a `MemoryRegion`.
+ #[derive(Clone, Debug)]
+ pub enum BackingObject {
++    PrivateAnonymous,
+     Shm(Arc<SharedMemory>),
+     File(Arc<File>),
+ }
+ 
+-impl AsRawDescriptor for BackingObject {
+-    fn as_raw_descriptor(&self) -> RawDescriptor {
++impl BackingObject {
++    pub fn descriptor(&self) -> Option<&(dyn AsRawDescriptor + Sync + Send + 'static)> {
+         match self {
+-            Self::Shm(shm) => shm.as_raw_descriptor(),
+-            Self::File(f) => f.as_raw_descriptor(),
++            BackingObject::PrivateAnonymous => None,
++            BackingObject::Shm(shm) => Some(shm.as_ref()),
++            BackingObject::File(f) => Some(f.as_ref()),
+         }
+     }
+ }
+ 
+-impl AsRef<dyn AsRawDescriptor + Sync + Send> for BackingObject {
+-    fn as_ref(&self) -> &(dyn AsRawDescriptor + Sync + Send + 'static) {
+-        match self {
+-            BackingObject::Shm(shm) => shm.as_ref(),
+-            BackingObject::File(f) => f.as_ref(),
+-        }
+-    }
+-}
+-
+-/// For MemoryRegion::regions
++/// Description of a guest memory region returned by [`GuestMemory::regions`].
+ pub struct MemoryRegionInformation<'a> {
+     pub index: usize,
+     pub guest_addr: GuestAddress,
+     pub size: usize,
+     pub host_addr: usize,
+-    pub shm: &'a BackingObject,
+-    pub shm_offset: u64,
++    pub backing: &'a BackingObject,
++    pub backing_offset: u64,
+     pub options: MemoryRegionOptions,
+ }
+ 
+@@ -146,6 +149,19 @@ pub enum MemoryRegionPurpose {
+     StaticSwiotlbRegion,
+ }
+ 
++/// Host backing used for an ordinary RAM region.
++///
++/// File-backed regions are configured separately by
++/// [`MemoryRegionOptions::file_backed`].
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
++pub enum RamBacking {
++    /// Descriptor-backed shared memory suitable for out-of-process devices.
++    #[default]
++    Shared,
++    /// Private anonymous memory that remains local to the VMM process.
++    PrivateAnonymous,
++}
++
+ #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues, PartialEq, Eq, PartialOrd, Ord)]
+ #[serde(deny_unknown_fields)]
+ pub struct FileBackedMappingParameters {
+@@ -178,6 +194,8 @@ pub struct MemoryRegionOptions {
+     pub align: u64,
+     /// Backing file params.
+     pub file_backed: Option<FileBackedMappingParameters>,
++    /// Host backing used when `file_backed` is not set.
++    pub ram_backing: RamBacking,
+ }
+ 
+ impl MemoryRegionOptions {
+@@ -199,6 +217,15 @@ impl MemoryRegionOptions {
+         self.file_backed = Some(params);
+         self
+     }
++
++    pub fn ram_backing(mut self, backing: RamBacking) -> Self {
++        self.ram_backing = backing;
++        self
++    }
++
++    fn uses_shared_memory_pool(&self) -> bool {
++        self.file_backed.is_none() && self.ram_backing == RamBacking::Shared
++    }
+ }
+ 
+ /// A regions of memory mapped memory.
+@@ -209,8 +236,8 @@ pub struct MemoryRegion {
+     mapping: MemoryMapping,
+     guest_base: GuestAddress,
+ 
+-    shared_obj: BackingObject,
+-    obj_offset: u64,
++    backing: BackingObject,
++    backing_offset: u64,
+ 
+     options: MemoryRegionOptions,
+ }
+@@ -232,8 +259,8 @@ impl MemoryRegion {
+         Ok(MemoryRegion {
+             mapping,
+             guest_base,
+-            shared_obj: BackingObject::Shm(shm),
+-            obj_offset: offset,
++            backing: BackingObject::Shm(shm),
++            backing_offset: offset,
+             options: Default::default(),
+         })
+     }
+@@ -254,8 +281,8 @@ impl MemoryRegion {
+         Ok(MemoryRegion {
+             mapping,
+             guest_base,
+-            shared_obj: BackingObject::File(file),
+-            obj_offset: offset,
++            backing: BackingObject::File(file),
++            backing_offset: offset,
+             options: Default::default(),
+         })
+     }
+@@ -282,8 +309,7 @@ impl MemoryRegion {
+     }
+ }
+ 
+-/// Tracks memory regions and where they are mapped in the guest, along with shm
+-/// descriptors of the underlying memory regions.
++/// Tracks memory regions, their guest mappings, and their host-memory backing.
+ #[derive(Clone, Debug)]
+ pub struct GuestMemory {
+     regions: Arc<[MemoryRegion]>,
+@@ -292,24 +318,33 @@ pub struct GuestMemory {
+ }
+ 
+ impl AsRawDescriptors for GuestMemory {
+-    /// USE WITH CAUTION, the descriptors returned here are not necessarily
+-    /// files!
++    /// Returns descriptors for regions that have a descriptor-backed object.
++    ///
++    /// Private anonymous regions are intentionally omitted: this trait represents an arbitrary
++    /// descriptor set, and there is no descriptor that could preserve those mappings across a
++    /// process boundary.
+     fn as_raw_descriptors(&self) -> Vec<RawDescriptor> {
+         self.regions
+             .iter()
+-            .map(|r| r.shared_obj.as_raw_descriptor())
++            .filter_map(|region| {
++                region
++                    .backing
++                    .descriptor()
++                    .map(|descriptor| descriptor.as_raw_descriptor())
++            })
+             .collect()
+     }
+ }
+ 
+ impl GuestMemory {
+     /// Creates backing shm for GuestMemory regions
+-    fn create_shm(ranges: &[(GuestAddress, u64, MemoryRegionOptions)]) -> Result<SharedMemory> {
++    fn create_shm(
++        ranges: &[(GuestAddress, u64, MemoryRegionOptions)],
++    ) -> Result<Option<SharedMemory>> {
+         let mut aligned_size = 0;
+         let pg_size = pagesize();
+         for range in ranges {
+-            if range.2.file_backed.is_some() {
+-                // Regions with a backing file don't use part of the `SharedMemory`.
++            if !range.2.uses_shared_memory_pool() {
+                 continue;
+             }
+             if range.1 % pg_size as u64 != 0 {
+@@ -319,6 +354,10 @@ impl GuestMemory {
+             aligned_size += range.1;
+         }
+ 
++        if aligned_size == 0 {
++            return Ok(None);
++        }
++
+         // NOTE: Some tests rely on the GuestMemory's name when capturing metrics.
+         let name = "crosvm_guest";
+         // Shm must be mut even though it is only updated on Unix systems.
+@@ -327,7 +366,7 @@ impl GuestMemory {
+ 
+         sys::finalize_shm(&mut shm)?;
+ 
+-        Ok(shm)
++        Ok(Some(shm))
+     }
+ 
+     /// Creates a container for guest memory regions.
+@@ -335,63 +374,87 @@ impl GuestMemory {
+     pub fn new_with_options(
+         ranges: &[(GuestAddress, u64, MemoryRegionOptions)],
+     ) -> Result<GuestMemory> {
+-        // Create shm
+-        let shm = Arc::new(GuestMemory::create_shm(ranges)?);
++        let page_size = pagesize() as u64;
++        for (address, size, options) in ranges {
++            if *size == 0 {
++                return Err(Error::InvalidSize(0));
++            }
++            if options.ram_backing == RamBacking::PrivateAnonymous
++                && (address.0 % page_size != 0 || size % page_size != 0)
++            {
++                return Err(Error::MemoryNotAligned(*address, *size));
++            }
++            if options.ram_backing == RamBacking::PrivateAnonymous && options.file_backed.is_some()
++            {
++                return Err(Error::PrivateMemoryFileBacking);
++            }
++        }
+ 
+-        // Create memory regions
+-        let mut regions = Vec::<MemoryRegion>::new();
++        let shm = GuestMemory::create_shm(ranges)?.map(Arc::new);
+         let mut shm_offset = 0;
++        let mut regions = Vec::<MemoryRegion>::with_capacity(ranges.len());
+ 
+-        for range in ranges {
++        for (guest_base, range_size, options) in ranges {
+             if let Some(last) = regions.last() {
+                 if last
+                     .guest_base
+                     .checked_add(last.mapping.size() as u64)
+-                    .is_none_or(|a| a > range.0)
++                    .is_none_or(|end| end > *guest_base)
+                 {
+                     return Err(Error::MemoryRegionOverlap);
+                 }
+             }
+ 
+-            let size = usize::try_from(range.1)
+-                .map_err(|_| Error::MemoryRegionTooLarge(range.1 as u128))?;
+-            if let Some(file_backed) = &range.2.file_backed {
+-                assert_eq!(usize::try_from(file_backed.size).unwrap(), size);
+-                let file = file_backed.open().map_err(Error::FiledBackedOpenFailed)?;
+-                let mapping = MemoryMappingBuilder::new(size)
+-                    .from_file(&file)
+-                    .offset(file_backed.offset)
+-                    .align(range.2.align)
+-                    .protection(if file_backed.writable {
+-                        base::Protection::read_write()
+-                    } else {
+-                        base::Protection::read()
+-                    })
+-                    .build()
+-                    .map_err(Error::FiledBackedMemoryMappingFailed)?;
+-                regions.push(MemoryRegion {
+-                    mapping,
+-                    guest_base: range.0,
+-                    shared_obj: BackingObject::File(Arc::new(file)),
+-                    obj_offset: file_backed.offset,
+-                    options: range.2.clone(),
+-                });
+-            } else {
+-                let mapping = MemoryMappingBuilder::new(size)
+-                    .from_shared_memory(shm.as_ref())
+-                    .offset(shm_offset)
+-                    .align(range.2.align)
+-                    .build()
+-                    .map_err(Error::MemoryMappingFailed)?;
+-                regions.push(MemoryRegion {
+-                    mapping,
+-                    guest_base: range.0,
+-                    shared_obj: BackingObject::Shm(shm.clone()),
+-                    obj_offset: shm_offset,
+-                    options: range.2.clone(),
+-                });
+-                shm_offset += size as u64;
+-            }
++            let size = usize::try_from(*range_size)
++                .map_err(|_| Error::MemoryRegionTooLarge(*range_size as u128))?;
++            let (mapping, backing, backing_offset) =
++                match (&options.file_backed, options.ram_backing) {
++                    (Some(file_backed), _) => {
++                        assert_eq!(usize::try_from(file_backed.size).unwrap(), size);
++                        let file = file_backed.open().map_err(Error::FiledBackedOpenFailed)?;
++                        let mapping = MemoryMappingBuilder::new(size)
++                            .from_file(&file)
++                            .offset(file_backed.offset)
++                            .align(options.align)
++                            .protection(if file_backed.writable {
++                                base::Protection::read_write()
++                            } else {
++                                base::Protection::read()
++                            })
++                            .build()
++                            .map_err(Error::FiledBackedMemoryMappingFailed)?;
++                        (
++                            mapping,
++                            BackingObject::File(Arc::new(file)),
++                            file_backed.offset,
++                        )
++                    }
++                    (None, RamBacking::Shared) => {
++                        let shm = shm.as_ref().ok_or(Error::SharedMemoryPoolMissing)?;
++                        let offset = shm_offset;
++                        shm_offset += size as u64;
++                        let mapping = MemoryMappingBuilder::new(size)
++                            .from_shared_memory(shm.as_ref())
++                            .offset(offset)
++                            .align(options.align)
++                            .build()
++                            .map_err(Error::MemoryMappingFailed)?;
++                        (mapping, BackingObject::Shm(shm.clone()), offset)
++                    }
++                    (None, RamBacking::PrivateAnonymous) => (
++                        sys::create_private_anonymous_mapping(size, options.align)?,
++                        BackingObject::PrivateAnonymous,
++                        0,
++                    ),
++                };
++
++            regions.push(MemoryRegion {
++                mapping,
++                guest_base: *guest_base,
++                backing,
++                backing_offset,
++                options: options.clone(),
++            });
+         }
+ 
+         Ok(GuestMemory {
+@@ -532,7 +595,7 @@ impl GuestMemory {
+         self.regions.len() as u64
+     }
+ 
+-    pub fn regions(&self) -> impl Iterator<Item = MemoryRegionInformation> {
++    pub fn regions(&self) -> impl Iterator<Item = MemoryRegionInformation<'_>> {
+         self.regions
+             .iter()
+             .enumerate()
+@@ -541,8 +604,8 @@ impl GuestMemory {
+                 guest_addr: region.start(),
+                 size: region.mapping.size(),
+                 host_addr: region.mapping.as_ptr() as usize,
+-                shm: &region.shared_obj,
+-                shm_offset: region.obj_offset,
++                backing: &region.backing,
++                backing_offset: region.backing_offset,
+                 options: region.options.clone(),
+             })
+     }
+@@ -878,8 +941,8 @@ impl GuestMemory {
+         )
+     }
+ 
+-    /// Returns a reference to the region that backs the given address.
+-    pub fn shm_region(
++    /// Returns the descriptor for the backing object at `guest_addr`.
++    pub fn backing_descriptor(
+         &self,
+         guest_addr: GuestAddress,
+     ) -> Result<&(dyn AsRawDescriptor + Send + Sync)> {
+@@ -887,12 +950,20 @@ impl GuestMemory {
+             .iter()
+             .find(|region| region.contains(guest_addr))
+             .ok_or(Error::InvalidGuestAddress(guest_addr))
+-            .map(|region| region.shared_obj.as_ref())
++            .and_then(|region| {
++                region
++                    .backing
++                    .descriptor()
++                    .ok_or(Error::MemoryRegionWithoutDescriptor)
++            })
+     }
+ 
+     /// Returns the region that contains the memory at `offset` from the base of guest memory.
+-    pub fn offset_region(&self, offset: u64) -> Result<&(dyn AsRawDescriptor + Send + Sync)> {
+-        self.shm_region(
++    pub fn backing_descriptor_at_offset(
++        &self,
++        offset: u64,
++    ) -> Result<&(dyn AsRawDescriptor + Send + Sync)> {
++        self.backing_descriptor(
+             self.checked_offset(self.regions[0].guest_base, offset)
+                 .ok_or(Error::InvalidOffset(offset))?,
+         )
+@@ -916,7 +987,7 @@ impl GuestMemory {
+                 (
+                     &region.mapping,
+                     guest_addr.offset_from(region.start()) as usize,
+-                    region.obj_offset,
++                    region.backing_offset,
+                 )
+             })
+     }
+@@ -956,11 +1027,14 @@ impl GuestMemory {
+             .iter()
+             .find(|region| region.contains(guest_addr))
+             .ok_or(Error::InvalidGuestAddress(guest_addr))
+-            .map(|region| {
+-                (
+-                    region.shared_obj.as_ref(),
+-                    region.obj_offset + guest_addr.offset_from(region.start()),
+-                )
++            .and_then(|region| {
++                Ok((
++                    region
++                        .backing
++                        .descriptor()
++                        .ok_or(Error::MemoryRegionWithoutDescriptor)?,
++                    region.backing_offset + guest_addr.offset_from(region.start()),
++                ))
+             })
+     }
+ 
+@@ -1137,6 +1211,10 @@ unsafe impl BackingMemory for GuestMemory {
+ mod tests {
+     use super::*;
+ 
++    fn private_ram() -> MemoryRegionOptions {
++        MemoryRegionOptions::new().ram_backing(RamBacking::PrivateAnonymous)
++    }
++
+     #[test]
+     fn test_alignment() {
+         let start_addr1 = GuestAddress(0x0);
+@@ -1146,6 +1224,14 @@ mod tests {
+         assert!(GuestMemory::new(&[(start_addr1, 0x10000), (start_addr2, 0x10000)]).is_ok());
+     }
+ 
++    #[test]
++    fn zero_sized_regions_are_rejected() {
++        assert!(matches!(
++            GuestMemory::new(&[(GuestAddress(0), 0)]),
++            Err(Error::InvalidSize(0))
++        ));
++    }
++
+     #[test]
+     fn two_regions() {
+         let start_addr1 = GuestAddress(0x0);
+@@ -1160,6 +1246,190 @@ mod tests {
+         assert!(!gm.is_valid_range(GuestAddress(0x5000), 0x10000));
+     }
+ 
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    #[test]
++    fn private_memory_has_no_shared_descriptor() {
++        let page_size = pagesize() as u64;
++        let gm = GuestMemory::new_with_options(&[(GuestAddress(0), page_size * 2, private_ram())])
++            .unwrap();
++
++        assert!(gm.as_raw_descriptors().is_empty());
++        assert!(matches!(
++            gm.backing_descriptor(GuestAddress(0)),
++            Err(Error::MemoryRegionWithoutDescriptor)
++        ));
++        assert!(matches!(
++            gm.regions().next().unwrap().backing,
++            BackingObject::PrivateAnonymous
++        ));
++    }
++
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    #[test]
++    fn shared_and_private_memory_can_be_mixed() {
++        let page_size = pagesize() as u64;
++        let gm = GuestMemory::new_with_options(&[
++            (GuestAddress(0), page_size, Default::default()),
++            (GuestAddress(page_size), page_size, private_ram()),
++            (GuestAddress(page_size * 2), page_size, Default::default()),
++        ])
++        .unwrap();
++        let regions = gm.regions().collect::<Vec<_>>();
++
++        assert_eq!(gm.as_raw_descriptors().len(), 2);
++        assert!(matches!(regions[0].backing, BackingObject::Shm(_)));
++        assert!(matches!(
++            regions[1].backing,
++            BackingObject::PrivateAnonymous
++        ));
++        assert!(matches!(regions[2].backing, BackingObject::Shm(_)));
++        assert_eq!(regions[0].backing_offset, 0);
++        assert_eq!(regions[2].backing_offset, page_size);
++    }
++
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    #[test]
++    fn private_memory_rejects_file_backing() {
++        let page_size = pagesize() as u64;
++        let options = MemoryRegionOptions::new()
++            .ram_backing(RamBacking::PrivateAnonymous)
++            .file_backed(FileBackedMappingParameters {
++                path: "/does/not/matter".into(),
++                address: 0,
++                size: page_size,
++                offset: 0,
++                writable: false,
++                sync: false,
++                align: false,
++                ram: true,
++            });
++        assert!(matches!(
++            GuestMemory::new_with_options(&[(GuestAddress(0), page_size, options)]),
++            Err(Error::PrivateMemoryFileBacking)
++        ));
++    }
++
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    #[test]
++    fn private_memory_requires_page_aligned_ranges() {
++        let page_size = pagesize() as u64;
++        assert!(matches!(
++            GuestMemory::new_with_options(&[(
++                GuestAddress(1),
++                page_size,
++                private_ram(),
++            )]),
++            Err(Error::MemoryNotAligned(GuestAddress(1), size)) if size == page_size
++        ));
++    }
++
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    #[test]
++    fn private_memory_range_can_be_discarded() {
++        let page_size = pagesize() as u64;
++        let gm =
++            GuestMemory::new_with_options(&[(GuestAddress(0), page_size, private_ram())]).unwrap();
++        let address = GuestAddress(64);
++
++        gm.write_all_at_addr(&[1, 2, 3, 4], address).unwrap();
++        gm.remove_range(GuestAddress(0), page_size).unwrap();
++
++        let mut value = [0xff; 4];
++        gm.read_exact_at_addr(&mut value, address).unwrap();
++        assert_eq!(value, [0; 4]);
++    }
++
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    #[test]
++    fn mergeable_ranges_require_private_page_aligned_memory() {
++        let page_size = pagesize() as u64;
++        let gm = GuestMemory::new_with_options(&[(GuestAddress(0), page_size * 2, private_ram())])
++            .unwrap();
++
++        gm.mark_mergeable_ranges(&[(GuestAddress(0), page_size)])
++            .unwrap();
++        assert!(gm
++            .mark_mergeable_ranges(&[(GuestAddress(1), page_size)])
++            .is_err());
++        assert!(gm
++            .mark_mergeable_ranges(&[(GuestAddress(0), page_size - 1)])
++            .is_err());
++
++        let shared = GuestMemory::new(&[(GuestAddress(0), page_size)]).unwrap();
++        assert!(matches!(
++            shared.mark_mergeable_ranges(&[(GuestAddress(0), page_size)]),
++            Err(Error::MemoryRegionNotPrivateAnonymous)
++        ));
++
++        let split = GuestMemory::new_with_options(&[
++            (GuestAddress(0), page_size, private_ram()),
++            (GuestAddress(page_size), page_size, private_ram()),
++        ])
++        .unwrap();
++        split
++            .mark_mergeable_ranges(&[(GuestAddress(0), page_size * 2)])
++            .unwrap();
++    }
++
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn only_selected_private_pages_are_mergeable() {
++        fn vm_flags(address: usize) -> Vec<String> {
++            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
++            let mut in_mapping = false;
++            for line in smaps.lines() {
++                if let Some((range, _)) = line.split_once(' ') {
++                    if let Some((start, end)) = range.split_once('-') {
++                        if let (Ok(start), Ok(end)) = (
++                            usize::from_str_radix(start, 16),
++                            usize::from_str_radix(end, 16),
++                        ) {
++                            in_mapping = start <= address && address < end;
++                            continue;
++                        }
++                    }
++                }
++                if in_mapping {
++                    if let Some(flags) = line.strip_prefix("VmFlags:") {
++                        return flags.split_whitespace().map(str::to_owned).collect();
++                    }
++                }
++            }
++            panic!("mapping for host address {address:#x} not found in /proc/self/smaps");
++        }
++
++        let page_size = pagesize();
++        let gm = GuestMemory::new_with_options(&[(
++            GuestAddress(0),
++            (page_size * 3) as u64,
++            private_ram(),
++        )])
++        .unwrap();
++        let first_page = gm
++            .get_host_address_range(GuestAddress(0), page_size)
++            .unwrap() as usize;
++        let second_page = gm
++            .get_host_address_range(GuestAddress(page_size as u64), page_size)
++            .unwrap() as usize;
++
++        assert!(!vm_flags(first_page).iter().any(|flag| flag == "mg"));
++        assert!(!vm_flags(second_page).iter().any(|flag| flag == "mg"));
++
++        assert!(gm
++            .mark_mergeable_ranges(&[
++                (GuestAddress(page_size as u64), page_size as u64),
++                (GuestAddress((page_size * 3) as u64), page_size as u64,),
++            ])
++            .is_err());
++        assert!(!vm_flags(second_page).iter().any(|flag| flag == "mg"));
++
++        gm.mark_mergeable_ranges(&[(GuestAddress(page_size as u64), page_size as u64)])
++            .unwrap();
++
++        assert!(!vm_flags(first_page).iter().any(|flag| flag == "mg"));
++        assert!(vm_flags(second_page).iter().any(|flag| flag == "mg"));
++    }
++
+     #[test]
+     fn overlap_memory() {
+         let start_addr1 = GuestAddress(0x0);
+@@ -1295,7 +1565,7 @@ mod tests {
+             .unwrap();
+ 
+         for region in gm.regions() {
+-            let shm = match region.shm {
++            let shm = match region.backing {
+                 BackingObject::Shm(s) => s,
+                 _ => {
+                     panic!("backing object isn't SharedMemory");
+@@ -1303,7 +1573,7 @@ mod tests {
+             };
+             let mmap = MemoryMappingBuilder::new(region.size)
+                 .from_shared_memory(shm)
+-                .offset(region.shm_offset)
++                .offset(region.backing_offset)
+                 .build()
+                 .unwrap();
+ 
+@@ -1441,4 +1711,31 @@ mod tests {
+             assert_eq!(gm2.read_obj_from_addr::<u64>(addr).unwrap(), value);
+         }
+     }
++
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    #[test]
++    fn private_memory_snapshot_restore() {
++        let page_size = pagesize() as u64;
++        let regions = &[(GuestAddress(0), page_size, private_ram())];
++        let address = GuestAddress(64);
++        let value = 0x1234_5678_u64;
++
++        let source = GuestMemory::new_with_options(regions).unwrap();
++        source.write_obj_at_addr(value, address).unwrap();
++
++        let mut data = tempfile::tempfile().unwrap();
++        // SAFETY: no VM or device is accessing `source`.
++        let metadata = unsafe { source.snapshot(&mut data, false).unwrap() };
++
++        let destination = GuestMemory::new_with_options(regions).unwrap();
++        use std::io::Seek;
++        data.seek(std::io::SeekFrom::Start(0)).unwrap();
++        // SAFETY: no VM or device is accessing `destination`.
++        unsafe { destination.restore(metadata, &mut data).unwrap() };
++
++        assert_eq!(
++            destination.read_obj_from_addr::<u64>(address).unwrap(),
++            value
++        );
++    }
+ }
+diff --git a/vm_memory/src/guest_memory/sys.rs b/vm_memory/src/guest_memory/sys.rs
+index 226ff9b0e..3d6a342af 100644
+--- a/vm_memory/src/guest_memory/sys.rs
++++ b/vm_memory/src/guest_memory/sys.rs
+@@ -12,5 +12,6 @@ cfg_if::cfg_if! {
+     }
+ }
+ 
+-pub(crate) use platform::finalize_shm;
+ pub use platform::MemoryPolicy;
++pub(crate) use platform::create_private_anonymous_mapping;
++pub(crate) use platform::finalize_shm;
+diff --git a/vm_memory/src/guest_memory/sys/linux.rs b/vm_memory/src/guest_memory/sys/linux.rs
+index dd6e55d89..32c02800f 100644
+--- a/vm_memory/src/guest_memory/sys/linux.rs
++++ b/vm_memory/src/guest_memory/sys/linux.rs
+@@ -6,10 +6,14 @@ use base::linux::FileDataIterator;
+ use base::linux::MemfdSeals;
+ use base::linux::MemoryMappingUnix;
+ use base::linux::SharedMemoryLinux;
++use base::sys::MemoryMappingBuilderUnix;
+ use base::MappedRegion;
++use base::MemoryMappingBuilder;
++use base::Protection;
+ use base::SharedMemory;
+ use bitflags::bitflags;
+ 
++use crate::BackingObject;
+ use crate::Error;
+ use crate::FileBackedMappingParameters;
+ use crate::GuestAddress;
+@@ -40,31 +44,101 @@ pub(crate) fn finalize_shm(shm: &mut SharedMemory) -> Result<()> {
+     shm.add_seals(seals).map_err(Error::MemoryAddSealsFailed)
+ }
+ 
++pub(crate) fn create_private_anonymous_mapping(
++    size: usize,
++    align: u64,
++) -> Result<base::MemoryMapping> {
++    MemoryMappingBuilder::new(size)
++        .align(align)
++        .protection(Protection::read_write())
++        .build_private_anonymous()
++        .map_err(Error::MemoryMappingFailed)
++}
++
+ impl GuestMemory {
++    /// Marks page-aligned guest-physical ranges as eligible for KSM.
++    ///
++    /// Every range is resolved and validated before any mapping is changed. If applying the advice
++    /// fails, ranges processed before the failure remain mergeable.
++    pub fn mark_mergeable_ranges(&self, ranges: &[(GuestAddress, u64)]) -> Result<()> {
++        let page_size = base::pagesize() as u64;
++        let mut resolved = Vec::new();
++
++        for &(addr, count) in ranges {
++            if count == 0 || addr.0 % page_size != 0 || count % page_size != 0 {
++                return Err(Error::InvalidGuestRange(addr, count));
++            }
++
++            let end = addr
++                .checked_add(count)
++                .ok_or(Error::InvalidGuestRange(addr, count))?;
++            let mut current = addr;
++            while current < end {
++                let region = self
++                    .regions
++                    .iter()
++                    .find(|region| region.contains(current))
++                    .ok_or(Error::InvalidGuestRange(addr, count))?;
++                if !matches!(&region.backing, BackingObject::PrivateAnonymous) {
++                    return Err(Error::MemoryRegionNotPrivateAnonymous);
++                }
++
++                let chunk_end = std::cmp::min(region.end(), end);
++                let offset = usize::try_from(current.offset_from(region.start()))
++                    .map_err(|_| Error::InvalidGuestRange(addr, count))?;
++                let size = usize::try_from(chunk_end.offset_from(current))
++                    .map_err(|_| Error::InvalidGuestRange(addr, count))?;
++                resolved.push((&region.mapping, current, offset, size));
++                current = chunk_end;
++            }
++        }
++
++        for (mapping, address, offset, size) in resolved {
++            mapping
++                .mark_mergeable(offset, size)
++                .map_err(|error| Error::MemoryAccess(address, error))?;
++        }
++        Ok(())
++    }
++
+     /// Free the range of guest memory back to the host. Subsequent accesses to the range will see
+     /// zero data.
+     ///
+     /// This feature is only available on Unix, where a MemoryMapping can remove a mapped range.
+     pub fn remove_range(&self, addr: GuestAddress, count: u64) -> Result<()> {
++        let region = self
++            .regions
++            .iter()
++            .find(|region| region.contains_range(addr, count))
++            .ok_or(Error::InvalidGuestRange(addr, count))?;
++        let offset = usize::try_from(addr.offset_from(region.guest_base))
++            .map_err(|_| Error::InvalidGuestRange(addr, count))?;
++        let size = usize::try_from(count).map_err(|_| Error::InvalidGuestRange(addr, count))?;
++
++        if matches!(&region.backing, BackingObject::PrivateAnonymous) {
++            return region
++                .mapping
++                .madvise_dontneed(offset, size)
++                .map_err(|error| Error::MemoryAccess(addr, error));
++        }
++
+         // TODO: It is likely we could use fallocate for everything because, in the kernel,
+         // MADV_REMOVE mostly just delegates to FALLOC_FL_PUNCH_HOLE internally.
+         if self.use_punchhole_locked() {
+-            let region = self
+-                .regions
+-                .iter()
+-                .find(|region| region.contains_range(addr, count))
+-                .ok_or(Error::InvalidGuestRange(addr, count))?;
+             base::sys::linux::fallocate(
+-                &region.shared_obj,
++                region
++                    .backing
++                    .descriptor()
++                    .ok_or(Error::MemoryRegionWithoutDescriptor)?,
+                 base::sys::linux::FallocateMode::PunchHole,
+-                region.obj_offset + addr.offset_from(region.guest_base),
++                region.backing_offset + addr.offset_from(region.guest_base),
+                 count,
+             )
+             .map_err(Error::PunchHole)
+         } else {
+-            let (mapping, offset, _) = self.find_region(addr)?;
+-            mapping
+-                .remove_range(offset, count as usize)
++            region
++                .mapping
++                .remove_range(offset, size)
+                 .map_err(|e| Error::MemoryAccess(addr, e))
+         }
+     }
+@@ -111,6 +185,16 @@ impl GuestMemory {
+         }
+         Ok(())
+     }
++
++    /// Keeps descriptorless private RAM out of any accidentally-created child process.
++    pub fn apply_dontfork_to_private_regions(&self) -> anyhow::Result<()> {
++        for region in self.regions.iter() {
++            if matches!(&region.backing, BackingObject::PrivateAnonymous) {
++                region.mapping.use_dontfork()?;
++            }
++        }
++        Ok(())
++    }
+ }
+ 
+ impl FileBackedMappingParameters {
+@@ -133,22 +217,31 @@ impl MemoryRegion {
+     /// For example, if there were three bytes and the second byte was a hole, the return would be
+     /// `[1..2]` (in practice these are probably always at least page sized).
+     pub(crate) fn find_data_ranges(&self) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
++        if matches!(&self.backing, BackingObject::PrivateAnonymous) {
++            return Ok(vec![0..self.mapping.size()]);
++        }
+         FileDataIterator::new(
+-            &self.shared_obj,
+-            self.obj_offset,
++            self.backing
++                .descriptor()
++                .ok_or(Error::MemoryRegionWithoutDescriptor)?,
++            self.backing_offset,
+             u64::try_from(self.mapping.size()).unwrap(),
+         )
+         .map(|range| {
+             let range = range?;
+             // Convert from file offsets to mmap offsets.
+-            Ok(usize::try_from(range.start - self.obj_offset).unwrap()
+-                ..usize::try_from(range.end - self.obj_offset).unwrap())
++            Ok(usize::try_from(range.start - self.backing_offset).unwrap()
++                ..usize::try_from(range.end - self.backing_offset).unwrap())
+         })
+         .collect()
+     }
+ 
+     pub(crate) fn zero_range(&self, offset: usize, size: usize) -> anyhow::Result<()> {
+-        self.mapping.remove_range(offset, size)?;
++        if matches!(&self.backing, BackingObject::PrivateAnonymous) {
++            self.mapping.madvise_dontneed(offset, size)?;
++        } else {
++            self.mapping.remove_range(offset, size)?;
++        }
+         Ok(())
+     }
+ }
+diff --git a/vm_memory/src/guest_memory/sys/windows.rs b/vm_memory/src/guest_memory/sys/windows.rs
+index de84da84b..6a13dc31a 100644
+--- a/vm_memory/src/guest_memory/sys/windows.rs
++++ b/vm_memory/src/guest_memory/sys/windows.rs
+@@ -25,6 +25,13 @@ pub(crate) fn finalize_shm(_shm: &mut SharedMemory) -> Result<()> {
+     Ok(())
+ }
+ 
++pub(crate) fn create_private_anonymous_mapping(
++    _size: usize,
++    _align: u64,
++) -> Result<base::MemoryMapping> {
++    Err(crate::Error::PrivateMemoryUnsupported)
++}
++
+ impl GuestMemory {
+     /// Handles guest memory policy hints/advices.
+     pub fn set_memory_policy(&self, _mem_policy: MemoryPolicy) {
+diff --git a/vm_memory/src/udmabuf/mod.rs b/vm_memory/src/udmabuf/mod.rs
+index 491ae3b6d..66f7327d5 100644
+--- a/vm_memory/src/udmabuf/mod.rs
++++ b/vm_memory/src/udmabuf/mod.rs
+@@ -22,8 +22,8 @@ pub enum UdmabufError {
+     DmabufCreationFail(IoError),
+     #[error("failed to open udmabuf driver: {0:?}")]
+     DriverOpenFailed(IoError),
+-    #[error("failed to get region offset: {0:?}")]
+-    InvalidOffset(GuestMemoryError),
++    #[error("failed to access guest memory backing: {0:?}")]
++    GuestMemoryAccess(GuestMemoryError),
+     #[error("All guest addresses must aligned to 4KiB")]
+     NotPageAligned,
+     #[error("udmabuf is not supported on this platform")]
+diff --git a/vm_memory/src/udmabuf/sys/linux.rs b/vm_memory/src/udmabuf/sys/linux.rs
+index d2735bdce..77b6ad1f6 100644
+--- a/vm_memory/src/udmabuf/sys/linux.rs
++++ b/vm_memory/src/udmabuf/sys/linux.rs
+@@ -50,13 +50,13 @@ ioctl_iow_nr!(
+ fn memory_offset(mem: &GuestMemory, guest_addr: GuestAddress, len: u64) -> UdmabufResult<u64> {
+     let (mapping, map_offset, memfd_offset) = mem
+         .find_region(guest_addr)
+-        .map_err(UdmabufError::InvalidOffset)?;
++        .map_err(UdmabufError::GuestMemoryAccess)?;
+     let map_offset = map_offset as u64;
+     if map_offset
+         .checked_add(len)
+         .is_none_or(|a| a > mapping.size() as u64)
+     {
+-        return Err(UdmabufError::InvalidOffset(
++        return Err(UdmabufError::GuestMemoryAccess(
+             GuestMemoryError::InvalidGuestAddress(guest_addr),
+         ));
+     }
+@@ -104,8 +104,10 @@ impl UdmabufDriverTrait for UnixUdmabufDriver {
+                 return Err(UdmabufError::NotPageAligned);
+             }
+ 
+-            // `unwrap` can't panic if `memory_offset obove succeeds.
+-            list.list[i].memfd = mem.shm_region(addr).unwrap().as_raw_descriptor() as u32;
++            list.list[i].memfd = mem
++                .backing_descriptor(addr)
++                .map_err(UdmabufError::GuestMemoryAccess)?
++                .as_raw_descriptor() as u32;
+             list.list[i].__pad = 0;
+             list.list[i].offset = offset;
+             list.list[i].size = len as u64;
+diff --git a/x86_64/src/lib.rs b/x86_64/src/lib.rs
+index 899056423..80b739927 100644
+--- a/x86_64/src/lib.rs
++++ b/x86_64/src/lib.rs
+@@ -2613,27 +2613,24 @@ mod tests {
+                     GuestAddress(0),
+                     640 * KB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(640 * KB),
+                     384 * KB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::ReservedMemory,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(1 * MB),
+                     512 * MB - 1 * MB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 )
+             ]
+@@ -2652,36 +2649,32 @@ mod tests {
+                     GuestAddress(0),
+                     640 * KB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(640 * KB),
+                     384 * KB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::ReservedMemory,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(1 * MB),
+                     2 * GB - 1 * MB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(4 * GB),
+                     2 * GB + 0x8000,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+             ]
+@@ -2700,36 +2693,32 @@ mod tests {
+                     GuestAddress(0),
+                     640 * KB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(640 * KB),
+                     384 * KB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::ReservedMemory,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(1 * MB),
+                     512 * MB - 1 * MB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(4 * GB - bios_len),
+                     bios_len,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::Bios,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+             ]
+@@ -2748,45 +2737,40 @@ mod tests {
+                     GuestAddress(0),
+                     640 * KB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(640 * KB),
+                     384 * KB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::ReservedMemory,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(1 * MB),
+                     2 * GB - 1 * MB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(4 * GB - bios_len),
+                     bios_len,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::Bios,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(4 * GB),
+                     2 * GB + 0x8000,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+             ]
+@@ -2805,27 +2789,24 @@ mod tests {
+                     GuestAddress(0),
+                     640 * KB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(640 * KB),
+                     384 * KB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::ReservedMemory,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(1 * MB),
+                     2 * GB - 1 * MB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 )
+             ]
+@@ -2845,36 +2826,32 @@ mod tests {
+                     GuestAddress(0),
+                     640 * KB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(640 * KB),
+                     384 * KB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::ReservedMemory,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(1 * MB),
+                     2 * GB - 1 * MB,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::GuestMemoryRegion,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+                 (
+                     GuestAddress(4 * GB - bios_len),
+                     bios_len,
+                     MemoryRegionOptions {
+-                        align: 0,
+                         purpose: MemoryRegionPurpose::Bios,
+-                        file_backed: None,
++                        ..Default::default()
+                     },
+                 ),
+             ]
+-- 
+2.51.2
+

@@ -1,0 +1,147 @@
+From 425c56815f532192d87b31b5f970ce4a3111b6f5 Mon Sep 17 00:00:00 2001
+From: SuperVM <supervm@localhost>
+Date: Tue, 28 Jul 2026 13:43:32 +0100
+Subject: [PATCH 3/4] feat(cli): configure virtio-fs DAX
+
+Add filesystem-tag and DAX-backing-directory options to both virtio-fs
+commands. A backing directory enables the shared-memory region and cross-guest
+page sharing; omitting it preserves ordinary reads.
+
+Change-Id: I8063fcbdb76a3bd8ed9003db8f8a4f3a389c9dba
+---
+ snix/cli/castore/src/main.rs | 35 +++++++++++++++++++++++++++++++++--
+ snix/cli/store/src/main.rs   | 34 ++++++++++++++++++++++++++++++++--
+ 2 files changed, 65 insertions(+), 4 deletions(-)
+
+diff --git a/snix/cli/castore/src/main.rs b/snix/cli/castore/src/main.rs
+index ebed250ca..79e0dd031 100644
+--- a/snix/cli/castore/src/main.rs
++++ b/snix/cli/castore/src/main.rs
+@@ -86,6 +86,23 @@ enum Commands {
+         #[arg(long, default_value_t = true)]
+         /// Whether to expose blob and directory digests as extended attributes.
+         show_xattr: bool,
++
++        /// Tag by which the guest identifies this virtio-fs device.
++        #[clap(long, default_value = "snix")]
++        tag: String,
++
++        /// Directory backing DAX mappings. Enables serving the guest's file
++        /// contents through the VMM's DAX window instead of copying them
++        /// through read requests.
++        ///
++        /// Blobs are materialized into this directory on demand and are keyed
++        /// by their digest, so pointing several daemons at one directory lets
++        /// their guests share host page cache for the blobs they both map.
++        ///
++        /// Without this, mapping requests are declined and guests fall back to
++        /// ordinary reads.
++        #[clap(long, value_name = "PATH")]
++        dax_backing_dir: Option<PathBuf>,
+     },
+ }
+ 
+@@ -251,11 +268,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+             service_addrs,
+             uid_gid,
+             show_xattr,
++            tag,
++            dax_backing_dir,
+         } => {
+             let (blob_service, directory_service) =
+                 snix_castore::utils::construct_services(service_addrs).await?;
+ 
+-            use snix_castore::fs::{FSSettings, SnixStoreFs, virtiofs::start_virtiofs_daemon};
++            use snix_castore::fs::{
++                FSSettings, SnixStoreFs, dax::DaxCache, virtiofs::start_virtiofs_daemon,
++            };
+ 
+             let digest = digest.parse()?;
+             let directory = directory_service
+@@ -275,9 +296,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+                     },
+                     tokio::runtime::Handle::current(),
+                 );
++
++                let dax_enabled = dax_backing_dir.is_some();
++                let fs = match dax_backing_dir {
++                    Some(dir) => {
++                        tracing::info!(dax_backing_dir=?dir, "serving DAX mappings");
++                        fs.with_dax_cache(DaxCache::new(dir)?)
++                    }
++                    None => fs,
++                };
++
+                 tracing::info!(socket_path=?socket, "starting virtiofs-daemon");
+ 
+-                start_virtiofs_daemon(fs, socket, "snix", false)
++                start_virtiofs_daemon(fs, socket, &tag, dax_enabled)
+             })
+             .await??;
+         }
+diff --git a/snix/cli/store/src/main.rs b/snix/cli/store/src/main.rs
+index ae2b8d147..8291d34e5 100644
+--- a/snix/cli/store/src/main.rs
++++ b/snix/cli/store/src/main.rs
+@@ -196,6 +196,23 @@ enum Commands {
+         #[arg(long, default_value_t = true)]
+         /// Whether to expose blob and directory digests as extended attributes.
+         show_xattr: bool,
++
++        /// Tag by which the guest identifies this virtio-fs device.
++        #[clap(long, default_value = "snix")]
++        tag: String,
++
++        /// Directory backing DAX mappings. Enables serving the guest's file
++        /// contents through the VMM's DAX window instead of copying them
++        /// through read requests.
++        ///
++        /// Blobs are materialized into this directory on demand and are keyed
++        /// by their digest, so pointing several daemons at one directory lets
++        /// their guests share host page cache for the blobs they both map.
++        ///
++        /// Without this, mapping requests are declined and guests fall back to
++        /// ordinary reads.
++        #[clap(long, value_name = "PATH")]
++        dax_backing_dir: Option<PathBuf>,
+     },
+ }
+ 
+@@ -676,11 +693,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+             list_root,
+             uid_gid,
+             show_xattr,
++            tag,
++            dax_backing_dir,
+         } => {
+             let (blob_service, directory_service, path_info_service, _nar_calculation_service) =
+                 snix_store::utils::construct_services(service_addrs).await?;
+ 
+-            use snix_castore::fs::{FSSettings, SnixStoreFs, virtiofs::start_virtiofs_daemon};
++            use snix_castore::fs::{
++                FSSettings, SnixStoreFs, dax::DaxCache, virtiofs::start_virtiofs_daemon,
++            };
+ 
+             let fs = SnixStoreFs::new(
+                 blob_service,
+@@ -694,10 +715,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                 tokio::runtime::Handle::current(),
+             );
+ 
++            let dax_enabled = dax_backing_dir.is_some();
++            let fs = match dax_backing_dir {
++                Some(dir) => {
++                    info!(dax_backing_dir=?dir, "serving DAX mappings");
++                    fs.with_dax_cache(DaxCache::new(dir)?)
++                }
++                None => fs,
++            };
++
+             tokio::task::spawn_blocking(move || {
+                 info!(socket_path=?socket, "starting virtiofs-daemon");
+ 
+-                start_virtiofs_daemon(fs, socket, "snix", false)
++                start_virtiofs_daemon(fs, socket, &tag, dax_enabled)
+             })
+             .await??;
+         }

@@ -1,0 +1,1184 @@
+From 0146b3253ea9437f0d58907c615da81b7af53e52 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Wed, 29 Jul 2026 02:49:17 +0100
+Subject: [PATCH 3/4] feat(castore/fs): serve declared tree metadata
+
+Load the configured declaration file once per root, serve `user.*` attributes,
+and retain `snix.*` entries as internal policy. Treat failures as no metadata
+and include declaration identity in file and directory inode keys.
+
+Change-Id: I882149ae234e35a29feb7e4323b16b36bb7a5dd4
+---
+ snix/build/src/buildservice/bwrap.rs |   2 +
+ snix/build/src/buildservice/oci.rs   |   2 +
+ snix/castore/src/fs/attrs_tests.rs   | 196 +++++++++++++++++
+ snix/castore/src/fs/fuse/tests.rs    |   3 +
+ snix/castore/src/fs/inode_tracker.rs | 136 ++++++++++--
+ snix/castore/src/fs/inodes.rs        |  45 +++-
+ snix/castore/src/fs/mod.rs           | 305 ++++++++++++++++++++++-----
+ snix/cli/castore/src/main.rs         |  10 +
+ snix/cli/store/src/main.rs           |   4 +
+ 9 files changed, 625 insertions(+), 78 deletions(-)
+ create mode 100644 snix/castore/src/fs/attrs_tests.rs
+
+diff --git a/snix/build/src/buildservice/bwrap.rs b/snix/build/src/buildservice/bwrap.rs
+index 9ebd0fde4..59b8369cf 100644
+--- a/snix/build/src/buildservice/bwrap.rs
++++ b/snix/build/src/buildservice/bwrap.rs
+@@ -85,6 +85,8 @@ where
+                         list_root: true,
+                         uid_gid_override: None,
+                         show_xattr: false,
++                        // Build inputs describe themselves in the castore model alone.
++                        fsmeta_path: None,
+                     },
+                     tokio::runtime::Handle::current(),
+                 );
+diff --git a/snix/build/src/buildservice/oci.rs b/snix/build/src/buildservice/oci.rs
+index 76e4aaf65..d116bd4f9 100644
+--- a/snix/build/src/buildservice/oci.rs
++++ b/snix/build/src/buildservice/oci.rs
+@@ -104,6 +104,8 @@ where
+                         list_root: true,
+                         uid_gid_override: None,
+                         show_xattr: false,
++                        // Build inputs describe themselves in the castore model alone.
++                        fsmeta_path: None,
+                     },
+                     tokio::runtime::Handle::current(),
+                 );
+diff --git a/snix/castore/src/fs/attrs_tests.rs b/snix/castore/src/fs/attrs_tests.rs
+new file mode 100644
+index 000000000..bb8d317e5
+--- /dev/null
++++ b/snix/castore/src/fs/attrs_tests.rs
+@@ -0,0 +1,196 @@
++//! Serving filesystem attributes declared by a tree.
++
++use std::{collections::BTreeMap, ffi::CString, io::Cursor, sync::Arc};
++
++use fuse_backend_rs::api::filesystem::{
++    Context, FileSystem, GetxattrReply, ListxattrReply, ROOT_ID,
++};
++
++use crate::{
++    Directory, Node, PathComponent,
++    blobservice::{BlobService, MemoryBlobService},
++    directoryservice::DirectoryService,
++    fs::{FSSettings, SnixStoreFs},
++};
++
++const ROOT: &str = "00000000000000000000000000000000-test";
++
++type Fs = SnixStoreFs<
++    Arc<dyn BlobService>,
++    Arc<dyn DirectoryService>,
++    Arc<BTreeMap<PathComponent, Node>>,
++>;
++
++async fn mk_fs(declaration: Option<&str>) -> Arc<Fs> {
++    let blob_service = Arc::new(MemoryBlobService::default()) as Arc<dyn BlobService>;
++    let directory_service =
++        Arc::new(crate::utils::gen_test_directory_service()) as Arc<dyn DirectoryService>;
++
++    let put = async |contents: &[u8]| {
++        let mut writer = blob_service.open_write().await;
++        tokio::io::copy(&mut Cursor::new(contents), &mut writer)
++            .await
++            .unwrap();
++        writer.close().await.unwrap();
++    };
++
++    let contents = b"contents";
++    put(contents).await;
++    let data = Node::File {
++        digest: blake3::hash(contents).into(),
++        size: contents.len() as u64,
++        executable: false,
++    };
++
++    let mut root_nodes = vec![("data".try_into().unwrap(), data)];
++    if let Some(declaration) = declaration {
++        put(declaration.as_bytes()).await;
++        let declaration = Node::File {
++            digest: blake3::hash(declaration.as_bytes()).into(),
++            size: declaration.len() as u64,
++            executable: false,
++        };
++        let nix_support =
++            Directory::try_from_iter([("fsmeta".try_into().unwrap(), declaration)]).unwrap();
++        directory_service.put(nix_support.clone()).await.unwrap();
++        root_nodes.push((
++            "nix-support".try_into().unwrap(),
++            Node::Directory {
++                digest: nix_support.digest(),
++                size: nix_support.size(),
++            },
++        ));
++    }
++
++    let root = Directory::try_from_iter(root_nodes).unwrap();
++    directory_service.put(root.clone()).await.unwrap();
++
++    let root_nodes = BTreeMap::from([(
++        ROOT.try_into().unwrap(),
++        Node::Directory {
++            digest: root.digest(),
++            size: root.size(),
++        },
++    )]);
++
++    Arc::new(SnixStoreFs::new(
++        blob_service,
++        directory_service,
++        Arc::new(root_nodes),
++        FSSettings {
++            fsmeta_path: declaration.map(|_| "nix-support/fsmeta".parse().unwrap()),
++            ..Default::default()
++        },
++        tokio::runtime::Handle::current(),
++    ))
++}
++
++async fn data_inode(fs: &Arc<Fs>) -> u64 {
++    let fs = fs.clone();
++    tokio::task::spawn_blocking(move || {
++        let root = fs
++            .lookup(&Context::default(), ROOT_ID, &CString::new(ROOT).unwrap())
++            .unwrap();
++        fs.lookup(
++            &Context::default(),
++            root.inode,
++            &CString::new("data").unwrap(),
++        )
++        .unwrap()
++        .inode
++    })
++    .await
++    .unwrap()
++}
++
++#[tokio::test]
++async fn serves_user_attributes_but_not_snix_policy() {
++    let fs = mk_fs(Some(
++        "user.policy=c2hhcmVk data\n\
++         snix.dax data\n",
++    ))
++    .await;
++    let inode = data_inode(&fs).await;
++
++    tokio::task::spawn_blocking(move || {
++        let user = CString::new("user.policy").unwrap();
++        assert!(matches!(
++            fs.getxattr(&Context::default(), inode, &user, 0).unwrap(),
++            GetxattrReply::Count(6)
++        ));
++        assert!(matches!(
++            fs.getxattr(&Context::default(), inode, &user, 6)
++                .unwrap(),
++            GetxattrReply::Value(value) if value == b"shared"
++        ));
++
++        assert!(matches!(
++            fs.listxattr(&Context::default(), inode, 0).unwrap(),
++            ListxattrReply::Count(12)
++        ));
++        assert!(matches!(
++            fs.listxattr(&Context::default(), inode, 12).unwrap(),
++            ListxattrReply::Names(names) if names == b"user.policy\0"
++        ));
++
++        let policy = CString::new("snix.dax").unwrap();
++        assert_eq!(
++            Some(libc::ENODATA),
++            fs.getxattr(&Context::default(), inode, &policy, 0)
++                .err()
++                .unwrap()
++                .raw_os_error(),
++        );
++    })
++    .await
++    .unwrap();
++}
++
++#[tokio::test]
++async fn disabled_declarations_preserve_xattrs_unsupported() {
++    let fs = mk_fs(None).await;
++    let inode = data_inode(&fs).await;
++
++    tokio::task::spawn_blocking(move || {
++        let name = CString::new("user.anything").unwrap();
++        assert_eq!(
++            Some(libc::ENOSYS),
++            fs.getxattr(&Context::default(), inode, &name, 0)
++                .err()
++                .unwrap()
++                .raw_os_error(),
++        );
++        assert_eq!(
++            Some(libc::ENOSYS),
++            fs.listxattr(&Context::default(), inode, 0)
++                .err()
++                .unwrap()
++                .raw_os_error(),
++        );
++    })
++    .await
++    .unwrap();
++}
++
++#[tokio::test]
++async fn malformed_declarations_are_ignored() {
++    let fs = mk_fs(Some("this is not a declaration\n")).await;
++    let inode = data_inode(&fs).await;
++
++    tokio::task::spawn_blocking(move || {
++        let name = CString::new("user.anything").unwrap();
++        assert_eq!(
++            Some(libc::ENODATA),
++            fs.getxattr(&Context::default(), inode, &name, 0)
++                .err()
++                .unwrap()
++                .raw_os_error(),
++        );
++        assert!(matches!(
++            fs.listxattr(&Context::default(), inode, 0).unwrap(),
++            ListxattrReply::Count(0)
++        ));
++    })
++    .await
++    .unwrap();
++}
+diff --git a/snix/castore/src/fs/fuse/tests.rs b/snix/castore/src/fs/fuse/tests.rs
+index 8bd153fef..4e91006b5 100644
+--- a/snix/castore/src/fs/fuse/tests.rs
++++ b/snix/castore/src/fs/fuse/tests.rs
+@@ -303,6 +303,7 @@ async fn root_with_listing() {
+             list_root: true, /* allow listing */
+             uid_gid_override: None,
+             show_xattr: false,
++            fsmeta_path: None,
+         },
+     )
+     .expect("must succeed");
+@@ -590,6 +591,7 @@ async fn uid_gid_override() {
+             list_root: false,
+             uid_gid_override: Some((1000, 100)),
+             show_xattr: false,
++            fsmeta_path: None,
+         },
+     )
+     .expect("must succeed");
+@@ -632,6 +634,7 @@ async fn xattr() {
+             list_root: false,
+             uid_gid_override: None,
+             show_xattr: true, /* support xattr */
++            fsmeta_path: None,
+         },
+     )
+     .expect("must succeed");
+diff --git a/snix/castore/src/fs/inode_tracker.rs b/snix/castore/src/fs/inode_tracker.rs
+index 3d02a7e57..8d5abfd42 100644
+--- a/snix/castore/src/fs/inode_tracker.rs
++++ b/snix/castore/src/fs/inode_tracker.rs
+@@ -9,10 +9,28 @@ use crate::B3Digest;
+ /// modes are different files, and the kernel is entitled to assume one inode
+ /// has one set of attributes. Keying on the digest alone made whichever of them
+ /// was looked up first decide the mode of both.
++///
++/// Declared attributes are part of it for the same reason. Two occurrences of
++/// one blob, one declared better mapped than copied and one not, must not
++/// resolve to a single inode whose behaviour then depends on which was looked
++/// up first.
+ #[derive(PartialEq, Eq, Hash)]
+ struct FileKey {
+     digest: B3Digest,
+     executable: bool,
++    attrs: B3Digest,
++}
++
++/// What makes two directories the same inode.
++///
++/// The declared subtree is included, because it is what the children of this
++/// directory will be given when they are allocated. Two occurrences of one
++/// castore directory with different declarations below them are different
++/// directories as far as the filesystem is concerned.
++#[derive(PartialEq, Eq, Hash)]
++struct DirKey {
++    digest: B3Digest,
++    attrs: B3Digest,
+ }
+
+ /// InodeTracker keeps track of inodes, stores data being these inodes and deals
+@@ -26,9 +44,9 @@ pub struct InodeTracker {
+     // lookup table for symlinks by their target
+     symlink_target_to_inode: HashMap<bytes::Bytes, u64>,
+
+-    // lookup table for directories by their B3Digest.
++    // lookup table for directories by everything that distinguishes them.
+     // Note the corresponding directory may not be present in data yet.
+-    directory_digest_to_inode: HashMap<B3Digest, u64>,
++    directory_to_inode: HashMap<DirKey, u64>,
+
+     // the next inode to allocate
+     next_inode: u64,
+@@ -41,7 +59,7 @@ impl Default for InodeTracker {
+
+             file_to_inode: Default::default(),
+             symlink_target_to_inode: Default::default(),
+-            directory_digest_to_inode: Default::default(),
++            directory_to_inode: Default::default(),
+
+             next_inode: 2,
+         }
+@@ -53,13 +71,29 @@ impl InodeData {
+     /// regular file.
+     fn file_key(&self) -> Option<FileKey> {
+         match self {
+-            InodeData::Regular(digest, _, executable) => Some(FileKey {
++            InodeData::Regular(digest, _, executable, attrs) => Some(FileKey {
+                 digest: *digest,
+                 executable: *executable,
++                attrs: *attrs.id(),
+             }),
+             _ => None,
+         }
+     }
++
++    /// The key under which this node is shared with identical ones, if it is a
++    /// directory.
++    fn dir_key(&self) -> Option<DirKey> {
++        match self {
++            InodeData::Directory(DirectoryInodeData::Sparse(digest, _, attrs))
++            | InodeData::Directory(DirectoryInodeData::Populated(digest, attrs, _)) => {
++                Some(DirKey {
++                    digest: *digest,
++                    attrs: *attrs.id(),
++                })
++            }
++            _ => None,
++        }
++    }
+ }
+
+ impl InodeTracker {
+@@ -102,9 +136,9 @@ impl InodeTracker {
+                     None => self.insert_and_increment(data),
+                 }
+             }
+-            InodeData::Directory(DirectoryInodeData::Sparse(ref digest, _size)) => {
+-                // check the lookup table if the B3Digest is known.
+-                match self.directory_digest_to_inode.get(digest) {
++            InodeData::Directory(DirectoryInodeData::Sparse(..)) => {
++                let key = data.dir_key().expect("Snix bug: must be a directory");
++                match self.directory_to_inode.get(&key) {
+                     Some(found_ino) => {
+                         // We already have it, return the inode.
+                         *found_ino
+@@ -138,17 +172,15 @@ impl InodeTracker {
+             InodeData::Symlink(ref target) => {
+                 self.symlink_target_to_inode.insert(target.clone(), ino);
+             }
+-            InodeData::Directory(DirectoryInodeData::Sparse(ref digest, _size)) => {
+-                self.directory_digest_to_inode.insert(*digest, ino);
+-            }
+-            // This is currently not used outside test fixtures.
++            // The populated case is currently not used outside test fixtures.
+             // Usually a [DirectoryInodeData::Sparse] is inserted and later
+             // "upgraded" with more data.
+             // However, as a future optimization, a lookup for a PathInfo could trigger a
+             // [DirectoryService::get_recursive()] request that "forks into
+             // background" and prepopulates all Directories in a closure.
+-            InodeData::Directory(DirectoryInodeData::Populated(ref digest, _)) => {
+-                self.directory_digest_to_inode.insert(*digest, ino);
++            InodeData::Directory(_) => {
++                self.directory_to_inode
++                    .insert(data.dir_key().expect("Snix bug: must be a directory"), ino);
+             }
+         }
+         // Insert data
+@@ -162,9 +194,18 @@ impl InodeTracker {
+
+ #[cfg(test)]
+ mod tests {
++    use crate::attrs::AttrTree;
+     use crate::fixtures;
+
+     use super::InodeData;
++
++    fn no_attrs() -> std::sync::Arc<AttrTree> {
++        AttrTree::empty()
++    }
++
++    fn dax_attrs() -> std::sync::Arc<AttrTree> {
++        AttrTree::parse(format!("{} ", crate::attrs::ATTR_DAX).as_bytes()).unwrap()
++    }
+     use super::InodeTracker;
+
+     /// Getting something non-existent should be none
+@@ -182,6 +223,7 @@ mod tests {
+             *fixtures::BLOB_A_DIGEST,
+             fixtures::BLOB_A.len() as u64,
+             false,
++            no_attrs(),
+         );
+
+         // put it in
+@@ -190,7 +232,7 @@ mod tests {
+         // a get should return the right data
+         let data = inode_tracker.get(ino).expect("must be some");
+         match *data {
+-            InodeData::Regular(ref digest, _, _) => {
++            InodeData::Regular(ref digest, ..) => {
+                 assert_eq!(&fixtures::BLOB_A_DIGEST.clone(), digest);
+             }
+             InodeData::Symlink(_) | InodeData::Directory(..) => panic!("wrong type"),
+@@ -206,6 +248,7 @@ mod tests {
+                 *fixtures::BLOB_B_DIGEST,
+                 fixtures::BLOB_B.len() as u64,
+                 false,
++                no_attrs(),
+             ))
+         );
+     }
+@@ -222,11 +265,13 @@ mod tests {
+             *fixtures::BLOB_A_DIGEST,
+             fixtures::BLOB_A.len() as u64,
+             false,
++            no_attrs(),
+         );
+         let executable = InodeData::Regular(
+             *fixtures::BLOB_A_DIGEST,
+             fixtures::BLOB_A.len() as u64,
+             true,
++            no_attrs(),
+         );
+
+         let plain_ino = inode_tracker.put(plain.clone());
+@@ -241,14 +286,73 @@ mod tests {
+
+         assert!(matches!(
+             *inode_tracker.get(plain_ino).unwrap(),
+-            InodeData::Regular(_, _, false)
++            InodeData::Regular(_, _, false, _)
+         ));
+         assert!(matches!(
+             *inode_tracker.get(executable_ino).unwrap(),
+-            InodeData::Regular(_, _, true)
++            InodeData::Regular(_, _, true, _)
+         ));
+     }
+
++    /// Two occurrences of one blob, one declared better mapped than copied and
++    /// one not, are different files for the same reason: the declaration
++    /// decides how the inode is served, and the kernel caches that per inode.
++    #[test]
++    fn put_regular_differing_in_attrs() {
++        let mut inode_tracker = InodeTracker::default();
++
++        let plain = InodeData::Regular(
++            *fixtures::BLOB_A_DIGEST,
++            fixtures::BLOB_A.len() as u64,
++            false,
++            no_attrs(),
++        );
++        let dax = InodeData::Regular(
++            *fixtures::BLOB_A_DIGEST,
++            fixtures::BLOB_A.len() as u64,
++            false,
++            dax_attrs(),
++        );
++
++        let plain_ino = inode_tracker.put(plain.clone());
++        let dax_ino = inode_tracker.put(dax.clone());
++
++        assert_ne!(plain_ino, dax_ino);
++
++        // and each keeps answering with what it was inserted as, in either
++        // order.
++        assert_eq!(dax_ino, inode_tracker.put(dax));
++        assert_eq!(plain_ino, inode_tracker.put(plain));
++
++        assert!(!inode_tracker.get(plain_ino).unwrap().attrs().attrs().dax);
++        assert!(inode_tracker.get(dax_ino).unwrap().attrs().attrs().dax);
++    }
++
++    /// The same holds for directories, where the declared subtree is what the
++    /// children of this directory will be allocated with.
++    #[test]
++    fn put_directory_differing_in_attrs() {
++        use super::DirectoryInodeData;
++
++        let mut inode_tracker = InodeTracker::default();
++
++        let sparse = |attrs| {
++            InodeData::Directory(DirectoryInodeData::Sparse(
++                fixtures::DIRECTORY_WITH_KEEP.digest(),
++                fixtures::DIRECTORY_WITH_KEEP.size(),
++                attrs,
++            ))
++        };
++
++        let plain_ino = inode_tracker.put(sparse(no_attrs()));
++        let dax_ino = inode_tracker.put(sparse(dax_attrs()));
++
++        assert_ne!(plain_ino, dax_ino);
++
++        assert_eq!(dax_ino, inode_tracker.put(sparse(dax_attrs())));
++        assert_eq!(plain_ino, inode_tracker.put(sparse(no_attrs())));
++    }
++
+     // Put of a symlink should allocate a uid, which should be the same when inserting again
+     #[test]
+     fn put_symlink() {
+diff --git a/snix/castore/src/fs/inodes.rs b/snix/castore/src/fs/inodes.rs
+index 84049b5be..6845214c4 100644
+--- a/snix/castore/src/fs/inodes.rs
++++ b/snix/castore/src/fs/inodes.rs
+@@ -1,37 +1,62 @@
+ //! This module contains all the data structures used to track information
+ //! about inodes, which present snix-castore nodes in a filesystem.
+-use crate::{B3Digest, Node, path::PathComponent};
++use std::sync::Arc;
++
++use crate::{B3Digest, Node, attrs::AttrTree, path::PathComponent};
+
+ #[derive(Clone, Debug)]
+ pub enum InodeData {
+-    Regular(B3Digest, u64, bool),  // digest, size, executable
+-    Symlink(bytes::Bytes),         // target
+-    Directory(DirectoryInodeData), // either [DirectoryInodeData:Sparse] or [DirectoryInodeData:Populated]
++    /// digest, size, executable, declared attributes
++    Regular(B3Digest, u64, bool, Arc<AttrTree>),
++    /// target
++    ///
++    /// Symlinks carry no attributes: Linux refuses `user.` extended attributes
++    /// on them, and there are no contents to hint about.
++    Symlink(bytes::Bytes),
++    /// either [DirectoryInodeData:Sparse] or [DirectoryInodeData:Populated]
++    Directory(DirectoryInodeData),
+ }
+
+ /// This encodes the two different states of [InodeData::Directory].
+ /// Either the data still is sparse (we only saw a [crate::Node::Directory],
+ /// but didn't fetch the [crate::Directory] struct yet, or we processed a
+ /// lookup and did fetch the data.
++///
++/// Both carry the [AttrTree] applying at and below this directory: the sparse
++/// state needs it to allocate inodes for children once they are fetched, and
++/// the populated state needs it to answer for the directory itself.
+ #[derive(Clone, Debug)]
+ pub enum DirectoryInodeData {
+-    Sparse(B3Digest, u64),                                // digest, size
+-    Populated(B3Digest, Vec<(u64, PathComponent, Node)>), // [(child_inode, name, node)]
++    /// digest, size, declared attributes
++    Sparse(B3Digest, u64, Arc<AttrTree>),
++    /// digest, declared attributes, [(child_inode, name, node)]
++    Populated(B3Digest, Arc<AttrTree>, Vec<(u64, PathComponent, Node)>),
+ }
+
+ impl InodeData {
+-    /// Constructs a new InodeData from a `&Node`.
+-    pub fn from_node(node: &Node) -> Self {
++    /// Constructs a new InodeData from a `&Node` and the [AttrTree] applying to
++    /// it.
++    pub fn from_node(node: &Node, attrs: Arc<AttrTree>) -> Self {
+         match node {
+             Node::Directory { digest, size } => {
+-                Self::Directory(DirectoryInodeData::Sparse(*digest, *size))
++                Self::Directory(DirectoryInodeData::Sparse(*digest, *size, attrs))
+             }
+             Node::File {
+                 digest,
+                 size,
+                 executable,
+-            } => Self::Regular(*digest, *size, *executable),
++            } => Self::Regular(*digest, *size, *executable, attrs),
+             Node::Symlink { target } => Self::Symlink(target.clone().into()),
+         }
+     }
++
++    /// What the tree declares about this node itself.
++    pub fn attrs(&self) -> &Arc<AttrTree> {
++        match self {
++            Self::Regular(_, _, _, attrs) => attrs,
++            Self::Directory(DirectoryInodeData::Sparse(_, _, attrs))
++            | Self::Directory(DirectoryInodeData::Populated(_, attrs, _)) => attrs,
++            Self::Symlink(_) => AttrTree::empty_ref(),
++        }
++    }
+ }
+diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
+index e8e21e0d3..6021aeae6 100644
+--- a/snix/castore/src/fs/mod.rs
++++ b/snix/castore/src/fs/mod.rs
+@@ -3,6 +3,9 @@ mod inode_tracker;
+ mod inodes;
+ pub mod root_nodes;
+
++#[cfg(all(test, target_os = "linux"))]
++mod attrs_tests;
++
+ #[cfg(feature = "fuse")]
+ pub mod fuse;
+
+@@ -20,6 +23,7 @@ use self::{
+ };
+ use crate::{
+     B3Digest, Node,
++    attrs::AttrTree,
+     blobservice::{BlobReader, BlobService},
+     directoryservice::DirectoryService,
+     path::PathComponent,
+@@ -70,9 +74,10 @@ use tracing::{Span, debug, error, instrument, warn};
+ ///  irrespective of their own location.
+ ///  This means:
+ ///  - Symlinks with the same target will get the same inode.
+-///  - Regular files with the same contents and executable bit will get the same
++///  - Regular files with the same contents, executable bit and declared
++///    attributes will get the same inode.
++///  - Directories with the same contents and declared subtree will get the same
+ ///    inode.
+-///  - Directories with the same contents will get the same inode.
+ ///
+ /// Due to the above being valid across the whole store, and considering the
+ /// merkle structure is a DAG, not a tree, this also means we can't do "bucketed
+@@ -137,6 +142,18 @@ pub struct FSSettings {
+
+     /// Whether to expose blob and directory digests as extended attributes.
+     pub show_xattr: bool,
++
++    /// Where, inside each root node, to look for a file declaring filesystem
++    /// attributes for that tree.
++    ///
++    /// A tree cannot describe itself in the castore model without changing its
++    /// own digests, so it describes itself in its contents instead. This is the
++    /// relative path of that file; the convention it follows belongs to
++    /// whoever mounts the tree, not here.
++    ///
++    /// [None] disables the lookup entirely, which is the behaviour of a
++    /// filesystem that knows nothing about declared attributes.
++    pub fsmeta_path: Option<crate::PathBuf>,
+ }
+
+ impl<BS, DS, RN> SnixStoreFs<BS, DS, RN>
+@@ -186,6 +203,104 @@ where
+         self
+     }
+
++    /// Reads what `root_node` declares about itself, from the file named by
++    /// [FSSettings::fsmeta_path] inside it.
++    ///
++    /// A tree only ever declares things about itself, so this is resolved once
++    /// per root node and then descended alongside it. Everything about it is a
++    /// hint, so every way it can fail -- no such file, unreadable, unparseable,
++    /// oversized -- yields an empty declaration and the filesystem behaves as
++    /// though the tree said nothing.
++    #[instrument(skip_all, fields(fsmeta.path), ret(level = tracing::Level::TRACE))]
++    fn declared_attrs(&self, root_node: &Node) -> Arc<AttrTree> {
++        let Some(fsmeta_path) = &self.settings.fsmeta_path else {
++            return AttrTree::empty();
++        };
++
++        match self.read_declaration(root_node, fsmeta_path) {
++            Ok(Some(tree)) => tree,
++            Ok(None) => AttrTree::empty(),
++            Err(err) => {
++                debug!(%err, "ignoring filesystem attribute declaration");
++                AttrTree::empty()
++            }
++        }
++    }
++
++    /// Resolves and parses the declaration file, if the tree has one.
++    fn read_declaration(
++        &self,
++        root_node: &Node,
++        fsmeta_path: &crate::Path,
++    ) -> io::Result<Option<Arc<AttrTree>>> {
++        let Node::Directory { digest, .. } = root_node else {
++            // A root which is a single file or symlink has nowhere to put a
++            // declaration.
++            return Ok(None);
++        };
++
++        let mut digest = *digest;
++        let mut components = fsmeta_path.components().peekable();
++
++        let file = loop {
++            let Some(name) = components.next() else {
++                return Ok(None);
++            };
++
++            let directory = self
++                .tokio_handle
++                .block_on(async { self.directory_service.get(&digest).await })
++                .map_err(io::Error::other)?;
++
++            let Some(directory) = directory else {
++                return Ok(None);
++            };
++
++            let Some((_, node)) = directory.nodes().find(|(n, _)| **n == name) else {
++                return Ok(None);
++            };
++
++            match (node, components.peek()) {
++                (Node::Directory { digest: child, .. }, Some(_)) => digest = *child,
++                (node @ Node::File { .. }, None) => break node.clone(),
++                // Anything else means the path does not name a file.
++                _ => return Ok(None),
++            }
++        };
++
++        let Node::File { digest, size, .. } = &file else {
++            return Ok(None);
++        };
++
++        if *size > crate::attrs::MAX_SIZE as u64 {
++            return Err(io::Error::other(format!(
++                "declaration is {size} bytes, larger than the limit"
++            )));
++        }
++
++        let buf = self.tokio_handle.block_on(async {
++            let reader = self
++                .blob_service
++                .open_read(digest)
++                .await
++                .map_err(io::Error::other)?
++                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "blob not found"))?;
++
++            // Do not trust a service implementation to return exactly the
++            // size recorded by the node. Read at most one byte beyond the
++            // parser's limit, which is enough for it to reject the input
++            // without allowing an inconsistent blob to grow this buffer
++            // without bound.
++            let mut reader =
++                tokio::io::AsyncReadExt::take(reader, (crate::attrs::MAX_SIZE + 1) as u64);
++            let mut buf = Vec::with_capacity(*size as usize);
++            tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf).await?;
++            Ok::<_, io::Error>(buf)
++        })?;
++
++        AttrTree::parse(&buf).map(Some).map_err(io::Error::other)
++    }
++
+     /// Retrieves the inode for a given root node basename, if present.
+     /// This obtains a read lock on self.root_nodes.
+     fn get_inode_for_root_name(&self, name: &PathComponent) -> Option<u64> {
+@@ -208,12 +323,12 @@ where
+         let data = self.inode_tracker.read().get(ino).unwrap();
+         match *data {
+             // if it's populated already, return children.
+-            InodeData::Directory(DirectoryInodeData::Populated(parent_digest, ref children)) => {
++            InodeData::Directory(DirectoryInodeData::Populated(parent_digest, _, ref children)) => {
+                 Ok((parent_digest, children.clone()))
+             }
+             // if it's sparse, fetch data using directory_service, populate child nodes
+             // and update it in [self.inode_tracker].
+-            InodeData::Directory(DirectoryInodeData::Sparse(parent_digest, _)) => {
++            InodeData::Directory(DirectoryInodeData::Sparse(parent_digest, _, ref attrs)) => {
+                 let directory = self
+                     .tokio_handle
+                     .block_on(async { self.directory_service.get(&parent_digest).await })
+@@ -236,7 +351,12 @@ where
+                     let children: Vec<(u64, PathComponent, Node)> = directory
+                         .into_nodes()
+                         .map(|(child_name, child_node)| {
+-                            let inode_data = InodeData::from_node(&child_node);
++                            // Each child is allocated with what the tree
++                            // declares for it, so an inode is never shared
++                            // between two nodes carrying different
++                            // declarations.
++                            let inode_data =
++                                InodeData::from_node(&child_node, attrs.child(&child_name));
+
+                             let child_ino = inode_tracker.put(inode_data);
+                             (child_ino, child_name, child_node)
+@@ -248,6 +368,7 @@ where
+                         ino,
+                         Arc::new(InodeData::Directory(DirectoryInodeData::Populated(
+                             parent_digest,
++                            attrs.clone(),
+                             children.clone(),
+                         ))),
+                     );
+@@ -300,6 +421,9 @@ where
+             Ok(None) => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+             // The root node does exist
+             Ok(Some(root_node)) => {
++                // What the tree says about itself, read once per root node.
++                let attrs = self.declared_attrs(&root_node);
++
+                 // Let's check if someone else beat us to updating the inode tracker and
+                 // root_nodes map. This avoids locking inode_tracker for writing.
+                 if let Some(ino) = self.root_nodes.read().get(name) {
+@@ -316,7 +440,7 @@ where
+
+                 // insert the (sparse) inode data and register in
+                 // self.root_nodes.
+-                let inode_data = InodeData::from_node(&root_node);
++                let inode_data = InodeData::from_node(&root_node, attrs);
+                 let ino = inode_tracker.put(inode_data.clone());
+                 root_nodes.insert(name.to_owned(), ino);
+
+@@ -329,9 +453,9 @@ where
+     /// applying uid/gid override if configured.
+     fn inode_data_to_attr(&self, inode_data: &InodeData, ino: u64) -> Attr {
+         let mode = match inode_data {
+-            InodeData::Regular(_, _, false) => libc::S_IFREG | 0o444,
++            InodeData::Regular(_, _, false, _) => libc::S_IFREG | 0o444,
+             // executable
+-            InodeData::Regular(_, _, true) => libc::S_IFREG | 0o555,
++            InodeData::Regular(_, _, true, _) => libc::S_IFREG | 0o555,
+             InodeData::Symlink(_) => libc::S_IFLNK | 0o444,
+             InodeData::Directory(_) => libc::S_IFDIR | 0o555,
+         };
+@@ -343,10 +467,10 @@ where
+             // FUTUREWORK: play with this numbers, as it affects read sizes for client applications.
+             blocks: 1024,
+             size: match inode_data {
+-                InodeData::Regular(_, size, _) => *size,
++                InodeData::Regular(_, size, ..) => *size,
+                 InodeData::Symlink(target) => target.len() as u64,
+-                InodeData::Directory(DirectoryInodeData::Sparse(_, size)) => *size,
+-                InodeData::Directory(DirectoryInodeData::Populated(_, children)) => {
++                InodeData::Directory(DirectoryInodeData::Sparse(_, size, _)) => *size,
++                InodeData::Directory(DirectoryInodeData::Populated(_, _, children)) => {
+                     children.len() as u64
+                 }
+             },
+@@ -363,6 +487,15 @@ where
+
+         attr
+     }
++
++    /// Builds the [Entry] answering a lookup or readdirplus for `ino`.
++    ///
++    /// Everything the kernel learns about an inode beyond its [Attr] is
++    /// communicated here, which is why this exists rather than callers reaching
++    /// for [attr_to_fuse_entry] directly.
++    fn inode_data_to_fuse_entry(&self, inode_data: &InodeData, ino: u64) -> Entry {
++        attr_to_fuse_entry(self.inode_data_to_attr(inode_data, ino))
++    }
+ }
+ fn attr_to_fuse_entry(attr: Attr) -> Entry {
+     Entry {
+@@ -472,9 +605,9 @@ where
+         let name: PathComponent = name.try_into().map_err(|_| std::io::ErrorKind::NotFound)?;
+
+         // This goes from a parent inode to a node.
+-        let (ino, inode_data) = if parent == ROOT_ID {
++        let ino = if parent == ROOT_ID {
+             // If the parent is [ROOT_ID], we need to check [self.root_nodes] (fetching from a [RootNode] provider if needed)
+-            self.name_in_root_to_ino_and_data(&name)?
++            self.name_in_root_to_ino_and_data(&name)?.0
+         } else {
+             // else the parent must be a directory, otherwise we would never come up with this request.
+             // Lookup the parent in [self.inode_tracker] (which must be a [InodeData::Directory]), and find the child with that name.
+@@ -490,23 +623,21 @@ where
+                     io::Error::from_raw_os_error(libc::ENOENT)
+                 })?;
+
+-            let (child_ino, _, child_node) = &children[idx];
+-
+-            // Reply with the file attributes for the child,
+-            (*child_ino, Arc::new(InodeData::from_node(child_node)))
++            children[idx].0
+         };
+
++        // The tracker is the authority on what this inode is: it holds the
++        // declarations the inode was allocated with, which cannot be recovered
++        // from the [Node] alone.
++        let inode_data = self
++            .inode_tracker
++            .read()
++            .get(ino)
++            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
++
+         debug!(inode_data=?&inode_data, ino=ino, "Some");
+
+-        let attr = self.inode_data_to_attr(
+-            self.inode_tracker
+-                .read()
+-                .get(ino)
+-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?
+-                .as_ref(),
+-            ino,
+-        );
+-        Ok(attr_to_fuse_entry(attr))
++        Ok(self.inode_data_to_fuse_entry(&inode_data, ino))
+     }
+
+     #[tracing::instrument(skip_all, fields(rq.inode = inode))]
+@@ -591,7 +722,11 @@ where
+                 let ino = self.get_inode_for_root_name(&name).unwrap_or_else(|| {
+                     // insert the (sparse) inode data and register in
+                     // self.root_nodes.
+-                    let ino = self.inode_tracker.write().put(InodeData::from_node(&node));
++                    let attrs = self.declared_attrs(&node);
++                    let ino = self
++                        .inode_tracker
++                        .write()
++                        .put(InodeData::from_node(&node, attrs));
+                     self.root_nodes.write().insert(name.clone(), ino);
+                     ino
+                 });
+@@ -670,17 +805,28 @@ where
+                     io::Error::from_raw_os_error(libc::EPERM)
+                 })?;
+
+-                let inode_data = InodeData::from_node(&node);
+-
+-                // obtain the inode, or allocate a new one.
++                // Obtain the inode, or allocate a new one, resolving what the
++                // tree declares only when we have not seen it before. Doing it
++                // unconditionally would re-read every store path's declaration
++                // on every listing.
+                 let ino = self.get_inode_for_root_name(&name).unwrap_or_else(|| {
+                     // insert the (sparse) inode data and register in
+                     // self.root_nodes.
+-                    let ino = self.inode_tracker.write().put(inode_data.clone());
++                    let attrs = self.declared_attrs(&node);
++                    let ino = self
++                        .inode_tracker
++                        .write()
++                        .put(InodeData::from_node(&node, attrs));
+                     self.root_nodes.write().insert(name.clone(), ino);
+                     ino
+                 });
+
++                let inode_data = self
++                    .inode_tracker
++                    .read()
++                    .get(ino)
++                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
++
+                 let written = add_entry(
+                     fuse_backend_rs::api::filesystem::DirEntry {
+                         ino,
+@@ -688,7 +834,7 @@ where
+                         type_: node_to_fuse_type(&node),
+                         name: name.as_ref(),
+                     },
+-                    attr_to_fuse_entry(self.inode_data_to_attr(&inode_data, ino)),
++                    self.inode_data_to_fuse_entry(&inode_data, ino),
+                 )?;
+                 // If the buffer is full, add_entry will return `Ok(0)`.
+                 if written == 0 {
+@@ -703,7 +849,14 @@ where
+         Span::current().record("directory.digest", parent_digest.to_string());
+
+         for (i, (ino, name, child_node)) in children.into_iter().skip(offset as usize).enumerate() {
+-            let inode_data = InodeData::from_node(&child_node);
++            // Read the child back out of the tracker rather than rebuilding it
++            // from the [Node]: the declarations it was allocated with are not
++            // recoverable from the node.
++            let inode_data = self
++                .inode_tracker
++                .read()
++                .get(ino)
++                .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
+
+             // the second parameter will become the "offset" parameter on the next call.
+             let written = add_entry(
+@@ -713,7 +866,7 @@ where
+                     type_: node_to_fuse_type(&child_node),
+                     name: name.as_ref(),
+                 },
+-                attr_to_fuse_entry(self.inode_data_to_attr(&inode_data, ino)),
++                self.inode_data_to_fuse_entry(&inode_data, ino),
+             )?;
+             // If the buffer is full, add_entry will return `Ok(0)`.
+             if written == 0 {
+@@ -764,7 +917,7 @@ where
+                 warn!("is directory");
+                 Err(io::Error::from_raw_os_error(libc::EISDIR))
+             }
+-            InodeData::Regular(ref blob_digest, _blob_size, _) => {
++            InodeData::Regular(ref blob_digest, _blob_size, ..) => {
+                 Span::current().record("blob.digest", blob_digest.to_string());
+
+                 match self
+@@ -932,7 +1085,7 @@ where
+             warn!("inode not found");
+             io::Error::from_raw_os_error(libc::EBADF)
+         })? {
+-            InodeData::Regular(ref blob_digest, _, _) => *blob_digest,
++            InodeData::Regular(ref blob_digest, ..) => *blob_digest,
+             InodeData::Directory(..) => return Err(io::Error::from_raw_os_error(libc::EISDIR)),
+             InodeData::Symlink(_) => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+         };
+@@ -989,24 +1142,47 @@ where
+         name: &CStr,
+         size: u32,
+     ) -> io::Result<GetxattrReply> {
+-        if !self.settings.show_xattr {
++        // Preserve the old "xattrs unsupported" answer when neither source of
++        // attributes is enabled. ENOSYS lets the kernel stop asking. Once a
++        // declaration path is configured we must keep answering, since a
++        // later inode may carry a declared attribute even if this one does
++        // not.
++        if !self.settings.show_xattr && self.settings.fsmeta_path.is_none() {
+             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+         }
+
+-        // Peek at the inode requested, and construct the response.
+-        let digest_str = match *self
++        let inode_data = self
+             .inode_tracker
+             .read()
+             .get(inode)
+-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODATA))?
+-        {
+-            InodeData::Directory(DirectoryInodeData::Sparse(ref digest, _))
+-            | InodeData::Directory(DirectoryInodeData::Populated(ref digest, _))
++            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODATA))?;
++
++        // What the tree declares about the file is an attribute of the file,
++        // so it is served whether or not the synthetic digest attributes below
++        // are enabled. A name outside the served namespace is not an error
++        // here: it simply is not a declared attribute, and might still be a
++        // synthetic one.
++        let declared = crate::attrs::XattrName::try_from(name.to_bytes())
++            .ok()
++            .and_then(|name| inode_data.attrs().attrs().xattrs.get(&name).cloned());
++
++        if let Some(value) = declared {
++            return reply_xattr(&value, size);
++        }
++
++        if !self.settings.show_xattr {
++            return Err(io::Error::from_raw_os_error(libc::ENODATA));
++        }
++
++        // Peek at the inode requested, and construct the response.
++        let digest_str = match *inode_data {
++            InodeData::Directory(DirectoryInodeData::Sparse(ref digest, ..))
++            | InodeData::Directory(DirectoryInodeData::Populated(ref digest, ..))
+                 if name.to_bytes() == XATTR_NAME_DIRECTORY_DIGEST =>
+             {
+                 digest.to_string()
+             }
+-            InodeData::Regular(ref digest, _, _) if name.to_bytes() == XATTR_NAME_BLOB_DIGEST => {
++            InodeData::Regular(ref digest, ..) if name.to_bytes() == XATTR_NAME_BLOB_DIGEST => {
+                 digest.to_string()
+             }
+             _ => {
+@@ -1014,13 +1190,7 @@ where
+             }
+         };
+
+-        if size == 0 {
+-            Ok(GetxattrReply::Count(digest_str.len() as u32))
+-        } else if size < digest_str.len() as u32 {
+-            Err(io::Error::from_raw_os_error(libc::ERANGE))
+-        } else {
+-            Ok(GetxattrReply::Value(digest_str.into_bytes()))
+-        }
++        reply_xattr(digest_str.as_bytes(), size)
+     }
+
+     #[tracing::instrument(skip_all, fields(rq.inode = inode))]
+@@ -1030,7 +1200,7 @@ where
+         inode: Self::Inode,
+         size: u32,
+     ) -> io::Result<ListxattrReply> {
+-        if !self.settings.show_xattr {
++        if !self.settings.show_xattr && self.settings.fsmeta_path.is_none() {
+             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+         }
+
+@@ -1038,6 +1208,15 @@ where
+         let xattrs_names = {
+             let mut out = Vec::new();
+             if let Some(inode_data) = self.inode_tracker.read().get(inode) {
++                for name in inode_data.attrs().attrs().xattrs.keys() {
++                    out.extend_from_slice(name.as_bytes());
++                    out.push_byte(b'\x00');
++                }
++
++                if !self.settings.show_xattr {
++                    return reply_names(out, size);
++                }
++
+                 match *inode_data {
+                     InodeData::Directory(_) => {
+                         out.extend_from_slice(XATTR_NAME_DIRECTORY_DIGEST);
+@@ -1062,3 +1241,25 @@ where
+         }
+     }
+ }
++
++/// Answers a getxattr, honouring the size-probe convention.
++fn reply_xattr(value: &[u8], size: u32) -> io::Result<GetxattrReply> {
++    if size == 0 {
++        Ok(GetxattrReply::Count(value.len() as u32))
++    } else if size < value.len() as u32 {
++        Err(io::Error::from_raw_os_error(libc::ERANGE))
++    } else {
++        Ok(GetxattrReply::Value(value.to_vec()))
++    }
++}
++
++/// Answers a listxattr, honouring the size-probe convention.
++fn reply_names(names: Vec<u8>, size: u32) -> io::Result<ListxattrReply> {
++    if size == 0 {
++        Ok(ListxattrReply::Count(names.len() as u32))
++    } else if size < names.len() as u32 {
++        Err(io::Error::from_raw_os_error(libc::ERANGE))
++    } else {
++        Ok(ListxattrReply::Names(names))
++    }
++}
+diff --git a/snix/cli/castore/src/main.rs b/snix/cli/castore/src/main.rs
+index 79e0dd031..8505c0f92 100644
+--- a/snix/cli/castore/src/main.rs
++++ b/snix/cli/castore/src/main.rs
+@@ -237,6 +237,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+                         list_root: true,
+                         uid_gid_override: uid_gid,
+                         show_xattr,
++
++                        // Which path in a tree carries a declaration is a
++                        // convention of whoever produced it, and castore has
++                        // none. `snix store` serves the Nix one.
++                        fsmeta_path: None,
+                     },
+                     tokio::runtime::Handle::current(),
+                 );
+@@ -293,6 +298,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+                         list_root: true,
+                         uid_gid_override: uid_gid,
+                         show_xattr,
++
++                        // Which path in a tree carries a declaration is a
++                        // convention of whoever produced it, and castore has
++                        // none. `snix store` serves the Nix one.
++                        fsmeta_path: None,
+                     },
+                     tokio::runtime::Handle::current(),
+                 );
+diff --git a/snix/cli/store/src/main.rs b/snix/cli/store/src/main.rs
+index 8291d34e5..164e1ed1e 100644
+--- a/snix/cli/store/src/main.rs
++++ b/snix/cli/store/src/main.rs
+@@ -660,6 +660,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                     list_root,
+                     uid_gid_override: uid_gid,
+                     show_xattr,
++                    // The Nix convention for out-of-band metadata about a store path.
++                    fsmeta_path: Some("nix-support/fsmeta".parse().expect("valid path")),
+                 },
+                 tokio::runtime::Handle::current(),
+             );
+@@ -711,6 +713,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                     list_root,
+                     uid_gid_override: uid_gid,
+                     show_xattr,
++                    // The Nix convention for out-of-band metadata about a store path.
++                    fsmeta_path: Some("nix-support/fsmeta".parse().expect("valid path")),
+                 },
+                 tokio::runtime::Handle::current(),
+             );

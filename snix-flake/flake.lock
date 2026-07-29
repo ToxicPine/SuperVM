@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1785090369,
+        "narHash": "sha256-m0pDuRJG7EDo9ri+4Ksu83VsI+PlxNC9lNBfydejce4=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "624af665418d3c65d544145b4d34ad696439570e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "snix-src": "snix-src"
+      }
+    },
+    "snix-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785179429,
+        "narHash": "sha256-Xk8+Yr+ZAJ1le7grjIhztW15vtprwUOuaaXdI29IJ9I=",
+        "ref": "refs/heads/canon",
+        "rev": "efbc95558ac72105dce13ee7bef679b766d0c69a",
+        "revCount": 22594,
+        "type": "git",
+        "url": "https://git.snix.dev/snix/snix.git"
+      },
+      "original": {
+        "rev": "efbc95558ac72105dce13ee7bef679b766d0c69a",
+        "type": "git",
+        "url": "https://git.snix.dev/snix/snix.git"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

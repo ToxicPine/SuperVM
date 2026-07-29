@@ -1,0 +1,397 @@
+From 0ab50baf2ee23a3f523d119d99c99c9f5189edba Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Tue, 28 Jul 2026 22:31:19 +0100
+Subject: [PATCH 4/4] feat(castore/fs): select DAX per inode
+
+Negotiate FUSE_CAP_PERFILE_DAX when a mapping cache is available and mark
+regular files selected by `snix.dax` with FUSE_ATTR_DAX. Other files retain
+ordinary reads, while setupmapping remains available for whole-mount DAX.
+
+Change-Id: Ibf3aab099f8ac3fa174838eed53947e4ab17e484
+---
+ snix/castore/src/fs/dax_tests.rs | 245 +++++++++++++++++++++++++++++++
+ snix/castore/src/fs/mod.rs       |  77 +++++++++-
+ 2 files changed, 320 insertions(+), 2 deletions(-)
+ create mode 100644 snix/castore/src/fs/dax_tests.rs
+
+diff --git a/snix/castore/src/fs/dax_tests.rs b/snix/castore/src/fs/dax_tests.rs
+new file mode 100644
+index 000000000..da142fb5a
+--- /dev/null
++++ b/snix/castore/src/fs/dax_tests.rs
+@@ -0,0 +1,245 @@
++//! Per-inode DAX negotiation and marking.
++//!
++//! These drive the [FileSystem] trait directly rather than through a mount:
++//! `FUSE_ATTR_DAX` travels in the lookup reply, which a mounted filesystem does
++//! not expose to userspace, and reproducing the mapping itself would need a
++//! VMM. The declaration is a real file in a real castore tree, so the whole
++//! resolution path is exercised.
++
++use std::{collections::BTreeMap, ffi::CString, io::Cursor, sync::Arc};
++
++use fuse_backend_rs::{
++    abi::fuse_abi::{FUSE_ATTR_DAX, KERNEL_MINOR_VERSION},
++    api::filesystem::{Context, FileSystem, FsOptions, ROOT_ID},
++};
++use tempfile::TempDir;
++
++use crate::{
++    Directory, Node, PathComponent,
++    attrs::ATTR_DAX,
++    blobservice::{BlobService, MemoryBlobService},
++    directoryservice::DirectoryService,
++    fixtures,
++    fs::{FSSettings, SnixStoreFs, dax::DaxCache},
++};
++
++const ROOT: &str = "00000000000000000000000000000000-test";
++
++type Fs = SnixStoreFs<
++    Arc<dyn BlobService>,
++    Arc<dyn DirectoryService>,
++    Arc<BTreeMap<PathComponent, Node>>,
++>;
++
++/// A tree of `bin/hello`, `share/doc` and a declaration naming one of them.
++///
++/// Both files are the same blob, so the only thing that can distinguish them
++/// is what the tree declares.
++async fn mk_fs(declaration: &str, dax_cache: Option<DaxCache>) -> Arc<Fs> {
++    let blob_service = Arc::new(MemoryBlobService::default()) as Arc<dyn BlobService>;
++    let directory_service =
++        Arc::new(crate::utils::gen_test_directory_service()) as Arc<dyn DirectoryService>;
++
++    let put = async |contents: Vec<u8>| {
++        let mut w = blob_service.open_write().await;
++        tokio::io::copy(&mut Cursor::new(contents), &mut w)
++            .await
++            .unwrap();
++        let size = w.close().await.unwrap();
++        let _ = size;
++    };
++
++    put(fixtures::BLOB_A.to_vec()).await;
++    put(declaration.as_bytes().to_vec()).await;
++
++    let file = |digest, size, executable| Node::File {
++        digest,
++        size,
++        executable,
++    };
++
++    let blob_a = file(
++        *fixtures::BLOB_A_DIGEST,
++        fixtures::BLOB_A.len() as u64,
++        false,
++    );
++    let decl_digest = blake3::hash(declaration.as_bytes()).into();
++    let decl = file(decl_digest, declaration.len() as u64, false);
++
++    let mk_dir = async |name: &str, node: Node| {
++        let d = Directory::try_from_iter([(PathComponent::try_from(name).unwrap(), node)]).unwrap();
++        directory_service.put(d.clone()).await.unwrap();
++        Node::Directory {
++            digest: d.digest(),
++            size: d.size(),
++        }
++    };
++
++    let bin = mk_dir("hello", blob_a.clone()).await;
++    let share = mk_dir("doc", blob_a).await;
++    let nix_support = mk_dir("fsmeta", decl).await;
++
++    let root = Directory::try_from_iter([
++        ("bin".try_into().unwrap(), bin),
++        ("nix-support".try_into().unwrap(), nix_support),
++        ("share".try_into().unwrap(), share),
++    ])
++    .unwrap();
++    directory_service.put(root.clone()).await.unwrap();
++
++    let root_nodes = BTreeMap::from([(
++        ROOT.try_into().unwrap(),
++        Node::Directory {
++            digest: root.digest(),
++            size: root.size(),
++        },
++    )]);
++
++    let fs = SnixStoreFs::new(
++        blob_service,
++        directory_service,
++        Arc::new(root_nodes),
++        FSSettings {
++            fsmeta_path: Some("nix-support/fsmeta".parse().unwrap()),
++            ..Default::default()
++        },
++        tokio::runtime::Handle::current(),
++    );
++
++    Arc::new(match dax_cache {
++        Some(cache) => fs.with_dax_cache(cache),
++        None => fs,
++    })
++}
++
++/// Filesystem calls block on the tokio handle, so they have to run off the
++/// runtime thread, exactly as the FUSE and vhost-user daemons run them.
++async fn lookup(fs: &Arc<Fs>, path: &[&str]) -> fuse_backend_rs::api::filesystem::Entry {
++    let fs = fs.clone();
++    let path: Vec<CString> = path.iter().map(|p| CString::new(*p).unwrap()).collect();
++
++    tokio::task::spawn_blocking(move || {
++        let mut ino = ROOT_ID;
++        let mut entry = None;
++        for name in &path {
++            let e = fs
++                .lookup(&Context::default(), ino, name)
++                .expect("lookup must succeed");
++            ino = e.inode;
++            entry = Some(e);
++        }
++        entry.expect("at least one component")
++    })
++    .await
++    .unwrap()
++}
++
++fn declaring_hello() -> String {
++    format!("{ATTR_DAX} bin/hello\n")
++}
++
++/// The whole point: with a guest that decides per inode and somewhere to
++/// materialize blobs, exactly the file the tree named is marked.
++#[tokio::test]
++async fn marks_only_what_the_tree_declares() {
++    let dir = TempDir::new().unwrap();
++    let fs = mk_fs(&declaring_hello(), Some(DaxCache::new(dir.path()).unwrap())).await;
++
++    assert!(
++        KERNEL_MINOR_VERSION >= 36,
++        "per-inode DAX was introduced in FUSE 7.36"
++    );
++
++    let opts = fs
++        .init(FsOptions::INIT_EXT | FsOptions::PERFILE_DAX)
++        .unwrap();
++    assert!(opts.contains(FsOptions::INIT_EXT));
++    assert!(opts.contains(FsOptions::PERFILE_DAX));
++
++    let hello = lookup(&fs, &[ROOT, "bin", "hello"]).await;
++    let doc = lookup(&fs, &[ROOT, "share", "doc"]).await;
++
++    assert_eq!(FUSE_ATTR_DAX, hello.attr_flags & FUSE_ATTR_DAX);
++    assert_eq!(0, doc.attr_flags & FUSE_ATTR_DAX);
++
++    // Same blob, different declarations, so they must not share an inode --
++    // otherwise the mark would apply to whichever was looked up first.
++    assert_ne!(hello.inode, doc.inode);
++
++    // Directories have no contents to map, whatever is declared.
++    assert_eq!(0, lookup(&fs, &[ROOT]).await.attr_flags & FUSE_ATTR_DAX);
++}
++
++/// Looking the unmarked one up first must not change the answer for either.
++#[tokio::test]
++async fn marking_does_not_depend_on_lookup_order() {
++    let dir = TempDir::new().unwrap();
++    let fs = mk_fs(&declaring_hello(), Some(DaxCache::new(dir.path()).unwrap())).await;
++    fs.init(FsOptions::PERFILE_DAX).unwrap();
++
++    assert_eq!(
++        0,
++        lookup(&fs, &[ROOT, "share", "doc"]).await.attr_flags & FUSE_ATTR_DAX
++    );
++    assert_eq!(
++        FUSE_ATTR_DAX,
++        lookup(&fs, &[ROOT, "bin", "hello"]).await.attr_flags & FUSE_ATTR_DAX
++    );
++    assert_eq!(
++        0,
++        lookup(&fs, &[ROOT, "share", "doc"]).await.attr_flags & FUSE_ATTR_DAX
++    );
++}
++
++/// A tree that declares nothing behaves exactly as it did before any of this,
++/// including sharing one inode between two names for one blob.
++#[tokio::test]
++async fn a_tree_declaring_nothing_is_unaffected() {
++    let dir = TempDir::new().unwrap();
++    let fs = mk_fs("# nothing\n", Some(DaxCache::new(dir.path()).unwrap())).await;
++    fs.init(FsOptions::PERFILE_DAX).unwrap();
++
++    let hello = lookup(&fs, &[ROOT, "bin", "hello"]).await;
++    let doc = lookup(&fs, &[ROOT, "share", "doc"]).await;
++
++    assert_eq!(0, hello.attr_flags & FUSE_ATTR_DAX);
++    assert_eq!(0, doc.attr_flags & FUSE_ATTR_DAX);
++    assert_eq!(
++        hello.inode, doc.inode,
++        "sharing must be as aggressive as before"
++    );
++}
++
++/// A guest that never offered to decide per inode gets no marks.
++#[tokio::test]
++async fn without_guest_support_nothing_is_marked() {
++    let dir = TempDir::new().unwrap();
++    let fs = mk_fs(&declaring_hello(), Some(DaxCache::new(dir.path()).unwrap())).await;
++
++    assert!(
++        !fs.init(FsOptions::empty())
++            .unwrap()
++            .contains(FsOptions::PERFILE_DAX)
++    );
++    assert_eq!(
++        0,
++        lookup(&fs, &[ROOT, "bin", "hello"]).await.attr_flags & FUSE_ATTR_DAX
++    );
++}
++
++/// Without a cache there is nothing to map, so per-inode DAX is declined
++/// outright rather than promising something setupmapping would then refuse.
++#[tokio::test]
++async fn without_a_cache_perfile_dax_is_declined() {
++    let fs = mk_fs(&declaring_hello(), None).await;
++
++    assert!(
++        !fs.init(FsOptions::PERFILE_DAX)
++            .unwrap()
++            .contains(FsOptions::PERFILE_DAX)
++    );
++    assert_eq!(
++        0,
++        lookup(&fs, &[ROOT, "bin", "hello"]).await.attr_flags & FUSE_ATTR_DAX
++    );
++}
+diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
+index 6021aeae6..a0fac07b4 100644
+--- a/snix/castore/src/fs/mod.rs
++++ b/snix/castore/src/fs/mod.rs
+@@ -12,6 +12,9 @@ pub mod fuse;
+ #[cfg(feature = "virtiofs")]
+ pub mod dax;
+ 
++#[cfg(all(test, feature = "virtiofs", target_os = "linux"))]
++mod dax_tests;
++
+ #[cfg(feature = "virtiofs")]
+ pub mod virtiofs;
+ 
+@@ -129,6 +132,13 @@ pub struct SnixStoreFs<BS, DS, RN: RootNodes> {
+     /// ordinary reads.
+     #[cfg(feature = "virtiofs")]
+     dax_cache: Option<dax::DaxCache>,
++
++    /// Whether the guest agreed to decide DAX per inode, negotiated in `init`.
++    ///
++    /// Until it has, marking individual inodes says nothing: a guest either
++    /// maps everything or nothing, according to how it was mounted.
++    #[cfg(all(feature = "virtiofs", target_os = "linux"))]
++    perfile_dax: std::sync::atomic::AtomicBool,
+ }
+ 
+ /// Configures some filesystem settings
+@@ -189,6 +199,9 @@ where
+ 
+             #[cfg(feature = "virtiofs")]
+             dax_cache: None,
++
++            #[cfg(all(feature = "virtiofs", target_os = "linux"))]
++            perfile_dax: std::sync::atomic::AtomicBool::new(false),
+         }
+     }
+ 
+@@ -494,7 +507,41 @@ where
+     /// communicated here, which is why this exists rather than callers reaching
+     /// for [attr_to_fuse_entry] directly.
+     fn inode_data_to_fuse_entry(&self, inode_data: &InodeData, ino: u64) -> Entry {
+-        attr_to_fuse_entry(self.inode_data_to_attr(inode_data, ino))
++        let mut entry = attr_to_fuse_entry(self.inode_data_to_attr(inode_data, ino));
++
++        #[cfg(all(feature = "virtiofs", target_os = "linux"))]
++        if self.dax_eligible(inode_data) {
++            entry.attr_flags |= fuse_backend_rs::abi::fuse_abi::FUSE_ATTR_DAX;
++            debug!(ino, "marking inode to be mapped rather than read");
++        }
++
++        entry
++    }
++
++    /// Whether the guest should map this inode rather than read it.
++    ///
++    /// Four things have to hold, and all of them can independently be false on
++    /// a working system, which is why every one of them falls back to ordinary
++    /// reads rather than to an error:
++    ///
++    /// - the guest agreed to decide this per inode;
++    /// - we have somewhere to materialize blobs, so a mapping can be answered
++    ///   at all;
++    /// - the node is a regular file, the only thing with contents to map;
++    /// - the tree asked for this file to be mapped.
++    ///
++    /// The last of those defaults to not mapping, which is the polarity of the
++    /// primitive underneath: `FUSE_ATTR_DAX` is a bit the filesystem sets, and
++    /// an inode whose lookup reply leaves it clear is not mapped. A tree that
++    /// says nothing gets what it would have got before any of this existed.
++    #[cfg(all(feature = "virtiofs", target_os = "linux"))]
++    fn dax_eligible(&self, inode_data: &InodeData) -> bool {
++        use std::sync::atomic::Ordering;
++
++        self.perfile_dax.load(Ordering::Relaxed)
++            && self.dax_cache.is_some()
++            && matches!(inode_data, InodeData::Regular(..))
++            && inode_data.attrs().attrs().dax
+     }
+ }
+ fn attr_to_fuse_entry(attr: Attr) -> Entry {
+@@ -546,7 +593,7 @@ where
+     type Handle = u64;
+     type Inode = u64;
+ 
+-    fn init(&self, _capable: FsOptions) -> io::Result<FsOptions> {
++    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+         let mut opts = FsOptions::empty();
+ 
+         // allow more than one pending read request per file-handle at any time
+@@ -565,6 +612,22 @@ where
+         }
+         // TODO: figure out what dawrin options make sense.
+ 
++        // Decide DAX per inode rather than for the whole mount, when the guest
++        // offers to and we can actually answer a mapping. Guests which do not
++        // offer it keep whatever their mount options said, and read normally.
++        #[cfg(all(feature = "virtiofs", target_os = "linux"))]
++        if capable.contains(FsOptions::PERFILE_DAX) && self.dax_cache.is_some() {
++            // PERFILE_DAX lives in flags2. INIT_EXT tells the kernel that the
++            // flags2 word in our reply is valid; without echoing it the kernel
++            // silently ignores the negotiated capability and every inode
++            // falls back to ordinary reads.
++            opts |= FsOptions::INIT_EXT | FsOptions::PERFILE_DAX;
++            self.perfile_dax
++                .store(true, std::sync::atomic::Ordering::Relaxed);
++        }
++
++        let _ = capable;
++
+         Ok(opts)
+     }
+ 
+@@ -1054,6 +1117,16 @@ where
+     ///
+     /// Reports `ENOSYS` when no cache is configured, which makes the guest fall
+     /// back to ordinary reads.
++    ///
++    /// Which inodes a guest maps is the guest's business. Where per-inode DAX
++    /// was negotiated it will only ask about inodes we marked, but a guest
++    /// mounted with DAX for the whole filesystem asks about all of them, and
++    /// answering is still correct -- mapping is a way of reading, not a
++    /// different view of the data. So this does not re-check eligibility.
++    ///
++    /// Nothing here requires the cache directory to live on a DAX-capable
++    /// filesystem. The pages a guest ends up mapping are host page cache pages
++    /// for the cache file, so the file only has to be a real file.
+     #[cfg(feature = "virtiofs")]
+     #[tracing::instrument(skip_all, fields(rq.inode = inode, rq.foffset = foffset, rq.len = len, rq.moffset = moffset), err)]
+     fn setupmapping(

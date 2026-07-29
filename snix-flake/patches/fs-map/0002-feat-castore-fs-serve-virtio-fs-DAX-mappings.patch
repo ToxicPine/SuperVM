@@ -1,0 +1,137 @@
+From c33180950c3ba8e8ad85f4aa409e3c40db08e907 Mon Sep 17 00:00:00 2001
+From: SuperVM <supervm@localhost>
+Date: Tue, 28 Jul 2026 13:43:22 +0100
+Subject: [PATCH 2/6] feat(castore/fs): serve DAX mappings
+
+Implement setupmapping and removemapping by materializing an inode's blob and
+passing its descriptor to the VMM. Without a cache mappings return ENOSYS;
+writable mappings return EROFS because castore contents are immutable.
+
+Change-Id: I598099d1c1b62e06296eed7a6fec166062ea3183
+---
+ snix/castore/src/fs/mod.rs | 95 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 95 insertions(+)
+
+diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
+index 1003492..11360b8 100644
+--- a/snix/castore/src/fs/mod.rs
++++ b/snix/castore/src/fs/mod.rs
+@@ -116,6 +116,13 @@ pub struct SnixStoreFs<BS, DS, RN: RootNodes> {
+     next_file_handle: AtomicU64,
+ 
+     tokio_handle: tokio::runtime::Handle,
++
++    /// Backing store for DAX mappings, if the filesystem is serving them.
++    ///
++    /// Without one, `setupmapping` reports `ENOSYS` and guests fall back to
++    /// ordinary reads.
++    #[cfg(feature = "virtiofs")]
++    dax_cache: Option<dax::DaxCache>,
+ }
+ 
+ /// Configures some filesystem settings
+@@ -161,9 +168,23 @@ where
+             file_handles: RwLock::new(Default::default()),
+             next_file_handle: AtomicU64::new(1),
+             tokio_handle,
++
++            #[cfg(feature = "virtiofs")]
++            dax_cache: None,
+         }
+     }
+ 
++    /// Serve DAX mappings for regular files, backed by `dax_cache`.
++    ///
++    /// Blobs are materialized into the cache on demand. Point several
++    /// filesystems at one cache directory to have them share host pages for
++    /// blobs they both map.
++    #[cfg(feature = "virtiofs")]
++    pub fn with_dax_cache(mut self, dax_cache: dax::DaxCache) -> Self {
++        self.dax_cache = Some(dax_cache);
++        self
++    }
++
+     /// Retrieves the inode for a given root node basename, if present.
+     /// This obtains a read lock on self.root_nodes.
+     fn get_inode_for_root_name(&self, name: &PathComponent) -> Option<u64> {
+@@ -870,6 +891,80 @@ where
+         Ok(bytes_written as usize)
+     }
+ 
++    /// Sets up a DAX mapping for a regular file.
++    ///
++    /// Blob contents are streamed and have no descriptor of their own, so the
++    /// blob is materialized into the configured [dax::DaxCache] and the
++    /// resulting descriptor is handed to the VMM. Guests sharing a cache
++    /// directory therefore map the same host file for the same blob.
++    ///
++    /// Reports `ENOSYS` when no cache is configured, which makes the guest fall
++    /// back to ordinary reads.
++    #[cfg(feature = "virtiofs")]
++    #[tracing::instrument(skip_all, fields(rq.inode = inode, rq.foffset = foffset, rq.len = len, rq.moffset = moffset), err)]
++    fn setupmapping(
++        &self,
++        _ctx: &Context,
++        inode: Self::Inode,
++        _handle: Self::Handle,
++        foffset: u64,
++        len: u64,
++        flags: u64,
++        moffset: u64,
++        vu_req: &mut dyn fuse_backend_rs::transport::FsCacheReqHandler,
++    ) -> io::Result<()> {
++        use fuse_backend_rs::abi::virtio_fs::SetupmappingFlags;
++        use std::os::fd::AsRawFd;
++
++        let Some(dax_cache) = self.dax_cache.as_ref() else {
++            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
++        };
++
++        // A castore is immutable, and the cache entry is shared between every
++        // guest mapping that blob. A writable mapping could never be honoured.
++        if flags & SetupmappingFlags::WRITE.bits() != 0 {
++            warn!("rejecting writable DAX mapping");
++            return Err(io::Error::from_raw_os_error(libc::EROFS));
++        }
++
++        let blob_digest = match *self.inode_tracker.read().get(inode).ok_or_else(|| {
++            warn!("inode not found");
++            io::Error::from_raw_os_error(libc::EBADF)
++        })? {
++            InodeData::Regular(ref blob_digest, _, _) => *blob_digest,
++            InodeData::Directory(..) => return Err(io::Error::from_raw_os_error(libc::EISDIR)),
++            InodeData::Symlink(_) => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
++        };
++
++        Span::current().record("blob.digest", blob_digest.to_string());
++
++        let file = dax_cache.open_blob(&blob_digest, &self.blob_service, &self.tokio_handle)?;
++
++        // The VMM duplicates the descriptor while handling this request; the
++        // cache additionally keeps it open for as long as the cache lives.
++        vu_req.map(foffset, moffset, len, flags, file.as_raw_fd())
++    }
++
++    /// Tears down DAX mappings previously established by [Self::setupmapping].
++    ///
++    /// Mappings are identified by their position in the DAX window, so this
++    /// needs no per-inode state and is simply forwarded to the VMM.
++    #[cfg(feature = "virtiofs")]
++    #[tracing::instrument(skip_all, fields(rq.inode = inode, rq.requests = requests.len()), err)]
++    fn removemapping(
++        &self,
++        _ctx: &Context,
++        inode: Self::Inode,
++        requests: Vec<fuse_backend_rs::abi::virtio_fs::RemovemappingOne>,
++        vu_req: &mut dyn fuse_backend_rs::transport::FsCacheReqHandler,
++    ) -> io::Result<()> {
++        if self.dax_cache.is_none() {
++            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
++        }
++
++        vu_req.unmap(requests)
++    }
++
+     #[tracing::instrument(skip_all, fields(rq.inode = inode))]
+     fn readlink(&self, _ctx: &Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
+         if inode == ROOT_ID {

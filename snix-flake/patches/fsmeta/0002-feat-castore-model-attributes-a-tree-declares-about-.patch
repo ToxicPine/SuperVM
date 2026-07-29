@@ -1,0 +1,612 @@
+From 2fce88c5ed874b774daa746086c1d03db3ced484 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Wed, 29 Jul 2026 02:43:35 +0100
+Subject: [PATCH 2/4] feat(castore): model declared tree metadata
+
+Model filesystem metadata as a line-oriented declaration file inside the tree,
+with base64 `user.*` attributes and internal `snix.*` policies for relative
+paths. Derive subtree identities from declarations so consumers do not merge
+nodes carrying different metadata.
+
+Change-Id: I68a7c82759bcbc94738fa2e4a5adfa9cc2051bc0
+---
+ snix/castore/src/attrs.rs | 577 ++++++++++++++++++++++++++++++++++++++
+ snix/castore/src/lib.rs   |   1 +
+ 2 files changed, 578 insertions(+)
+ create mode 100644 snix/castore/src/attrs.rs
+
+diff --git a/snix/castore/src/attrs.rs b/snix/castore/src/attrs.rs
+new file mode 100644
+index 000000000..d395bb414
+--- /dev/null
++++ b/snix/castore/src/attrs.rs
+@@ -0,0 +1,577 @@
++//! Filesystem attributes declared by a tree, about itself.
++//!
++//! A castore [Node](crate::Node) describes what a NAR describes: the shape of a
++//! tree, the contents of its files, and whether those files are executable.
++//! Real filesystems carry more — extended attributes, and hints about how
++//! contents are best accessed — and none of it can be added to the castore
++//! model or to the NAR without changing every digest and every store path.
++//!
++//! So a tree carries it as *contents*: an ordinary file, somewhere inside the
++//! tree, declaring attributes for paths relative to that tree's root. Being
++//! contents, it needs no format extension, it travels through every existing
++//! tool untouched, and it is covered by whatever already covers the tree — a
++//! NAR hash, and any signature over one. It also cannot be stripped without
++//! changing that hash.
++//!
++//! # Namespaces
++//!
++//! Two namespaces, distinguished by what reads them:
++//!
++//! - `user.` is **served**. These are handed to whoever mounts the tree, as
++//!   extended attributes, verbatim. Nothing here interprets them.
++//! - `snix.` is **interpreted**. These are consumed as policy — currently only
++//!   `snix.dax` — and are never served, so they cannot be
++//!   confused with real attributes of the file.
++//!
++//! Anything else is refused. `security.`, `system.` and `trusted.` are
++//! kernel-interpreted and usually privileged; serving them from a declaration
++//! in a file would claim an authority this has no business claiming.
++
++use std::{
++    collections::BTreeMap,
++    fmt,
++    sync::{Arc, LazyLock},
++};
++
++use bytes::Bytes;
++use data_encoding::BASE64;
++
++use crate::{
++    B3Digest,
++    path::{Path, PathComponent},
++};
++
++/// The attribute declaring that a file's contents are better mapped than
++/// copied. Interpreted by [crate::fs], never served.
++pub const ATTR_DAX: &str = "snix.dax";
++
++/// The largest declaration file that will be parsed.
++///
++/// The file is contents like any other, so it could be any size; this bounds
++/// what is read into memory before anything about it is known.
++pub const MAX_SIZE: usize = 4 * 1024 * 1024;
++
++/// The name of an extended attribute served to whoever mounts the tree.
++///
++/// Constructing one enforces the namespace policy, so a name that exists is a
++/// name that may be served.
++#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
++pub struct XattrName(Bytes);
++
++impl XattrName {
++    /// The only namespace served.
++    pub const NAMESPACE: &'static [u8] = b"user.";
++
++    /// The kernel's limit on an attribute name, including the namespace.
++    pub const MAX_LEN: usize = 255;
++
++    pub fn as_bytes(&self) -> &[u8] {
++        &self.0
++    }
++}
++
++impl TryFrom<&[u8]> for XattrName {
++    type Error = AttrError;
++
++    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
++        if !value.starts_with(Self::NAMESPACE) {
++            return Err(AttrError::NotServable);
++        }
++        if value.len() == Self::NAMESPACE.len() {
++            return Err(AttrError::EmptyName);
++        }
++        if value.len() > Self::MAX_LEN {
++            return Err(AttrError::NameTooLong);
++        }
++        if value.contains(&0) {
++            return Err(AttrError::InteriorNul);
++        }
++
++        Ok(Self(Bytes::copy_from_slice(value)))
++    }
++}
++
++impl AsRef<[u8]> for XattrName {
++    fn as_ref(&self) -> &[u8] {
++        &self.0
++    }
++}
++
++impl fmt::Debug for XattrName {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        fmt::Debug::fmt(bstr::BStr::new(&self.0), f)
++    }
++}
++
++impl fmt::Display for XattrName {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        fmt::Display::fmt(bstr::BStr::new(&self.0), f)
++    }
++}
++
++/// What a tree declares about one of its nodes.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct NodeAttrs {
++    /// Extended attributes to serve verbatim, ordered by name.
++    pub xattrs: BTreeMap<XattrName, Bytes>,
++    /// Whether [ATTR_DAX] asks for the contents to be mapped rather than
++    /// copied. Only meaningful on regular files.
++    ///
++    /// False is the default because `dax=inode` follows the `FUSE_ATTR_DAX`
++    /// bit in a lookup reply: an inode is non-DAX unless the server marks it.
++    pub dax: bool,
++}
++
++impl NodeAttrs {
++    /// Whether this says anything at all.
++    pub fn is_default(&self) -> bool {
++        !self.dax && self.xattrs.is_empty()
++    }
++}
++
++/// An immutable tree of [NodeAttrs], addressed by [Path] relative to a root.
++///
++/// Descend it alongside a castore tree with [AttrTree::child], which is defined
++/// for every name, so a consumer never has to branch on whether a declaration
++/// exists.
++pub struct AttrTree {
++    attrs: NodeAttrs,
++    children: BTreeMap<PathComponent, Arc<AttrTree>>,
++    id: B3Digest,
++}
++
++/// The tree declaring nothing about anything.
++///
++/// Shared, so descending into undeclared parts of a tree allocates nothing and
++/// yields one stable identity.
++static EMPTY: LazyLock<Arc<AttrTree>> =
++    LazyLock::new(|| Arc::new(AttrTree::assemble(NodeAttrs::default(), BTreeMap::new())));
++
++impl AttrTree {
++    /// The tree declaring nothing.
++    pub fn empty() -> Arc<AttrTree> {
++        EMPTY.clone()
++    }
++
++    /// [AttrTree::empty], without cloning the [Arc].
++    pub fn empty_ref() -> &'static Arc<AttrTree> {
++        &EMPTY
++    }
++
++    /// Parses a declaration file.
++    ///
++    /// The format is line-oriented, so a build can write it with a shell:
++    ///
++    /// ```text
++    /// # one attribute per line
++    /// snix.dax bin/hello
++    /// user.mime=YXBwbGljYXRpb24veC1leGVjdXRhYmxl bin/hello
++    /// ```
++    ///
++    /// Each line is `name[=base64-value]` followed by a space and the path,
++    /// relative to the root of the tree, which runs to the end of the line so
++    /// that spaces in filenames need no quoting. Blank lines and lines starting
++    /// with `#` are ignored. The empty path addresses the root itself.
++    ///
++    /// Values are base64 so that arbitrary bytes survive a text format. A name
++    /// given without `=` declares an empty value, which is what a flag such as
++    /// [ATTR_DAX] uses.
++    ///
++    /// A path containing a newline cannot be addressed, and so cannot be
++    /// annotated. Nothing breaks; those files are simply served without
++    /// declarations.
++    pub fn parse(input: &[u8]) -> Result<Arc<AttrTree>, AttrError> {
++        if input.len() > MAX_SIZE {
++            return Err(AttrError::TooLarge { size: input.len() });
++        }
++
++        let mut root = Builder::default();
++
++        for (i, line) in input.split(|b| *b == b'\n').enumerate() {
++            let line = strip_trailing_cr(line);
++            if line.is_empty() || line[0] == b'#' {
++                continue;
++            }
++
++            let at = |e: AttrError| AttrError::Line {
++                line: i + 1,
++                source: Box::new(e),
++            };
++
++            let (decl, path) = split_once(line, b' ').ok_or_else(|| at(AttrError::NoPath))?;
++            let (name, value) = match split_once(decl, b'=') {
++                Some((name, value)) => (
++                    name,
++                    BASE64
++                        .decode(value)
++                        .map_err(|_| at(AttrError::InvalidValue))?,
++                ),
++                None => (decl, Vec::new()),
++            };
++
++            let path = Path::from_bytes(path).ok_or_else(|| at(AttrError::InvalidPath))?;
++
++            let mut cursor = &mut root;
++            for component in path.components() {
++                cursor = cursor.children.entry(component).or_default();
++            }
++
++            if name == ATTR_DAX.as_bytes() {
++                cursor.attrs.dax = true;
++                continue;
++            }
++
++            let name = XattrName::try_from(name).map_err(at)?;
++            if cursor.attrs.xattrs.insert(name, value.into()).is_some() {
++                return Err(at(AttrError::Duplicate));
++            }
++        }
++
++        Ok(root.freeze())
++    }
++
++    /// What is declared about this node.
++    pub fn attrs(&self) -> &NodeAttrs {
++        &self.attrs
++    }
++
++    /// The subtree applying below `name`.
++    ///
++    /// Names about which nothing is declared yield [AttrTree::empty], so this
++    /// is total: a consumer descends unconditionally.
++    pub fn child(&self, name: &PathComponent) -> Arc<AttrTree> {
++        match self.children.get(name) {
++            Some(child) => child.clone(),
++            None => AttrTree::empty(),
++        }
++    }
++
++    /// What is declared at `path`, relative to this node.
++    pub fn get(&self, path: &Path) -> NodeAttrs {
++        let mut components = path.components();
++
++        let Some(first) = components.next() else {
++            return self.attrs.clone();
++        };
++
++        let mut cursor = match self.children.get(&first) {
++            Some(child) => child.clone(),
++            None => return NodeAttrs::default(),
++        };
++
++        for component in components {
++            let next = cursor.children.get(&component).cloned();
++            cursor = match next {
++                Some(child) => child,
++                None => return NodeAttrs::default(),
++            };
++        }
++
++        cursor.attrs.clone()
++    }
++
++    /// Whether this declares nothing, here or below.
++    pub fn is_empty(&self) -> bool {
++        self.id == EMPTY.id
++    }
++
++    /// The identity of this subtree.
++    ///
++    /// Two subtrees have the same identity exactly when they declare the same
++    /// things for the same relative paths. Consumers which coalesce state by
++    /// content — such as the inode allocator in [crate::fs] — key on it so they
++    /// need not compare whole trees.
++    pub fn id(&self) -> &B3Digest {
++        &self.id
++    }
++
++    /// Builds a node and computes its identity, Merkle-wise, in one pass.
++    fn assemble(attrs: NodeAttrs, children: BTreeMap<PathComponent, Arc<AttrTree>>) -> Self {
++        let mut hasher = blake3::Hasher::new();
++
++        hasher.update(&[u8::from(attrs.dax)]);
++        hasher.update(&(attrs.xattrs.len() as u64).to_le_bytes());
++        for (name, value) in &attrs.xattrs {
++            hasher.update(&(name.as_bytes().len() as u64).to_le_bytes());
++            hasher.update(name.as_bytes());
++            hasher.update(&(value.len() as u64).to_le_bytes());
++            hasher.update(value);
++        }
++
++        hasher.update(&(children.len() as u64).to_le_bytes());
++        for (name, child) in &children {
++            let name = name.as_ref();
++            hasher.update(&(name.len() as u64).to_le_bytes());
++            hasher.update(name);
++            hasher.update(child.id.as_ref());
++        }
++
++        Self {
++            attrs,
++            children,
++            id: hasher.finalize().into(),
++        }
++    }
++}
++
++impl fmt::Debug for AttrTree {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("AttrTree")
++            .field("attrs", &self.attrs)
++            .field("children", &self.children.keys().collect::<Vec<_>>())
++            .finish()
++    }
++}
++
++impl PartialEq for AttrTree {
++    fn eq(&self, other: &Self) -> bool {
++        self.id == other.id
++    }
++}
++
++impl Eq for AttrTree {}
++
++/// A tree under construction, before identities are computed.
++#[derive(Default)]
++struct Builder {
++    attrs: NodeAttrs,
++    children: BTreeMap<PathComponent, Builder>,
++}
++
++impl Builder {
++    fn freeze(self) -> Arc<AttrTree> {
++        let children: BTreeMap<PathComponent, Arc<AttrTree>> = self
++            .children
++            .into_iter()
++            .map(|(name, child)| (name, child.freeze()))
++            .filter(|(_, child)| !child.is_empty())
++            .collect();
++
++        if self.attrs.is_default() && children.is_empty() {
++            return AttrTree::empty();
++        }
++
++        Arc::new(AttrTree::assemble(self.attrs, children))
++    }
++}
++
++fn strip_trailing_cr(line: &[u8]) -> &[u8] {
++    match line.split_last() {
++        Some((b'\r', rest)) => rest,
++        _ => line,
++    }
++}
++
++fn split_once(haystack: &[u8], sep: u8) -> Option<(&[u8], &[u8])> {
++    let i = haystack.iter().position(|b| *b == sep)?;
++    Some((&haystack[..i], &haystack[i + 1..]))
++}
++
++#[derive(Debug, thiserror::Error, PartialEq)]
++pub enum AttrError {
++    #[error("line {line}: {source}")]
++    Line { line: usize, source: Box<AttrError> },
++
++    #[error("declaration is {size} bytes, larger than the {MAX_SIZE} byte limit")]
++    TooLarge { size: usize },
++
++    #[error("no path given")]
++    NoPath,
++
++    #[error("path is not a valid relative path")]
++    InvalidPath,
++
++    #[error("value is not valid base64")]
++    InvalidValue,
++
++    #[error("declared twice for the same path")]
++    Duplicate,
++
++    #[error("only the user. namespace is served, and only snix. is interpreted")]
++    NotServable,
++
++    #[error("the namespace prefix on its own is not a name")]
++    EmptyName,
++
++    #[error("name is longer than the 255 bytes the kernel allows")]
++    NameTooLong,
++
++    #[error("name contains a null byte")]
++    InteriorNul,
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{ATTR_DAX, AttrError, AttrTree, NodeAttrs, XattrName};
++    use crate::PathBuf;
++
++    fn path(s: &str) -> PathBuf {
++        s.parse().unwrap()
++    }
++
++    fn parse(s: &str) -> Result<std::sync::Arc<AttrTree>, AttrError> {
++        AttrTree::parse(s.as_bytes())
++    }
++
++    fn served(t: &AttrTree, p: &str) -> Vec<(String, String)> {
++        t.get(&path(p))
++            .xattrs
++            .iter()
++            .map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v).into_owned()))
++            .collect()
++    }
++
++    #[test]
++    fn declaring_nothing_yields_nothing() {
++        for input in ["", "\n\n", "# just a comment\n", "\n# and a blank line\n\n"] {
++            assert!(parse(input).unwrap().is_empty(), "{input:?}");
++        }
++    }
++
++    /// The split that matters: `user.` reaches whoever mounts the tree,
++    /// `snix.` is consumed here and never served.
++    #[test]
++    fn user_is_served_and_snix_is_interpreted() {
++        let t = parse(&format!(
++            "{ATTR_DAX} bin/hello\n\
++             user.mime=dGV4dC9wbGFpbg== bin/hello\n"
++        ))
++        .unwrap();
++
++        let attrs = t.get(&path("bin/hello"));
++        assert!(attrs.dax, "snix.dax must be interpreted");
++        assert_eq!(
++            vec![("user.mime".to_string(), "text/plain".to_string())],
++            served(&t, "bin/hello"),
++            "only the user. attribute may be served",
++        );
++    }
++
++    #[test]
++    fn a_name_without_a_value_declares_an_empty_one() {
++        let t = parse("user.flag bin/hello\n").unwrap();
++        assert_eq!(
++            vec![("user.flag".to_string(), String::new())],
++            served(&t, "bin/hello"),
++        );
++    }
++
++    /// Values are base64 so arbitrary bytes survive a line-oriented format.
++    #[test]
++    fn values_may_be_arbitrary_bytes() {
++        let t = parse("user.raw=AAECgP8= f\n").unwrap();
++        assert_eq!(
++            &[0x00u8, 0x01, 0x02, 0x80, 0xff][..],
++            &t.get(&path("f")).xattrs.values().next().unwrap()[..],
++        );
++    }
++
++    /// The path runs to the end of the line, so spaces need no quoting.
++    #[test]
++    fn paths_may_contain_spaces() {
++        let t = parse("user.a share/a file with spaces\n").unwrap();
++        assert_eq!(1, served(&t, "share/a file with spaces").len());
++    }
++
++    #[test]
++    fn the_empty_path_addresses_the_root() {
++        let t = parse(&format!("{ATTR_DAX} \n")).unwrap();
++        assert!(t.attrs().dax);
++    }
++
++    #[test]
++    fn refuses_namespaces_it_has_no_business_serving() {
++        for name in [
++            "security.selinux",
++            "system.posix_acl_access",
++            "trusted.overlay.opaque",
++            "user.",
++            "mime",
++        ] {
++            assert!(
++                matches!(
++                    parse(&format!("{name}=AA== f\n")),
++                    Err(AttrError::Line { .. })
++                ),
++                "{name} must be refused",
++            );
++        }
++    }
++
++    #[test]
++    fn refuses_malformed_lines() {
++        assert!(matches!(
++            parse("user.a=AA==\n"),
++            Err(AttrError::Line { .. })
++        ));
++        assert!(matches!(
++            parse("user.a=not-base64! f\n"),
++            Err(AttrError::Line { .. })
++        ));
++        assert!(matches!(
++            parse("user.a=AA== ../f\n"),
++            Err(AttrError::Line { .. })
++        ));
++        assert!(matches!(
++            parse("user.a=AA== a//b\n"),
++            Err(AttrError::Line { .. })
++        ));
++        assert!(matches!(
++            parse("user.a=AA== f\nuser.a=AQ== f\n"),
++            Err(AttrError::Line { .. })
++        ));
++    }
++
++    #[test]
++    fn refuses_oversized_declarations() {
++        let huge = vec![b'#'; super::MAX_SIZE + 1];
++        assert_eq!(
++            Err(AttrError::TooLarge {
++                size: super::MAX_SIZE + 1
++            }),
++            AttrTree::parse(&huge),
++        );
++    }
++
++    /// Descending must agree with an absolute lookup, since the filesystem uses
++    /// the former and the tests state the latter.
++    #[test]
++    fn descending_agrees_with_lookup() {
++        let t = parse(&format!("{ATTR_DAX} bin/hello\n")).unwrap();
++
++        let bin = t.child(&"bin".try_into().unwrap());
++        assert!(bin.child(&"hello".try_into().unwrap()).attrs().dax);
++        assert!(bin.child(&"nowhere".try_into().unwrap()).is_empty());
++        assert_eq!(NodeAttrs::default(), t.get(&path("bin")));
++    }
++
++    /// Identity must depend on what is declared and nothing else, because
++    /// consumers use it to decide whether two occurrences of one castore node
++    /// may share state.
++    #[test]
++    fn identity_tracks_declarations() {
++        let a = parse(&format!("{ATTR_DAX} bin/hello\n")).unwrap();
++        let b = parse(&format!("# a comment\n\n{ATTR_DAX} bin/hello\n")).unwrap();
++        let c = parse(&format!("{ATTR_DAX} bin/other\n")).unwrap();
++        let d = parse("user.a=AA== bin/hello\n").unwrap();
++
++        assert_eq!(a.id(), b.id(), "formatting must not matter");
++        assert_ne!(a.id(), c.id());
++        assert_ne!(a.id(), d.id());
++        assert_ne!(a.id(), AttrTree::empty().id());
++
++        assert_eq!(
++            a.child(&"bin".try_into().unwrap()).id(),
++            b.child(&"bin".try_into().unwrap()).id(),
++        );
++    }
++
++    #[test]
++    fn xattr_name_policy() {
++        assert!(XattrName::try_from(&b"user.mime"[..]).is_ok());
++        assert_eq!(
++            Err(AttrError::NotServable),
++            XattrName::try_from(&b"snix.dax"[..])
++        );
++    }
++}
+diff --git a/snix/castore/src/lib.rs b/snix/castore/src/lib.rs
+index d9e281c28..f055f0ac2 100644
+--- a/snix/castore/src/lib.rs
++++ b/snix/castore/src/lib.rs
+@@ -3,6 +3,7 @@
+ mod digests;
+ mod errors;
+ 
++pub mod attrs;
+ pub mod blobservice;
+ pub mod composition;
+ pub mod directoryservice;

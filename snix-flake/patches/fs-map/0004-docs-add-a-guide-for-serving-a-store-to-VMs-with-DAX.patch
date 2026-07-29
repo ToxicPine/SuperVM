@@ -1,0 +1,124 @@
+From b39d3b1c11ea9172a57d9d2eb5631c822691d864 Mon Sep 17 00:00:00 2001
+From: SuperVM <supervm@localhost>
+Date: Tue, 28 Jul 2026 13:43:32 +0100
+Subject: [PATCH 4/6] docs: document serving stores with DAX
+
+Document serving a store with DAX, sharing its backing directory between VMs,
+and the required CONFIG_FUSE_DAX and CONFIG_FS_DAX guest options.
+
+Change-Id: I5ef8507c052373ea13075c8c38268ee3e8e3a421
+---
+ web/content/docs/guides/virtiofs-dax.md | 104 ++++++++++++++++++++++++
+ 1 file changed, 104 insertions(+)
+ create mode 100644 web/content/docs/guides/virtiofs-dax.md
+
+diff --git a/web/content/docs/guides/virtiofs-dax.md b/web/content/docs/guides/virtiofs-dax.md
+new file mode 100644
+index 0000000..73fb6db
+--- /dev/null
++++ b/web/content/docs/guides/virtiofs-dax.md
+@@ -0,0 +1,104 @@
++---
++title: "Serve a store to VMs over virtio-fs with DAX"
++slug: virtiofs-dax
++description: ""
++summary: ""
++date: 2026-07-28T00:00:00+00:00
++lastmod: 2026-07-28T00:00:00+00:00
++draft: false
++weight: 16
++toc: true
++---
++
++This document describes how to expose a store to virtual machines with
++`snix store virtiofs`, and how to enable DAX so that guests read file contents
++directly out of the host page cache.
++
++### Run the virtio-fs daemon
++
++`snix store virtiofs` serves a store over a vhost-user socket, which a VMM
++attaches to a guest as a virtio-fs device:
++
++```bash
++snix store virtiofs /run/snix/vm.sock
++```
++
++Point the daemon at whichever services hold your data, the same way as
++`snix store mount`:
++
++```bash
++export BLOB_SERVICE_ADDR=objectstore+file:///var/lib/snix-castore/blobs
++export DIRECTORY_SERVICE_ADDR=redb:///var/lib/snix-castore/directories.redb
++export PATH_INFO_SERVICE_ADDR=redb:///var/lib/snix-store/pathinfo.redb
++```
++
++Each guest needs its own socket, so start one daemon per VM.
++
++### Enable DAX
++
++Without DAX, a guest reading a file sends a request to the daemon, which copies
++the contents into the guest. The bytes then live in both the host page cache and
++the guest's, and every guest pays that cost separately.
++
++With DAX, the guest instead asks the VMM to map the file into a window of guest
++physical memory, and reads it in place. Nothing is copied, and the guest does
++not cache what the host is already caching.
++
++Files are served lazily from a castore and have no descriptor of their own, so
++they must be written somewhere mappable first. Pass a directory to hold them:
++
++```bash
++snix store virtiofs --dax-backing-dir /var/cache/snix-dax /run/snix/vm.sock
++```
++
++Blobs are materialized into that directory on first use and named by their
++digest. Nothing is written there for files a guest never maps.
++
++Your VMM must also be given a DAX window. With [Alioth]:
++
++```bash
++alioth boot ... --fs vu,socket=/run/snix/vm.sock,tag=snix,dax_window=1g
++```
++
++The window is a span of guest address space, not memory that gets allocated, so
++sizing it generously is cheap. Guests mount the filesystem with `-o dax`:
++
++```bash
++mount -t virtiofs -o dax snix /nix/store
++```
++
++DAX requires a guest kernel built with `CONFIG_FUSE_DAX`, which in turn requires
++`CONFIG_FS_DAX`. Distribution kernels do not always enable these. Where the
++guest, the VMM, or the daemon lacks DAX support, mapping requests are declined
++and reads fall back to being copied, so a `--dax-backing-dir` that is never populated
++is a sign that DAX is not actually in use.
++
++### Sharing one cache between VMs
++
++Entries in the cache are named by content digest, so several daemons can be
++pointed at one directory:
++
++```bash
++snix store virtiofs --dax-backing-dir /var/cache/snix-dax /run/snix/vm-a.sock &
++snix store virtiofs --dax-backing-dir /var/cache/snix-dax /run/snix/vm-b.sock &
++```
++
++A blob that two guests both map then resolves to the same host file, and their
++mappings resolve to the same host page cache pages. Shared libraries and other
++files common to many guests are therefore stored, read, and cached once no
++matter how many VMs use them.
++
++This follows from how entries are named rather than from any deduplication
++pass: two guests mapping the same content cannot end up on different pages.
++
++### Lifetime of the cache
++
++Entries are immutable once written and are not removed while the daemon runs, so
++the directory grows to cover the set of blobs guests have actually mapped. It is
++a cache in the sense that deleting it while no VM is running loses nothing but
++the work of writing it again.
++
++Do not delete entries underneath a running VM. A guest may hold mappings into
++them, and unlinking the file will not tear those mappings down.
++
++[Alioth]: https://github.com/google/alioth

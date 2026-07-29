@@ -1,0 +1,901 @@
+From 5aaa549fe5e82b4362b54cb7b9d0e9628bc3b55c Mon Sep 17 00:00:00 2001
+From: Arbion Halili <99731180+ToxicPine@users.noreply.github.com>
+Date: Wed, 29 Jul 2026 02:22:13 +0100
+Subject: [PATCH 3/6] vm_memory: span adjacent regions
+
+Let ordinary guest-memory operations span adjacent regions while keeping
+host-pointer and volatile APIs single-region. Preserve short I/O at real
+holes and validate complete ranges before destructive operations.
+---
+ arch/src/lib.rs                         |  29 ++-
+ base/src/file_traits.rs                 | 132 ++++++++++-
+ kernel_loader/src/arm64.rs              |   7 +-
+ kernel_loader/src/lib.rs                |  31 ++-
+ kernel_loader/src/multiboot.rs          |  23 +-
+ vm_memory/src/guest_memory.rs           | 283 ++++++++++++++++++++----
+ vm_memory/src/guest_memory/sys/linux.rs |  78 ++++---
+ x86_64/src/bzimage.rs                   |  55 ++++-
+ 8 files changed, 538 insertions(+), 100 deletions(-)
+
+diff --git a/arch/src/lib.rs b/arch/src/lib.rs
+index bc9bb599a..73b994a47 100644
+--- a/arch/src/lib.rs
++++ b/arch/src/lib.rs
+@@ -1352,11 +1352,11 @@ where
+     // This is safe due to the bounds check above.
+     let size = size as u32;
+ 
+-    let guest_slice = guest_mem
+-        .get_slice_at_addr(guest_addr, size as usize)
++    let guest_slices = guest_mem
++        .get_spanning_slices_at_addr(guest_addr, size as usize)
+         .map_err(LoadImageError::GuestMemorySlice)?;
+     image
+-        .read_exact_at_volatile(guest_slice, 0)
++        .read_exact_vectored_at_volatile(&guest_slices, 0)
+         .map_err(LoadImageError::ReadToMemory)?;
+ 
+     Ok(size)
+@@ -1478,6 +1478,10 @@ pub struct SmbiosOptions {
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::io::Seek;
++    use std::io::SeekFrom;
++    use std::io::Write;
++
+     use serde_keyvalue::from_key_values;
+     use tempfile::tempfile;
+ 
+@@ -1564,4 +1568,23 @@ mod tests {
+         assert_eq!(addr.offset() % TEST_ALIGN, 0);
+         assert_eq!(size, TEST_IMAGE_SIZE as u32);
+     }
++
++    #[test]
++    fn load_image_across_adjacent_memory_regions() {
++        let mem =
++            GuestMemory::new(&[(GuestAddress(0), 0x1000), (GuestAddress(0x1000), 0x1000)]).unwrap();
++        let expected = vec![0x5a; 0x1000];
++        let mut image = tempfile().unwrap();
++        image.write_all(&expected).unwrap();
++        image.seek(SeekFrom::Start(0)).unwrap();
++
++        let size =
++            load_image(&mem, &mut image, GuestAddress(0x800), expected.len() as u64).unwrap();
++
++        let mut actual = vec![0; expected.len()];
++        mem.read_exact_at_addr(&mut actual, GuestAddress(0x800))
++            .unwrap();
++        assert_eq!(size as usize, expected.len());
++        assert_eq!(actual, expected);
++    }
+ }
+diff --git a/base/src/file_traits.rs b/base/src/file_traits.rs
+index f555d1eaa..7e6cc2fed 100644
+--- a/base/src/file_traits.rs
++++ b/base/src/file_traits.rs
+@@ -191,7 +191,11 @@ pub trait FileReadWriteAtVolatile {
+                 Ok(0) => return Err(Error::from(ErrorKind::UnexpectedEof)),
+                 Ok(n) => {
+                     slice = slice.offset(n).unwrap();
+-                    offset = offset.checked_add(n as u64).unwrap();
++                    if slice.size() != 0 {
++                        offset = offset
++                            .checked_add(n as u64)
++                            .ok_or_else(|| Error::from(ErrorKind::InvalidInput))?;
++                    }
+                 }
+                 Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+                 Err(e) => return Err(e),
+@@ -200,6 +204,28 @@ pub trait FileReadWriteAtVolatile {
+         Ok(())
+     }
+ 
++    /// Reads bytes from this file at `offset` to fill each destination slice in order.
++    fn read_exact_vectored_at_volatile(
++        &self,
++        slices: &[VolatileSlice],
++        mut offset: u64,
++    ) -> Result<()> {
++        let mut slices = slices
++            .iter()
++            .copied()
++            .filter(|slice| slice.size() != 0)
++            .peekable();
++        while let Some(slice) = slices.next() {
++            self.read_exact_at_volatile(slice, offset)?;
++            if slices.peek().is_some() {
++                offset = offset
++                    .checked_add(slice.size() as u64)
++                    .ok_or_else(|| Error::from(ErrorKind::InvalidInput))?;
++            }
++        }
++        Ok(())
++    }
++
+     /// Writes bytes to this file at `offset` from the given slice, returning the number of bytes
+     /// written on success. On Windows file pointer will update with the write, but on Linux the
+     /// file pointer will not change.
+@@ -229,7 +255,11 @@ pub trait FileReadWriteAtVolatile {
+                 Ok(0) => return Err(Error::from(ErrorKind::WriteZero)),
+                 Ok(n) => {
+                     slice = slice.offset(n).unwrap();
+-                    offset = offset.checked_add(n as u64).unwrap();
++                    if slice.size() != 0 {
++                        offset = offset
++                            .checked_add(n as u64)
++                            .ok_or_else(|| Error::from(ErrorKind::InvalidInput))?;
++                    }
+                 }
+                 Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+                 Err(e) => return Err(e),
+@@ -401,6 +431,104 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn read_exact_vectored_at_file() -> Result<()> {
++        let mut f = tempfile()?;
++        f.write_all(b"0123456789abcdefghij")
++            .expect("failed to write bytes");
++
++        let mut mem = [0u8; 20];
++        let (first, second) = mem.split_at_mut(7);
++        let slices = [VolatileSlice::new(first), VolatileSlice::new(second)];
++        f.read_exact_vectored_at_volatile(&slices, 0)?;
++
++        assert_eq!(&mem, b"0123456789abcdefghij");
++        Ok(())
++    }
++
++    #[test]
++    fn read_exact_vectored_offset_and_empty_slices() {
++        struct ZeroReader;
++
++        impl FileReadWriteAtVolatile for ZeroReader {
++            fn read_at_volatile(&self, slice: VolatileSlice, _offset: u64) -> Result<usize> {
++                slice.write_bytes(0);
++                Ok(slice.size())
++            }
++
++            fn write_at_volatile(&self, _slice: VolatileSlice, _offset: u64) -> Result<usize> {
++                unreachable!()
++            }
++        }
++
++        let reader = ZeroReader;
++        reader
++            .read_exact_vectored_at_volatile(&[], u64::MAX)
++            .unwrap();
++
++        let mut byte = [0xff];
++        reader
++            .read_exact_vectored_at_volatile(&[VolatileSlice::new(&mut byte)], u64::MAX)
++            .unwrap();
++        assert_eq!(byte, [0]);
++
++        let mut first_empty = [];
++        let mut second_empty = [];
++        reader
++            .read_exact_vectored_at_volatile(
++                &[
++                    VolatileSlice::new(&mut first_empty),
++                    VolatileSlice::new(&mut second_empty),
++                ],
++                u64::MAX,
++            )
++            .unwrap();
++
++        let mut leading_empty = [];
++        let mut byte = [0xff];
++        reader
++            .read_exact_vectored_at_volatile(
++                &[
++                    VolatileSlice::new(&mut leading_empty),
++                    VolatileSlice::new(&mut byte),
++                ],
++                u64::MAX,
++            )
++            .unwrap();
++        assert_eq!(byte, [0]);
++
++        let mut byte = [0xff];
++        let mut trailing_empty = [];
++        reader
++            .read_exact_vectored_at_volatile(
++                &[
++                    VolatileSlice::new(&mut byte),
++                    VolatileSlice::new(&mut trailing_empty),
++                ],
++                u64::MAX,
++            )
++            .unwrap();
++        assert_eq!(byte, [0]);
++
++        let mut first_byte = [0xff];
++        let mut middle_empty = [];
++        let mut second_byte = [0xff];
++        assert_eq!(
++            reader
++                .read_exact_vectored_at_volatile(
++                    &[
++                        VolatileSlice::new(&mut first_byte),
++                        VolatileSlice::new(&mut middle_empty),
++                        VolatileSlice::new(&mut second_byte),
++                    ],
++                    u64::MAX,
++                )
++                .unwrap_err()
++                .kind(),
++            ErrorKind::InvalidInput
++        );
++    }
++
+     #[test]
+     fn write_at_file() -> Result<()> {
+         let mut f = tempfile()?;
+diff --git a/kernel_loader/src/arm64.rs b/kernel_loader/src/arm64.rs
+index 090f456e5..8a81472ef 100644
+--- a/kernel_loader/src/arm64.rs
++++ b/kernel_loader/src/arm64.rs
+@@ -103,12 +103,7 @@ where
+     let load_size = usize::try_from(file_size).map_err(|_| Error::InvalidKernelSize)?;
+     let range_size = max(file_size, u64::from(header.image_size));
+ 
+-    let guest_slice = guest_mem
+-        .get_slice_at_addr(load_addr, load_size)
+-        .map_err(|_| Error::ReadKernelImage)?;
+-    kernel_image
+-        .read_exact_at_volatile(guest_slice, 0)
+-        .map_err(|_| Error::ReadKernelImage)?;
++    crate::read_exact_to_guest(guest_mem, kernel_image, 0, load_addr, load_size)?;
+ 
+     Ok(LoadedKernel {
+         size: file_size,
+diff --git a/kernel_loader/src/lib.rs b/kernel_loader/src/lib.rs
+index a0f79d6c2..5edf241b6 100644
+--- a/kernel_loader/src/lib.rs
++++ b/kernel_loader/src/lib.rs
+@@ -32,6 +32,24 @@ pub use arm64::load_arm64_kernel_lz4;
+ pub use multiboot::load_multiboot;
+ pub use multiboot::multiboot_header_from_file;
+ 
++fn read_exact_to_guest<F>(
++    guest_mem: &GuestMemory,
++    source: &F,
++    source_offset: u64,
++    guest_addr: GuestAddress,
++    len: usize,
++) -> Result<()>
++where
++    F: FileReadWriteAtVolatile,
++{
++    let slices = guest_mem
++        .get_spanning_slices_at_addr(guest_addr, len)
++        .map_err(|_| Error::ReadKernelImage)?;
++    source
++        .read_exact_vectored_at_volatile(&slices, source_offset)
++        .map_err(|_| Error::ReadKernelImage)
++}
++
+ #[sorted]
+ #[derive(Error, Debug, PartialEq, Eq)]
+ pub enum Error {
+@@ -154,12 +172,13 @@ where
+             continue;
+         }
+ 
+-        let guest_slice = guest_mem
+-            .get_slice_at_addr(GuestAddress(paddr), phdr.p_filesz as usize)
+-            .map_err(|_| Error::ReadKernelImage)?;
+-        kernel_image
+-            .read_exact_at_volatile(guest_slice, phdr.p_offset)
+-            .map_err(|_| Error::ReadKernelImage)?;
++        read_exact_to_guest(
++            guest_mem,
++            kernel_image,
++            phdr.p_offset,
++            GuestAddress(paddr),
++            phdr.p_filesz as usize,
++        )?;
+     }
+ 
+     // We should have found at least one PT_LOAD program header. If not, `start` will not be set.
+diff --git a/kernel_loader/src/multiboot.rs b/kernel_loader/src/multiboot.rs
+index 69b449ac6..488f8c241 100644
+--- a/kernel_loader/src/multiboot.rs
++++ b/kernel_loader/src/multiboot.rs
+@@ -325,18 +325,21 @@ pub fn load_multiboot<F>(
+ where
+     F: FileReadWriteAtVolatile,
+ {
+-    let guest_slice = guest_mem
+-        .get_slice_at_addr(multiboot_load.load_addr, multiboot_load.file_load_size)
+-        .map_err(|_| Error::ReadKernelImage)?;
+-    kernel_image
+-        .read_exact_at_volatile(guest_slice, multiboot_load.file_load_offset)
+-        .map_err(|_| Error::ReadKernelImage)?;
++    crate::read_exact_to_guest(
++        guest_mem,
++        kernel_image,
++        multiboot_load.file_load_offset,
++        multiboot_load.load_addr,
++        multiboot_load.file_load_size,
++    )?;
+ 
+     if let Some(bss_addr) = multiboot_load.bss_addr {
+-        let bss_slice = guest_mem
+-            .get_slice_at_addr(bss_addr, multiboot_load.bss_size)
+-            .map_err(|_| Error::ReadKernelImage)?;
+-        bss_slice.write_bytes(0);
++        for slice in guest_mem
++            .get_spanning_slices_at_addr(bss_addr, multiboot_load.bss_size)
++            .map_err(|_| Error::ReadKernelImage)?
++        {
++            slice.write_bytes(0);
++        }
+     }
+ 
+     let size: u64 = multiboot_load
+diff --git a/vm_memory/src/guest_memory.rs b/vm_memory/src/guest_memory.rs
+index 5adc76b80..d48c6fd69 100644
+--- a/vm_memory/src/guest_memory.rs
++++ b/vm_memory/src/guest_memory.rs
+@@ -299,14 +299,6 @@ impl MemoryRegion {
+     fn contains(&self, addr: GuestAddress) -> bool {
+         addr >= self.guest_base && addr < self.end()
+     }
+-
+-    #[cfg(any(target_os = "android", target_os = "linux"))] // unused on windows
+-    fn contains_range(&self, addr: GuestAddress, size: u64) -> bool {
+-        let Some(end_addr) = addr.checked_add(size) else {
+-            return false;
+-        };
+-        addr >= self.guest_base && end_addr <= self.end()
+-    }
+ }
+ 
+ /// Tracks memory regions, their guest mappings, and their host-memory backing.
+@@ -611,9 +603,9 @@ impl GuestMemory {
+     }
+ 
+     /// Writes a slice to guest memory at the specified guest address.
+-    /// Returns the number of bytes written.  The number of bytes written can
+-    /// be less than the length of the slice if there isn't enough room in the
+-    /// memory region.
++    /// Returns the number of bytes written. The write spans adjacent guest memory regions. The
++    /// number of bytes written can be less than the length of the slice if it reaches an unmapped
++    /// guest address.
+     ///
+     /// # Examples
+     /// * Write a slice at guestaddress 0x200.
+@@ -630,18 +622,35 @@ impl GuestMemory {
+     /// # }
+     /// ```
+     pub fn write_at_addr(&self, buf: &[u8], guest_addr: GuestAddress) -> Result<usize> {
+-        let (mapping, offset, _) = self.find_region(guest_addr)?;
+-        mapping
+-            .write_slice(buf, offset)
+-            .map_err(|e| Error::MemoryAccess(guest_addr, e))
++        let mut completed = 0;
++        loop {
++            let Some(addr) = guest_addr.checked_add(completed as u64) else {
++                return Ok(completed);
++            };
++            let (mapping, offset, _) = match self.find_region(addr) {
++                Ok(region) => region,
++                Err(e) if completed == 0 => return Err(e),
++                Err(_) => return Ok(completed),
++            };
++            let written = mapping
++                .write_slice(&buf[completed..], offset)
++                .map_err(|e| Error::MemoryAccess(addr, e))?;
++            // An empty input is the only successful zero-length write here.
++            if written == 0 {
++                return Ok(completed);
++            }
++            completed += written;
++            if completed == buf.len() {
++                return Ok(completed);
++            }
++        }
+     }
+ 
+     /// Writes the entire contents of a slice to guest memory at the specified
+     /// guest address.
+     ///
+-    /// Returns an error if there isn't enough room in the memory region to
+-    /// complete the entire write. Part of the data may have been written
+-    /// nevertheless.
++    /// The write may span adjacent guest memory regions. Returns an error if the range contains
++    /// an unmapped guest address. Part of the data may have been written nevertheless.
+     ///
+     /// # Examples
+     ///
+@@ -668,9 +677,9 @@ impl GuestMemory {
+     }
+ 
+     /// Reads to a slice from guest memory at the specified guest address.
+-    /// Returns the number of bytes read.  The number of bytes read can
+-    /// be less than the length of the slice if there isn't enough room in the
+-    /// memory region.
++    /// Returns the number of bytes read. The read spans adjacent guest memory regions. The number
++    /// of bytes read can be less than the length of the slice if it reaches an unmapped guest
++    /// address.
+     ///
+     /// # Examples
+     /// * Read a slice of length 16 at guestaddress 0x200.
+@@ -688,17 +697,35 @@ impl GuestMemory {
+     /// # }
+     /// ```
+     pub fn read_at_addr(&self, buf: &mut [u8], guest_addr: GuestAddress) -> Result<usize> {
+-        let (mapping, offset, _) = self.find_region(guest_addr)?;
+-        mapping
+-            .read_slice(buf, offset)
+-            .map_err(|e| Error::MemoryAccess(guest_addr, e))
++        let mut completed = 0;
++        loop {
++            let Some(addr) = guest_addr.checked_add(completed as u64) else {
++                return Ok(completed);
++            };
++            let (mapping, offset, _) = match self.find_region(addr) {
++                Ok(region) => region,
++                Err(e) if completed == 0 => return Err(e),
++                Err(_) => return Ok(completed),
++            };
++            let read = mapping
++                .read_slice(&mut buf[completed..], offset)
++                .map_err(|e| Error::MemoryAccess(addr, e))?;
++            // An empty output buffer is the only successful zero-length read here.
++            if read == 0 {
++                return Ok(completed);
++            }
++            completed += read;
++            if completed == buf.len() {
++                return Ok(completed);
++            }
++        }
+     }
+ 
+     /// Reads from guest memory at the specified address to fill the entire
+     /// buffer.
+     ///
+-    /// Returns an error if there isn't enough room in the memory region to fill
+-    /// the entire buffer. Part of the buffer may have been filled nevertheless.
++    /// The read may span adjacent guest memory regions. Returns an error if the range contains an
++    /// unmapped guest address. Part of the buffer may have been filled nevertheless.
+     ///
+     /// # Examples
+     ///
+@@ -725,7 +752,8 @@ impl GuestMemory {
+         }
+     }
+ 
+-    /// Reads an object from guest memory at the given guest address.
++    /// Reads an object from guest memory at the given guest address, spanning adjacent regions if
++    /// necessary.
+     ///
+     /// # Examples
+     /// * Read a u64 from two areas of guest memory backed by separate mappings.
+@@ -744,12 +772,26 @@ impl GuestMemory {
+     /// ```
+     pub fn read_obj_from_addr<T: FromBytes>(&self, guest_addr: GuestAddress) -> Result<T> {
+         let (mapping, offset, _) = self.find_region(guest_addr)?;
+-        mapping
+-            .read_obj(offset)
+-            .map_err(|e| Error::MemoryAccess(guest_addr, e))
++        if mapping.size() - offset >= std::mem::size_of::<T>() {
++            return mapping
++                .read_obj(offset)
++                .map_err(|e| Error::MemoryAccess(guest_addr, e));
++        }
++
++        let mut value = T::new_zeroed();
++        // SAFETY: `value` is initialized, and the resulting slice covers exactly its storage.
++        // `FromBytes` guarantees that every byte pattern represents a valid `T`.
++        let bytes = unsafe {
++            std::slice::from_raw_parts_mut(
++                std::ptr::addr_of_mut!(value).cast::<u8>(),
++                std::mem::size_of::<T>(),
++            )
++        };
++        self.read_exact_at_addr(bytes, guest_addr)?;
++        Ok(value)
+     }
+ 
+-    /// Reads an object from guest memory at the given guest address.
++    /// Reads an object from a single guest memory region at the given guest address.
+     /// Reading from a volatile area isn't strictly safe as it could change
+     /// mid-read.  However, as long as the type T is plain old data and can
+     /// handle random initialization, everything will be OK.
+@@ -780,8 +822,8 @@ impl GuestMemory {
+             .map_err(|e| Error::MemoryAccess(guest_addr, e))
+     }
+ 
+-    /// Writes an object to the memory region at the specified guest address.
+-    /// Returns Ok(()) if the object fits, or Err if it extends past the end.
++    /// Writes an object at the specified guest address, spanning adjacent regions if necessary.
++    /// Returns Ok(()) if the full guest range is mapped.
+     ///
+     /// # Examples
+     /// * Write a u64 at guest address 0x1100.
+@@ -801,12 +843,16 @@ impl GuestMemory {
+         guest_addr: GuestAddress,
+     ) -> Result<()> {
+         let (mapping, offset, _) = self.find_region(guest_addr)?;
+-        mapping
+-            .write_obj(val, offset)
+-            .map_err(|e| Error::MemoryAccess(guest_addr, e))
++        if mapping.size() - offset >= std::mem::size_of::<T>() {
++            return mapping
++                .write_obj(val, offset)
++                .map_err(|e| Error::MemoryAccess(guest_addr, e));
++        }
++
++        self.write_all_at_addr(val.as_bytes(), guest_addr)
+     }
+ 
+-    /// Writes an object to the memory region at the specified guest address.
++    /// Writes an object to a single guest memory region at the specified guest address.
+     /// Returns Ok(()) if the object fits, or Err if it extends past the end.
+     ///
+     /// The write operation will be volatile, i.e. it will not be reordered by
+@@ -835,8 +881,9 @@ impl GuestMemory {
+             .map_err(|e| Error::MemoryAccess(guest_addr, e))
+     }
+ 
+-    /// Returns a `VolatileSlice` of `len` bytes starting at `addr`. Returns an error if the slice
+-    /// is not a subset of this `GuestMemory`.
++    /// Returns a `VolatileSlice` of `len` bytes starting at `addr`. Because a `VolatileSlice`
++    /// represents one contiguous host range, this returns an error if the requested range crosses
++    /// a guest memory region boundary.
+     ///
+     /// # Examples
+     /// * Write `99` to 30 bytes starting at guest address 0x1010.
+@@ -866,6 +913,56 @@ impl GuestMemory {
+                     .map_err(Error::VolatileMemoryAccess)
+             })
+     }
++
++    /// Returns volatile slices covering `len` bytes starting at `addr`.
++    ///
++    /// Unlike [`GuestMemory::get_slice_at_addr`], this method can span adjacent guest memory
++    /// regions. The slices are contiguous in guest address space but may be unrelated in host
++    /// address space. It returns an error if any part of the requested range is not backed by
++    /// guest memory.
++    ///
++    /// A zero-length request validates `addr` and returns an empty vector.
++    pub fn get_spanning_slices_at_addr(
++        &self,
++        addr: GuestAddress,
++        len: usize,
++    ) -> Result<Vec<VolatileSlice<'_>>> {
++        if len == 0 {
++            self.get_slice_at_addr(addr, 0)?;
++            return Ok(Vec::new());
++        }
++
++        let mut slices = Vec::new();
++        let mut current = addr;
++        let mut remaining = len;
++
++        while remaining != 0 {
++            let region = self
++                .regions
++                .iter()
++                .find(|region| region.contains(current))
++                .ok_or(Error::InvalidGuestAddress(current))?;
++            let offset = usize::try_from(current.offset_from(region.start()))
++                .map_err(|_| Error::InvalidGuestAddress(current))?;
++            // `region.contains(current)` guarantees that `offset` is within the mapping.
++            let size = remaining.min(region.mapping.size() - offset);
++            slices.push(
++                region
++                    .mapping
++                    .get_slice(offset, size)
++                    .map_err(Error::VolatileMemoryAccess)?,
++            );
++            remaining -= size;
++            if remaining != 0 {
++                current = current
++                    .checked_add(size as u64)
++                    .ok_or(Error::InvalidGuestAddress(current))?;
++            }
++        }
++
++        Ok(slices)
++    }
++
+     /// Convert a GuestAddress into a pointer in the address space of this
+     /// process. This should only be necessary for giving addresses to the
+     /// kernel, as with vhost ioctls. Normal reads/writes to guest memory should
+@@ -1246,6 +1343,86 @@ mod tests {
+         assert!(!gm.is_valid_range(GuestAddress(0x5000), 0x10000));
+     }
+ 
++    #[test]
++    fn slices_can_span_adjacent_regions() {
++        let gm =
++            GuestMemory::new(&[(GuestAddress(0), 0x1000), (GuestAddress(0x1000), 0x1000)]).unwrap();
++
++        let slices = gm
++            .get_spanning_slices_at_addr(GuestAddress(0x800), 0x1000)
++            .unwrap();
++        assert_eq!(
++            slices.iter().map(VolatileSlice::size).collect::<Vec<_>>(),
++            [0x800, 0x800]
++        );
++
++        let gm_with_hole =
++            GuestMemory::new(&[(GuestAddress(0), 0x1000), (GuestAddress(0x2000), 0x1000)]).unwrap();
++        assert!(matches!(
++            gm_with_hole.get_spanning_slices_at_addr(GuestAddress(0x800), 0x1000),
++            Err(Error::InvalidGuestAddress(GuestAddress(0x1000)))
++        ));
++    }
++
++    #[test]
++    fn exact_access_can_span_adjacent_regions() {
++        let gm =
++            GuestMemory::new(&[(GuestAddress(0), 0x1000), (GuestAddress(0x1000), 0x1000)]).unwrap();
++        let expected = vec![0x5a; 0x1000];
++
++        gm.write_all_at_addr(&expected, GuestAddress(0x800))
++            .unwrap();
++        let mut actual = vec![0; expected.len()];
++        gm.read_exact_at_addr(&mut actual, GuestAddress(0x800))
++            .unwrap();
++
++        assert_eq!(actual, expected);
++
++        let object_addr = GuestAddress(0xffc);
++        gm.write_obj_at_addr(0x1234_5678_9abc_def0u64, object_addr)
++            .unwrap();
++        assert_eq!(
++            gm.read_obj_from_addr::<u64>(object_addr).unwrap(),
++            0x1234_5678_9abc_def0
++        );
++    }
++
++    #[test]
++    fn exact_access_preserves_short_error_at_a_hole() {
++        let gm =
++            GuestMemory::new(&[(GuestAddress(0), 0x1000), (GuestAddress(0x2000), 0x1000)]).unwrap();
++        let mut read_buf = vec![0; 0x1000];
++
++        assert!(matches!(
++            gm.write_all_at_addr(&[0x5a; 0x1000], GuestAddress(0x800)),
++            Err(Error::ShortWrite {
++                expected: 0x1000,
++                completed: 0x800,
++            })
++        ));
++        assert!(matches!(
++            gm.read_exact_at_addr(&mut read_buf, GuestAddress(0x800)),
++            Err(Error::ShortRead {
++                expected: 0x1000,
++                completed: 0x800,
++            })
++        ));
++        assert!(matches!(
++            gm.write_obj_at_addr(0x1234_5678_9abc_def0u64, GuestAddress(0xffc)),
++            Err(Error::ShortWrite {
++                expected: 8,
++                completed: 4,
++            })
++        ));
++        assert!(matches!(
++            gm.read_obj_from_addr::<u64>(GuestAddress(0xffc)),
++            Err(Error::ShortRead {
++                expected: 8,
++                completed: 4,
++            })
++        ));
++    }
++
+     #[cfg(any(target_os = "android", target_os = "linux"))]
+     #[test]
+     fn private_memory_has_no_shared_descriptor() {
+@@ -1339,6 +1516,32 @@ mod tests {
+         assert_eq!(value, [0; 4]);
+     }
+ 
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    #[test]
++    fn range_spanning_shared_and_private_memory_can_be_discarded() {
++        let page_size = pagesize() as u64;
++        let gm = GuestMemory::new_with_options(&[
++            (GuestAddress(0), page_size, MemoryRegionOptions::new()),
++            (GuestAddress(page_size), page_size, private_ram()),
++        ])
++        .unwrap();
++        let shared_address = GuestAddress(page_size - 4);
++        let private_address = GuestAddress(page_size);
++
++        gm.write_all_at_addr(&[1; 4], shared_address).unwrap();
++        gm.write_all_at_addr(&[2; 4], private_address).unwrap();
++        gm.remove_range(GuestAddress(0), page_size * 2).unwrap();
++
++        let mut shared_value = [0xff; 4];
++        let mut private_value = [0xff; 4];
++        gm.read_exact_at_addr(&mut shared_value, shared_address)
++            .unwrap();
++        gm.read_exact_at_addr(&mut private_value, private_address)
++            .unwrap();
++        assert_eq!(shared_value, [0; 4]);
++        assert_eq!(private_value, [0; 4]);
++    }
++
+     #[cfg(any(target_os = "android", target_os = "linux"))]
+     #[test]
+     fn mergeable_ranges_require_private_page_aligned_memory() {
+diff --git a/vm_memory/src/guest_memory/sys/linux.rs b/vm_memory/src/guest_memory/sys/linux.rs
+index 32c02800f..8850b7c40 100644
+--- a/vm_memory/src/guest_memory/sys/linux.rs
++++ b/vm_memory/src/guest_memory/sys/linux.rs
+@@ -106,41 +106,59 @@ impl GuestMemory {
+     ///
+     /// This feature is only available on Unix, where a MemoryMapping can remove a mapped range.
+     pub fn remove_range(&self, addr: GuestAddress, count: u64) -> Result<()> {
+-        let region = self
+-            .regions
+-            .iter()
+-            .find(|region| region.contains_range(addr, count))
++        if count == 0 {
++            return Err(Error::InvalidGuestRange(addr, count));
++        }
++        let end = addr
++            .checked_add(count)
+             .ok_or(Error::InvalidGuestRange(addr, count))?;
+-        let offset = usize::try_from(addr.offset_from(region.guest_base))
+-            .map_err(|_| Error::InvalidGuestRange(addr, count))?;
+-        let size = usize::try_from(count).map_err(|_| Error::InvalidGuestRange(addr, count))?;
+-
+-        if matches!(&region.backing, BackingObject::PrivateAnonymous) {
+-            return region
+-                .mapping
+-                .madvise_dontneed(offset, size)
+-                .map_err(|error| Error::MemoryAccess(addr, error));
++        let mut resolved = Vec::new();
++        let mut current = addr;
++        while current < end {
++            let region = self
++                .regions
++                .iter()
++                .find(|region| region.contains(current))
++                .ok_or(Error::InvalidGuestRange(addr, count))?;
++            let chunk_end = std::cmp::min(region.end(), end);
++            let offset = usize::try_from(current.offset_from(region.guest_base))
++                .map_err(|_| Error::InvalidGuestRange(addr, count))?;
++            let size = usize::try_from(chunk_end.offset_from(current))
++                .map_err(|_| Error::InvalidGuestRange(addr, count))?;
++            resolved.push((region, current, offset, size));
++            current = chunk_end;
+         }
+ 
+-        // TODO: It is likely we could use fallocate for everything because, in the kernel,
+-        // MADV_REMOVE mostly just delegates to FALLOC_FL_PUNCH_HOLE internally.
+-        if self.use_punchhole_locked() {
+-            base::sys::linux::fallocate(
++        for (region, chunk_addr, offset, size) in resolved {
++            if matches!(&region.backing, BackingObject::PrivateAnonymous) {
+                 region
+-                    .backing
+-                    .descriptor()
+-                    .ok_or(Error::MemoryRegionWithoutDescriptor)?,
+-                base::sys::linux::FallocateMode::PunchHole,
+-                region.backing_offset + addr.offset_from(region.guest_base),
+-                count,
+-            )
+-            .map_err(Error::PunchHole)
+-        } else {
+-            region
+-                .mapping
+-                .remove_range(offset, size)
+-                .map_err(|e| Error::MemoryAccess(addr, e))
++                    .mapping
++                    .madvise_dontneed(offset, size)
++                    .map_err(|error| Error::MemoryAccess(chunk_addr, error))?;
++                continue;
++            }
++
++            // TODO: It is likely we could use fallocate for everything because, in the kernel,
++            // MADV_REMOVE mostly just delegates to FALLOC_FL_PUNCH_HOLE internally.
++            if self.use_punchhole_locked() {
++                base::sys::linux::fallocate(
++                    region
++                        .backing
++                        .descriptor()
++                        .ok_or(Error::MemoryRegionWithoutDescriptor)?,
++                    base::sys::linux::FallocateMode::PunchHole,
++                    region.backing_offset + chunk_addr.offset_from(region.guest_base),
++                    size as u64,
++                )
++                .map_err(Error::PunchHole)?;
++            } else {
++                region
++                    .mapping
++                    .remove_range(offset, size)
++                    .map_err(|error| Error::MemoryAccess(chunk_addr, error))?;
++            }
+         }
++        Ok(())
+     }
+ 
+     /// Handles guest memory policy hints/advices.
+diff --git a/x86_64/src/bzimage.rs b/x86_64/src/bzimage.rs
+index 1811a59a9..283920aab 100644
+--- a/x86_64/src/bzimage.rs
++++ b/x86_64/src/bzimage.rs
+@@ -150,11 +150,11 @@ where
+     }
+ 
+     // Load the whole kernel image to `load_addr`
+-    let guest_slice = guest_mem
+-        .get_slice_at_addr(load_addr, file_size_usize)
++    let guest_slices = guest_mem
++        .get_spanning_slices_at_addr(load_addr, file_size_usize)
+         .map_err(Error::GuestMemoryError)?;
+     kernel_image
+-        .read_exact_at_volatile(guest_slice, 0)
++        .read_exact_vectored_at_volatile(&guest_slices, 0)
+         .map_err(Error::ReadKernelImage)?;
+ 
+     let (entry_offset, cpu_mode) = if params.hdr.xloadflags & XLF_KERNEL_64 != 0 {
+@@ -172,3 +172,52 @@ where
+ 
+     Ok((params, kernel_region, bzimage_entry, cpu_mode))
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::io::Seek;
++    use std::io::SeekFrom;
++    use std::io::Write;
++
++    use tempfile::tempfile;
++    use zerocopy::IntoBytes;
++
++    use super::*;
++
++    #[test]
++    fn load_bzimage_across_adjacent_memory_regions() {
++        const LOAD_ADDR: u64 = 0x10_0000;
++        const SETUP_SIZE: u64 = 0x400;
++        const IMAGE_SIZE: usize = 0x1800;
++
++        let mut params = boot_params::default();
++        params.hdr.header = 0x53726448;
++        params.hdr.setup_sects = 1;
++        params.hdr.syssize = ((IMAGE_SIZE as u64 - SETUP_SIZE) / 16) as u32;
++
++        let mut expected = vec![0x5a; IMAGE_SIZE];
++        expected[..params.as_bytes().len()].copy_from_slice(params.as_bytes());
++        // Make the setup-header range include every field initialized above.
++        expected[0x201] = 0x40;
++
++        let mut image = tempfile().unwrap();
++        image.write_all(&expected).unwrap();
++        image.seek(SeekFrom::Start(0)).unwrap();
++
++        let mem = GuestMemory::new(&[
++            (GuestAddress(LOAD_ADDR), 0x1000),
++            (GuestAddress(LOAD_ADDR + 0x1000), 0x1000),
++        ])
++        .unwrap();
++        load_bzimage(&mem, GuestAddress(LOAD_ADDR + SETUP_SIZE), &mut image).unwrap();
++
++        let mut actual = vec![0; expected.len()];
++        mem.get_slice_at_addr(GuestAddress(LOAD_ADDR), 0x1000)
++            .unwrap()
++            .copy_to(&mut actual[..0x1000]);
++        mem.get_slice_at_addr(GuestAddress(LOAD_ADDR + 0x1000), IMAGE_SIZE - 0x1000)
++            .unwrap()
++            .copy_to(&mut actual[0x1000..]);
++        assert_eq!(actual, expected);
++    }
++}
+-- 
+2.51.2
+

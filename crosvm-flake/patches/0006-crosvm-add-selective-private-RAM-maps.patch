@@ -1,0 +1,753 @@
+From cb56289349592a735f953434fc0cece2827ec4c7 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <99731180+ToxicPine@users.noreply.github.com>
+Date: Wed, 29 Jul 2026 02:22:32 +0100
+Subject: [PATCH 6/6] crosvm: add selective private RAM
+
+Give selected guest-physical ranges private anonymous backing from a
+versioned JSON map, optionally marking them KSM-mergeable. Require KVM and an
+unsandboxed single process, reject incompatible modes, and prevent forked
+divergence.
+---
+ src/crosvm/cmdline.rs               |  15 ++
+ src/crosvm/config.rs                |   8 +
+ src/crosvm/sys/linux.rs             |  42 +++-
+ src/crosvm/sys/linux/config.rs      | 202 +++++++++++++++-
+ src/crosvm/sys/linux/private_ram.rs | 357 ++++++++++++++++++++++++++++
+ 5 files changed, 620 insertions(+), 4 deletions(-)
+ create mode 100644 src/crosvm/sys/linux/private_ram.rs
+
+diff --git a/src/crosvm/cmdline.rs b/src/crosvm/cmdline.rs
+index 49bbe80cc..c43be1d6f 100644
+--- a/src/crosvm/cmdline.rs
++++ b/src/crosvm/cmdline.rs
+@@ -1662,6 +1662,19 @@ pub struct RunCommand {
+     ///       (default: "0 <current egid> 1")
+     pub pmem_ext2: Vec<PmemExt2Option>,
+ 
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    #[argh(option, arg_name = "PATH")]
++    /// JSON map of guest-physical RAM ranges to keep private to crosvm. Requires KVM and
++    /// --disable-sandbox. Private ranges are omitted from vhost-user memory tables, so the guest
++    /// must not place device buffers there. Incompatible memory and device options are rejected.
++    pub private_ram_map: Option<PathBuf>,
++
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    #[argh(switch)]
++    /// mark ranges selected by --private-ram-map as eligible for Linux KSM; startup fails if the
++    /// kernel rejects MADV_MERGEABLE
++    pub private_ram_mergeable: bool,
++
+     #[cfg(feature = "process-invariants")]
+     #[argh(option, arg_name = "PATH")]
+     /// shared read-only memory address for a serialized EmulatorProcessInvariants proto
+@@ -2431,6 +2444,8 @@ impl TryFrom<RunCommand> for super::config::Config {
+ 
+         #[cfg(any(target_os = "android", target_os = "linux"))]
+         {
++            cfg.private_ram_map = cmd.private_ram_map;
++            cfg.private_ram_mergeable = cmd.private_ram_mergeable;
+             cfg.lock_guest_memory = cmd.lock_guest_memory.unwrap_or_default();
+             cfg.boost_uclamp = cmd.boost_uclamp.unwrap_or_default();
+         }
+diff --git a/src/crosvm/config.rs b/src/crosvm/config.rs
+index 47eff3e13..9838878f0 100644
+--- a/src/crosvm/config.rs
++++ b/src/crosvm/config.rs
+@@ -725,6 +725,10 @@ pub struct Config {
+     #[cfg(any(target_os = "android", target_os = "linux"))]
+     pub pmem_ext2: Vec<crate::crosvm::sys::config::PmemExt2Option>,
+     pub pmems: Vec<PmemOption>,
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    pub private_ram_map: Option<PathBuf>,
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    pub private_ram_mergeable: bool,
+     #[cfg(feature = "process-invariants")]
+     pub process_invariants_data_handle: Option<u64>,
+     #[cfg(feature = "process-invariants")]
+@@ -969,6 +973,10 @@ impl Default for Config {
+             #[cfg(any(target_os = "android", target_os = "linux"))]
+             pmem_ext2: Vec::new(),
+             pmems: Vec::new(),
++            #[cfg(any(target_os = "android", target_os = "linux"))]
++            private_ram_map: None,
++            #[cfg(any(target_os = "android", target_os = "linux"))]
++            private_ram_mergeable: false,
+             #[cfg(feature = "process-invariants")]
+             process_invariants_data_handle: None,
+             #[cfg(feature = "process-invariants")]
+diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
+index 93b883426..1978c0cab 100644
+--- a/src/crosvm/sys/linux.rs
++++ b/src/crosvm/sys/linux.rs
+@@ -16,6 +16,7 @@ pub(crate) mod jail_warden;
+ pub(crate) mod pci_hotplug_helpers;
+ #[cfg(feature = "pci-hotplug")]
+ pub(crate) mod pci_hotplug_manager;
++mod private_ram;
+ mod vcpu;
+ 
+ #[cfg(all(feature = "pvclock", target_arch = "aarch64"))]
+@@ -1756,11 +1757,20 @@ fn create_guest_memory(
+     let guest_mem_layout = Arch::guest_memory_layout(components, arch_memory_layout, hypervisor)
+         .context("failed to create guest memory layout")?;
+ 
+-    let guest_mem_layout = punch_holes_in_guest_mem_layout_for_mappings(
++    let mut guest_mem_layout = punch_holes_in_guest_mem_layout_for_mappings(
+         guest_mem_layout,
+         &cfg.file_backed_mappings_ram,
+     )?;
+ 
++    let private_ranges = cfg
++        .private_ram_map
++        .as_deref()
++        .map(private_ram::load)
++        .transpose()?;
++    if let Some(ranges) = &private_ranges {
++        guest_mem_layout = private_ram::apply_to_layout(guest_mem_layout, ranges)?;
++    }
++
+     let mut guest_mem = GuestMemory::new_with_options(&guest_mem_layout)
+         .context("failed to create guest memory")?;
+     let mut mem_policy = MemoryPolicy::empty();
+@@ -1778,6 +1788,27 @@ fn create_guest_memory(
+     }
+     guest_mem.set_memory_policy(mem_policy);
+ 
++    if cfg.private_ram_mergeable {
++        let ranges = private_ranges
++            .as_ref()
++            .context("private RAM merging requires a private RAM map")?
++            .iter()
++            .map(|range| (GuestAddress(range.guest_physical_start), range.length))
++            .collect::<Vec<_>>();
++        guest_mem
++            .mark_mergeable_ranges(&ranges)
++            .context("failed to mark private guest RAM ranges mergeable")?;
++    }
++
++    if private_ranges.is_some() {
++        // Private RAM has no descriptor that a post-fork child could use to reconstruct the
++        // mapping. Make accidental child access fail instead of silently creating divergent COW
++        // state.
++        guest_mem
++            .apply_dontfork_to_private_regions()
++            .context("failed to mark private guest RAM MADV_DONTFORK")?;
++    }
++
+     if cfg.unmap_guest_memory_on_fork {
+         // Note that this isn't compatible with sandboxing. We could potentially fix that by
+         // delaying the call until after the sandboxed devices are forked. However, the main use
+@@ -2105,13 +2136,18 @@ fn get_default_hypervisor() -> Option<HypervisorKind> {
+ }
+ 
+ pub fn run_config(cfg: Config) -> Result<ExitState> {
+-    let components = setup_vm_components(&cfg)?;
+-
++    // validate_config catches an explicitly selected non-KVM hypervisor. Resolve the implicit
++    // default here as well, before any VM state is created.
+     let hypervisor = cfg
+         .hypervisor
+         .clone()
+         .or_else(get_default_hypervisor)
+         .context("no enabled hypervisor")?;
++    if cfg.private_ram_map.is_some() && !matches!(&hypervisor, HypervisorKind::Kvm { .. }) {
++        bail!("`private-ram-map` requires the KVM hypervisor");
++    }
++
++    let components = setup_vm_components(&cfg)?;
+ 
+     debug!("creating hypervisor: {:?}", hypervisor);
+ 
+diff --git a/src/crosvm/sys/linux/config.rs b/src/crosvm/sys/linux/config.rs
+index 80eca1dfe..07cf63a9d 100644
+--- a/src/crosvm/sys/linux/config.rs
++++ b/src/crosvm/sys/linux/config.rs
+@@ -8,6 +8,7 @@ use std::str::FromStr;
+ use anyhow::anyhow;
+ use anyhow::bail;
+ use anyhow::Context;
++use devices::virtio::DeviceType;
+ use devices::IommuDevType;
+ use devices::PciAddress;
+ use devices::SerialParameters;
+@@ -48,7 +49,78 @@ pub fn check_serial_params(_serial_params: &SerialParameters) -> Result<(), Stri
+     Ok(())
+ }
+ 
+-pub fn validate_config(_cfg: &mut Config) -> std::result::Result<(), String> {
++pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
++    if cfg.private_ram_mergeable && cfg.private_ram_map.is_none() {
++        return Err("`private-ram-mergeable` requires `private-ram-map`".to_string());
++    }
++
++    if cfg.private_ram_map.is_some() {
++        if cfg.jail_config.is_some() {
++            return Err("`private-ram-map` requires `disable-sandbox`".to_string());
++        }
++        if cfg
++            .hypervisor
++            .as_ref()
++            .is_some_and(|kind| !matches!(kind, HypervisorKind::Kvm { .. }))
++        {
++            // An implicit hypervisor is resolved and checked in run_config.
++            return Err("`private-ram-map` requires the KVM hypervisor".to_string());
++        }
++        if cfg.swap_dir.is_some() {
++            return Err("`private-ram-map` does not support vmm-swap".to_string());
++        }
++        if !matches!(cfg.protection_type, hypervisor::ProtectionType::Unprotected) {
++            return Err("`private-ram-map` does not support protected VMs".to_string());
++        }
++        if !cfg.file_backed_mappings_ram.is_empty() || cfg.memory_file.is_some() {
++            return Err("`private-ram-map` does not support file-backed RAM".to_string());
++        }
++        if cfg
++            .vhost_user
++            .iter()
++            .any(|device| device.type_ != DeviceType::Fs)
++        {
++            return Err(
++                "`private-ram-map` supports only filesystem vhost-user frontends".to_string(),
++            );
++        }
++        if !cfg.vfio.is_empty() {
++            return Err("`private-ram-map` does not support VFIO devices".to_string());
++        }
++        if !cfg.pmem_ext2.is_empty() {
++            // pmem-ext2 creates a child device process even when sandboxing is disabled.
++            return Err("`private-ram-map` does not support `pmem-ext2`".to_string());
++        }
++        if cfg.hugepages {
++            return Err("`private-ram-map` and `hugepages` are mutually exclusive".to_string());
++        }
++        if cfg.lock_guest_memory {
++            return Err(
++                "`private-ram-map` and `lock-guest-memory` are mutually exclusive".to_string(),
++            );
++        }
++        #[cfg(feature = "gpu")]
++        if cfg.gpu_parameters.as_ref().is_some_and(|gpu| gpu.udmabuf) {
++            return Err("`private-ram-map` does not support GPU udmabuf".to_string());
++        }
++        #[cfg(feature = "video-decoder")]
++        if !cfg.video_dec.is_empty() {
++            return Err("`private-ram-map` does not support virtio-video decoders".to_string());
++        }
++        #[cfg(feature = "video-encoder")]
++        if !cfg.video_enc.is_empty() {
++            return Err("`private-ram-map` does not support virtio-video encoders".to_string());
++        }
++        #[cfg(all(feature = "media", feature = "video-decoder"))]
++        if !cfg.media_decoder.is_empty() {
++            return Err("`private-ram-map` does not support virtio-media decoders".to_string());
++        }
++        #[cfg(feature = "media")]
++        if cfg.simple_media_device || !cfg.v4l2_proxy.is_empty() {
++            return Err("`private-ram-map` does not support virtio-media devices".to_string());
++        }
++    }
++
+     Ok(())
+ }
+ 
+@@ -365,6 +437,134 @@ mod tests {
+     use super::*;
+     use crate::crosvm::config::from_key_values;
+ 
++    #[test]
++    fn private_ram_options_parse() {
++        let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
++            &[],
++            &[
++                "--disable-sandbox",
++                "--private-ram-map",
++                "/private-ram.json",
++                "--private-ram-mergeable",
++                "/dev/null",
++            ],
++        )
++        .unwrap()
++        .try_into()
++        .unwrap();
++
++        assert_eq!(
++            config.private_ram_map,
++            Some(PathBuf::from("/private-ram.json"))
++        );
++        assert!(config.private_ram_mergeable);
++        assert!(config.hypervisor.is_none());
++    }
++
++    #[test]
++    fn private_ram_mergeable_requires_map() {
++        let result: std::result::Result<Config, _> = crate::crosvm::cmdline::RunCommand::from_args(
++            &[],
++            &["--disable-sandbox", "--private-ram-mergeable", "/dev/null"],
++        )
++        .unwrap()
++        .try_into();
++
++        assert_eq!(
++            result.err().unwrap(),
++            "`private-ram-mergeable` requires `private-ram-map`"
++        );
++    }
++
++    #[test]
++    fn private_ram_map_requires_disable_sandbox() {
++        let result: std::result::Result<Config, _> = crate::crosvm::cmdline::RunCommand::from_args(
++            &[],
++            &["--private-ram-map", "/private-ram.json", "/dev/null"],
++        )
++        .unwrap()
++        .try_into();
++
++        assert_eq!(
++            result.err().unwrap(),
++            "`private-ram-map` requires `disable-sandbox`"
++        );
++    }
++
++    #[test]
++    fn private_ram_map_allows_only_filesystem_vhost_user_frontends() {
++        let fs: std::result::Result<Config, _> = crate::crosvm::cmdline::RunCommand::from_args(
++            &[],
++            &[
++                "--disable-sandbox",
++                "--private-ram-map",
++                "/private-ram.json",
++                "--vhost-user",
++                "fs,socket=/backend.sock",
++                "/dev/null",
++            ],
++        )
++        .unwrap()
++        .try_into();
++        assert!(fs.is_ok());
++
++        let block: std::result::Result<Config, _> = crate::crosvm::cmdline::RunCommand::from_args(
++            &[],
++            &[
++                "--disable-sandbox",
++                "--private-ram-map",
++                "/private-ram.json",
++                "--vhost-user",
++                "block,socket=/backend.sock",
++                "/dev/null",
++            ],
++        )
++        .unwrap()
++        .try_into();
++        assert_eq!(
++            block.err().unwrap(),
++            "`private-ram-map` supports only filesystem vhost-user frontends"
++        );
++    }
++
++    #[test]
++    fn private_ram_map_rejects_incompatible_memory_options() {
++        let cases: &[(&[&str], &str)] = &[
++            (
++                &["--swap", "/tmp"],
++                "`private-ram-map` does not support vmm-swap",
++            ),
++            (
++                &["--pmem-ext2", "/tmp"],
++                "`private-ram-map` does not support `pmem-ext2`",
++            ),
++            (
++                &["--hugepages"],
++                "`private-ram-map` and `hugepages` are mutually exclusive",
++            ),
++            (
++                &["--lock-guest-memory"],
++                "`private-ram-map` and `lock-guest-memory` are mutually exclusive",
++            ),
++        ];
++
++        for &(extra_args, expected_error) in cases {
++            let mut args = vec![
++                "--disable-sandbox",
++                "--private-ram-map",
++                "/private-ram.json",
++            ];
++            args.extend_from_slice(extra_args);
++            args.push("/dev/null");
++
++            let result: std::result::Result<Config, _> =
++                crate::crosvm::cmdline::RunCommand::from_args(&[], &args)
++                    .unwrap()
++                    .try_into();
++            assert_eq!(result.err().unwrap(), expected_error);
++        }
++    }
++
+     #[test]
+     fn parse_coiommu_options() {
+         use std::time::Duration;
+diff --git a/src/crosvm/sys/linux/private_ram.rs b/src/crosvm/sys/linux/private_ram.rs
+new file mode 100644
+index 000000000..59c741152
+--- /dev/null
++++ b/src/crosvm/sys/linux/private_ram.rs
+@@ -0,0 +1,357 @@
++// Copyright 2026 The ChromiumOS Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++//! Validation and layout application for private guest RAM maps.
++//!
++//! The input is a versioned JSON object. `pageSize` is the host page size expected by the
++//! producer; ranges use absolute guest-physical addresses and must be aligned to that size:
++//! ```text
++//! {
++//!   "schemaVersion": 1,
++//!   "pageSize": 4096,
++//!   "ranges": [
++//!     { "guestPhysicalStart": 16777216, "length": 2097152 }
++//!   ]
++//! }
++//! ```
++//! Unknown object fields are accepted so producers can attach metadata without changing the
++//! consumer schema.
++
++use std::fs::File;
++use std::io::BufReader;
++use std::path::Path;
++
++use anyhow::bail;
++use anyhow::Context;
++use anyhow::Result;
++use serde::Deserialize;
++use vm_memory::GuestAddress;
++use vm_memory::MemoryRegionOptions;
++use vm_memory::MemoryRegionPurpose;
++use vm_memory::RamBacking;
++
++const SUPPORTED_SCHEMA_VERSION: u32 = 1;
++
++#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
++#[serde(rename_all = "camelCase")]
++pub(super) struct PrivateRamRange {
++    pub(super) guest_physical_start: u64,
++    pub(super) length: u64,
++}
++
++impl PrivateRamRange {
++    fn end(&self) -> Result<u64> {
++        self.guest_physical_start
++            .checked_add(self.length)
++            .with_context(|| {
++                format!(
++                    "private RAM range at {:#x} overflows",
++                    self.guest_physical_start
++                )
++            })
++    }
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct PrivateRamMap {
++    page_size: u64,
++    ranges: Vec<PrivateRamRange>,
++    schema_version: u32,
++}
++
++impl PrivateRamMap {
++    fn validate_and_normalize(mut self) -> Result<Vec<PrivateRamRange>> {
++        if self.schema_version != SUPPORTED_SCHEMA_VERSION {
++            bail!(
++                "unsupported private RAM map schema version {}; expected {}",
++                self.schema_version,
++                SUPPORTED_SCHEMA_VERSION
++            );
++        }
++        let host_page_size = base::pagesize() as u64;
++        if self.page_size != host_page_size {
++            bail!(
++                "private RAM map page size {} does not match host page size {}",
++                self.page_size,
++                host_page_size
++            );
++        }
++        if self.ranges.is_empty() {
++            bail!("private RAM map contains no ranges");
++        }
++
++        self.ranges.sort_by_key(|range| range.guest_physical_start);
++        let mut previous_end = 0;
++        let mut normalized = Vec::<PrivateRamRange>::with_capacity(self.ranges.len());
++        for range in self.ranges {
++            if range.length == 0 {
++                bail!(
++                    "private RAM range at {:#x} is empty",
++                    range.guest_physical_start
++                );
++            }
++            if range.guest_physical_start % self.page_size != 0
++                || range.length % self.page_size != 0
++            {
++                bail!(
++                    "private RAM range at {:#x} with length {:#x} is not page aligned",
++                    range.guest_physical_start,
++                    range.length
++                );
++            }
++            let end = range.end()?;
++            if range.guest_physical_start < previous_end {
++                bail!(
++                    "private RAM range at {:#x} overlaps a previous range",
++                    range.guest_physical_start
++                );
++            }
++            previous_end = end;
++
++            if let Some(previous) = normalized.last_mut() {
++                if previous.end()? == range.guest_physical_start {
++                    previous.length = previous
++                        .length
++                        .checked_add(range.length)
++                        .context("adjacent private RAM ranges overflow")?;
++                    continue;
++                }
++            }
++
++            normalized.push(range);
++        }
++
++        Ok(normalized)
++    }
++}
++
++pub(super) fn load(path: &Path) -> Result<Vec<PrivateRamRange>> {
++    let file = File::open(path)
++        .with_context(|| format!("failed to open private RAM map {}", path.display()))?;
++    let map: PrivateRamMap = serde_json::from_reader(BufReader::new(file))
++        .with_context(|| format!("failed to parse private RAM map {}", path.display()))?;
++    map.validate_and_normalize()
++}
++
++/// Splits an architecture-provided layout so that exactly `private_ranges`
++/// receive private anonymous backing.
++pub(super) fn apply_to_layout(
++    mut layout: Vec<(GuestAddress, u64, MemoryRegionOptions)>,
++    private_ranges: &[PrivateRamRange],
++) -> Result<Vec<(GuestAddress, u64, MemoryRegionOptions)>> {
++    for private_range in private_ranges {
++        let private_start = private_range.guest_physical_start;
++        let private_end = private_range.end()?;
++        let index = layout
++            .iter()
++            .position(|(start, length, _)| {
++                start.0 <= private_start
++                    && start
++                        .0
++                        .checked_add(*length)
++                        .is_some_and(|end| private_end <= end)
++            })
++            .with_context(|| {
++                format!(
++                    "private RAM range {private_start:#x}..{private_end:#x} is outside a single \
++                     guest RAM region"
++                )
++            })?;
++
++        let (region_start, region_length, options) = layout.remove(index);
++        let region_end = region_start
++            .0
++            .checked_add(region_length)
++            .context("guest RAM region overflows")?;
++        if options.purpose != MemoryRegionPurpose::GuestMemoryRegion {
++            bail!(
++                "private RAM range at {private_start:#x} targets a {:?} region",
++                options.purpose
++            );
++        }
++        if options.file_backed.is_some() {
++            bail!("private RAM range at {private_start:#x} targets file-backed RAM");
++        }
++        if options.ram_backing != RamBacking::Shared {
++            bail!("private RAM range at {private_start:#x} targets non-shared RAM");
++        }
++
++        let mut replacements = Vec::with_capacity(3);
++        if region_start.0 < private_start {
++            replacements.push((
++                region_start,
++                private_start - region_start.0,
++                options.clone(),
++            ));
++        }
++        replacements.push((
++            GuestAddress(private_start),
++            private_range.length,
++            options.clone().ram_backing(RamBacking::PrivateAnonymous),
++        ));
++        if private_end < region_end {
++            replacements.push((GuestAddress(private_end), region_end - private_end, options));
++        }
++        layout.splice(index..index, replacements);
++    }
++
++    Ok(layout)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn valid_map() -> PrivateRamMap {
++        let page_size = base::pagesize() as u64;
++        PrivateRamMap {
++            page_size,
++            ranges: vec![
++                PrivateRamRange {
++                    guest_physical_start: page_size * 2,
++                    length: page_size,
++                },
++                PrivateRamRange {
++                    guest_physical_start: 0,
++                    length: page_size,
++                },
++            ],
++            schema_version: SUPPORTED_SCHEMA_VERSION,
++        }
++    }
++
++    #[test]
++    fn valid_ranges_are_sorted() {
++        let ranges = valid_map().validate_and_normalize().unwrap();
++        assert_eq!(ranges[0].guest_physical_start, 0);
++        assert_eq!(
++            ranges[1].guest_physical_start,
++            (base::pagesize() * 2) as u64
++        );
++    }
++
++    #[test]
++    fn unknown_metadata_is_ignored() {
++        let document = format!(
++            r#"{{
++                "schemaVersion": 1,
++                "pageSize": {},
++                "producer": "example",
++                "annotations": {{"purpose": "test-only"}},
++                "ranges": [
++                    {{"guestPhysicalStart": 0, "length": {}, "name": "range"}}
++                ]
++            }}"#,
++            base::pagesize(),
++            base::pagesize(),
++        );
++        let map: PrivateRamMap = serde_json::from_str(&document).unwrap();
++        assert_eq!(map.validate_and_normalize().unwrap().len(), 1);
++    }
++
++    #[test]
++    fn overlapping_ranges_are_rejected() {
++        let page_size = base::pagesize() as u64;
++        let mut map = valid_map();
++        map.ranges[0].guest_physical_start = 0;
++        map.ranges[0].length = page_size * 2;
++        assert!(map.validate_and_normalize().is_err());
++    }
++
++    #[test]
++    fn unsupported_schema_version_is_rejected() {
++        let mut map = valid_map();
++        map.schema_version = SUPPORTED_SCHEMA_VERSION + 1;
++        assert!(map.validate_and_normalize().is_err());
++    }
++
++    #[test]
++    fn adjacent_ranges_are_coalesced() {
++        let page_size = base::pagesize() as u64;
++        let mut map = valid_map();
++        map.ranges[0].guest_physical_start = page_size;
++        let ranges = map.validate_and_normalize().unwrap();
++
++        assert_eq!(
++            ranges,
++            vec![PrivateRamRange {
++                guest_physical_start: 0,
++                length: page_size * 2,
++            }]
++        );
++    }
++
++    #[test]
++    fn empty_and_unaligned_ranges_are_rejected() {
++        let page_size = base::pagesize() as u64;
++        let mut empty = valid_map();
++        empty.ranges[0].length = 0;
++        assert!(empty.validate_and_normalize().is_err());
++
++        let mut unaligned = valid_map();
++        unaligned.ranges[0].guest_physical_start += 1;
++        assert!(unaligned.validate_and_normalize().is_err());
++
++        let mut wrong_page_size = valid_map();
++        wrong_page_size.page_size = page_size * 2;
++        assert!(wrong_page_size.validate_and_normalize().is_err());
++    }
++
++    #[test]
++    fn layout_is_split_around_private_ranges() {
++        let page_size = base::pagesize() as u64;
++        let ranges = valid_map().validate_and_normalize().unwrap();
++        let layout = vec![(GuestAddress(0), page_size * 4, MemoryRegionOptions::new())];
++        let result = apply_to_layout(layout, &ranges).unwrap();
++
++        assert_eq!(result.len(), 4);
++        assert_eq!(result[0].2.ram_backing, RamBacking::PrivateAnonymous);
++        assert_eq!(result[1].2.ram_backing, RamBacking::Shared);
++        assert_eq!(result[2].2.ram_backing, RamBacking::PrivateAnonymous);
++        assert_eq!(result[3].2.ram_backing, RamBacking::Shared);
++
++        let guest_memory = vm_memory::GuestMemory::new_with_options(&result).unwrap();
++        let is_private: Vec<_> = guest_memory
++            .regions()
++            .map(|region| matches!(region.backing, vm_memory::BackingObject::PrivateAnonymous))
++            .collect();
++        assert_eq!(is_private, [true, false, true, false]);
++    }
++
++    #[test]
++    fn range_crossing_a_layout_boundary_is_rejected() {
++        let page_size = base::pagesize() as u64;
++        let range = PrivateRamRange {
++            guest_physical_start: page_size,
++            length: page_size * 2,
++        };
++        let layout = vec![
++            (GuestAddress(0), page_size * 2, MemoryRegionOptions::new()),
++            (
++                GuestAddress(page_size * 2),
++                page_size * 2,
++                MemoryRegionOptions::new(),
++            ),
++        ];
++
++        assert!(apply_to_layout(layout, &[range]).is_err());
++    }
++
++    #[test]
++    fn reserved_memory_cannot_be_made_private() {
++        let page_size = base::pagesize() as u64;
++        let range = PrivateRamRange {
++            guest_physical_start: 0,
++            length: page_size,
++        };
++        let layout = vec![(
++            GuestAddress(0),
++            page_size,
++            MemoryRegionOptions::new().purpose(MemoryRegionPurpose::ReservedMemory),
++        )];
++
++        assert!(apply_to_layout(layout, &[range]).is_err());
++    }
++}
+-- 
+2.51.2
+

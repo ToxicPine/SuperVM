@@ -1,0 +1,145 @@
+From 1d22d3d46011d667dd62d33a99d7fa1dcf20aff9 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <99731180+ToxicPine@users.noreply.github.com>
+Date: Wed, 29 Jul 2026 00:23:49 +0100
+Subject: [PATCH 5/6] crosvm: keep unsandboxed virtio-fs in-process
+
+Run built-in virtio-fs in the VMM process when sandboxing is disabled, passing
+the shared directory directly to PassthroughFs. This also keeps private
+anonymous guest RAM coherent with the device; sandboxed behavior is unchanged.
+---
+ devices/src/virtio/fs/mod.rs           |  5 +++-
+ devices/src/virtio/fs/passthrough.rs   | 10 +++++---
+ src/crosvm/sys/linux/device_helpers.rs | 34 ++++++++++++++++++++------
+ 3 files changed, 38 insertions(+), 11 deletions(-)
+
+diff --git a/devices/src/virtio/fs/mod.rs b/devices/src/virtio/fs/mod.rs
+index 27a8b8303..795b7cf90 100644
+--- a/devices/src/virtio/fs/mod.rs
++++ b/devices/src/virtio/fs/mod.rs
+@@ -4,6 +4,7 @@
+ 
+ use std::collections::BTreeMap;
+ use std::io;
++use std::path::Path;
+ use std::sync::Arc;
+ 
+ use anyhow::anyhow;
+@@ -137,6 +138,7 @@ impl Fs {
+         num_workers: usize,
+         fs_cfg: Config,
+         tube: Tube,
++        root_dir: &Path,
+     ) -> Result<Fs> {
+         if tag.len() > FS_MAX_TAG_LEN {
+             return Err(Error::TagTooLong(tag.len()));
+@@ -150,7 +152,8 @@ impl Fs {
+             num_request_queues: Le32::from(num_workers as u32),
+         };
+ 
+-        let fs = PassthroughFs::new(tag, fs_cfg).map_err(Error::CreateFs)?;
++        let mut fs = PassthroughFs::new(tag, fs_cfg).map_err(Error::CreateFs)?;
++        fs.set_root_dir(root_dir).map_err(Error::CreateFs)?;
+ 
+         // There is always a high priority queue in addition to the request queues.
+         let num_queues = num_workers + 1;
+diff --git a/devices/src/virtio/fs/passthrough.rs b/devices/src/virtio/fs/passthrough.rs
+index 5cdc301ef..d9ec39cfb 100644
+--- a/devices/src/virtio/fs/passthrough.rs
++++ b/devices/src/virtio/fs/passthrough.rs
+@@ -20,7 +20,6 @@ use std::os::raw::c_int;
+ use std::os::raw::c_long;
+ #[cfg(feature = "fs_runtime_ugid_map")]
+ use std::os::unix::ffi::OsStrExt;
+-#[cfg(feature = "fs_runtime_ugid_map")]
+ use std::path::Path;
+ use std::ptr;
+ use std::ptr::addr_of;
+@@ -1015,7 +1014,7 @@ impl PassthroughFs {
+         }
+     }
+ 
+-    pub fn set_root_dir(&mut self, shared_dir: String) -> io::Result<()> {
++    pub fn set_root_dir(&mut self, shared_dir: impl AsRef<Path>) -> io::Result<()> {
+         let canonicalized_root = match std::fs::canonicalize(shared_dir) {
+             Ok(path) => path,
+             Err(e) => {
+@@ -1025,7 +1024,12 @@ impl PassthroughFs {
+                 ));
+             }
+         };
+-        self.root_dir = canonicalized_root.to_string_lossy().to_string();
++        self.root_dir = canonicalized_root
++            .into_os_string()
++            .into_string()
++            .map_err(|_| {
++                io::Error::new(io::ErrorKind::InvalidInput, "root_dir is not valid UTF-8")
++            })?;
+         Ok(())
+     }
+ 
+diff --git a/src/crosvm/sys/linux/device_helpers.rs b/src/crosvm/sys/linux/device_helpers.rs
+index e0619a33f..235beed12 100644
+--- a/src/crosvm/sys/linux/device_helpers.rs
++++ b/src/crosvm/sys/linux/device_helpers.rs
+@@ -1158,10 +1158,20 @@ pub fn create_fs_device(
+     fs_cfg: virtio::fs::Config,
+     device_tube: Tube,
+ ) -> DeviceResult {
+-    let max_open_files = base::linux::max_open_files()
+-        .context("failed to get max number of open files")?
+-        .rlim_max;
++    if !src.is_absolute() {
++        bail!("virtio-fs source path must be absolute: {}", src.display());
++    }
++    if !src.is_dir() {
++        bail!(
++            "virtio-fs source path is not a directory: {}",
++            src.display()
++        );
++    }
++
+     let j = if let Some(jail_config) = jail_config {
++        let max_open_files = base::linux::max_open_files()
++            .context("failed to get max number of open files")?
++            .rlim_max;
+         let mut config = SandboxConfig::new(jail_config, "fs_device");
+         config.limit_caps = false;
+         config.ugid_map = Some((uid_map, gid_map));
+@@ -1173,20 +1183,30 @@ pub fn create_fs_device(
+         } else {
+             RunAsUser::Specified(ugid.0.unwrap_or(0), ugid.1.unwrap_or(0))
+         };
+-        create_sandbox_minijail(src, max_open_files, &config)?
++        Some(create_sandbox_minijail(src, max_open_files, &config)?)
+     } else {
+-        create_base_minijail(src, max_open_files)?
++        None
+     };
+ 
+     let features = virtio::base_features(protection_type);
+     // TODO(chirantan): Use more than one worker once the kernel driver has been fixed to not panic
+     // when num_queues > 1.
+-    let dev = virtio::fs::Fs::new(features, tag, 1, fs_cfg, device_tube)
++    let root_dir = if j.is_some() {
++        // The jailed device process pivots into `src`.
++        Path::new("/")
++    } else {
++        // An in-process device cannot pivot the whole VMM. Fs worker threads unshare CLONE_FS
++        // before changing the working directory or umask. PassthroughFs::drop deliberately leaks
++        // descriptors, so this remains sound only while virtio-fs is not hot-unpluggable and the
++        // device therefore lives until process exit.
++        src
++    };
++    let dev = virtio::fs::Fs::new(features, tag, 1, fs_cfg, device_tube, root_dir)
+         .context("failed to create fs device")?;
+ 
+     Ok(VirtioDeviceStub {
+         dev: Box::new(dev),
+-        jail: Some(j),
++        jail: j,
+     })
+ }
+ 
+-- 
+2.51.2
+

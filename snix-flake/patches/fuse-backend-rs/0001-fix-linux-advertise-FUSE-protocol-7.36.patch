@@ -1,0 +1,33 @@
+From 9649621ebef5b828e3d5adbb658bfe0242e7a5b7 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Wed, 29 Jul 2026 18:40:27 +0100
+Subject: [PATCH] fix(linux): advertise FUSE protocol 7.36
+
+Advertise FUSE protocol 7.36 so Linux can use the existing INIT_EXT,
+PERFILE_DAX, and FUSE_ATTR_DAX definitions.
+---
+ src/abi/fuse_abi_linux.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/abi/fuse_abi_linux.rs b/src/abi/fuse_abi_linux.rs
+index c49f65f..36fdacb 100644
+--- a/src/abi/fuse_abi_linux.rs
++++ b/src/abi/fuse_abi_linux.rs
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE-BSD-3-Clause file.
+
+-//! Linux Fuse Application Binary Interfaces, Version 7.31.
++//! Linux Fuse Application Binary Interfaces, Version 7.36.
+
+ #![allow(missing_docs)]
+
+@@ -21,7 +21,7 @@ pub use libc::{
+ pub const KERNEL_VERSION: u32 = 7;
+
+ /// Minor version number of this interface.
+-pub const KERNEL_MINOR_VERSION: u32 = 33;
++pub const KERNEL_MINOR_VERSION: u32 = 36;
+
+ /// Init reply size is FUSE_COMPAT_INIT_OUT_SIZE
+ pub const KERNEL_MINOR_VERSION_INIT_OUT_SIZE: u32 = 5;

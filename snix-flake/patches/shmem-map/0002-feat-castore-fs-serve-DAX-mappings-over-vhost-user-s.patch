@@ -1,0 +1,1123 @@
+From 9cd704c79868241ddac0f9d1984a403f1a86fbf6 Mon Sep 17 00:00:00 2001
+From: SuperVM <supervm@localhost>
+Date: Tue, 28 Jul 2026 13:43:22 +0100
+Subject: [PATCH 2/4] feat(castore/fs): serve DAX over vhost-user shmem
+
+Serve setupmapping and removemapping through standard vhost-user shmem
+requests, advertising the cache region and device tag. Keep the cache
+optional, reject writable mappings, and test descriptor passing over a socket
+pair.
+
+Change-Id: I1999de02032feb208bd7af2520cbba1e619f17f6
+---
+ snix/Cargo.lock                 |  43 +++--
+ snix/Cargo.nix                  | 154 ++++++++++------
+ snix/Cargo.toml                 |  12 +-
+ snix/castore/Cargo.toml         |   1 -
+ snix/castore/src/fs/mod.rs      |  95 ++++++++++
+ snix/castore/src/fs/virtiofs.rs | 307 ++++++++++++++++++++++++++++++--
+ snix/cli/castore/src/main.rs    |   2 +-
+ snix/cli/store/src/main.rs      |   2 +-
+ 8 files changed, 513 insertions(+), 103 deletions(-)
+
+diff --git a/snix/Cargo.lock b/snix/Cargo.lock
+index 2b099e0e1..1f93d4e4e 100644
+--- a/snix/Cargo.lock
++++ b/snix/Cargo.lock
+@@ -1976,9 +1976,9 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
+ 
+ [[package]]
+ name = "fuse-backend-rs"
+-version = "0.12.0"
++version = "0.14.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e1663480cae165243a6c7f75abecfb868c16d17346afc74faf61a2febcadd11b"
++checksum = "13d8148185e731fa601a078e4ae8c742bf4b69e86e19136848780deaef08fd7d"
+ dependencies = [
+  "arc-swap",
+  "bitflags 1.3.2",
+@@ -1990,7 +1990,6 @@ dependencies = [
+  "mio 0.8.11",
+  "nix 0.24.3",
+  "radix_trie",
+- "vhost",
+  "virtio-queue",
+  "vm-memory",
+  "vmm-sys-util",
+@@ -5157,7 +5156,7 @@ dependencies = [
+  "url",
+  "vhost",
+  "vhost-user-backend",
+- "virtio-bindings 0.2.6",
++ "virtio-bindings",
+  "virtio-queue",
+  "vm-memory",
+  "vmm-sys-util",
+@@ -6641,6 +6640,7 @@ checksum = "e2e054861b4bd027cd373e18e8d8d8e6548085000e41290d95ce0c373a654b4a"
+ dependencies = [
+  "getrandom 0.3.4",
+  "js-sys",
++ "rand 0.9.2",
+  "wasm-bindgen",
+ ]
+ 
+@@ -6658,37 +6658,32 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+ 
+ [[package]]
+ name = "vhost"
+-version = "0.6.1"
++version = "0.16.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a6769e8dbf5276b4376439fbf36bb880d203bf614bf7ef444198edc24b5a9f35"
++checksum = "ee90657203a8644e9a0860a0db6a7887d8ef0c7bc09fc22dfa4ae75df65bac86"
+ dependencies = [
+- "bitflags 1.3.2",
++ "bitflags 2.10.0",
+  "libc",
++ "uuid",
+  "vm-memory",
+  "vmm-sys-util",
+ ]
+ 
+ [[package]]
+ name = "vhost-user-backend"
+-version = "0.8.0"
++version = "0.22.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9f237b91db4ac339d639fb43398b52d785fa51e3c7760ac9425148863c1f4303"
++checksum = "d5925983d8fb537752ad3e26604c0a17abfa5de77cb6773a096c8a959c9eca0f"
+ dependencies = [
+  "libc",
+  "log",
+  "vhost",
+- "virtio-bindings 0.1.0",
++ "virtio-bindings",
+  "virtio-queue",
+  "vm-memory",
+  "vmm-sys-util",
+ ]
+ 
+-[[package]]
+-name = "virtio-bindings"
+-version = "0.1.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3ff512178285488516ed85f15b5d0113a7cdb89e9e8a760b269ae4f02b84bd6b"
+-
+ [[package]]
+ name = "virtio-bindings"
+ version = "0.2.6"
+@@ -6697,32 +6692,34 @@ checksum = "804f498a26d5a63be7bbb8bdcd3869c3f286c4c4a17108905276454da0caf8cb"
+ 
+ [[package]]
+ name = "virtio-queue"
+-version = "0.7.1"
++version = "0.17.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3ba81e2bcc21c0d2fc5e6683e79367e26ad219197423a498df801d79d5ba77bd"
++checksum = "e358084f32ed165fddb41d98ff1b7ff3c08b9611d8d6114a1b422e2e85688baf"
+ dependencies = [
++ "libc",
+  "log",
+- "virtio-bindings 0.1.0",
++ "virtio-bindings",
+  "vm-memory",
+  "vmm-sys-util",
+ ]
+ 
+ [[package]]
+ name = "vm-memory"
+-version = "0.10.0"
++version = "0.17.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "688a70366615b45575a424d9c665561c1b5ab2224d494f706b6a6812911a827c"
++checksum = "f39348a049689cabd3377cdd9182bf526ec76a6f823b79903896452e9d7a7380"
+ dependencies = [
+  "arc-swap",
+  "libc",
++ "thiserror 2.0.17",
+  "winapi",
+ ]
+ 
+ [[package]]
+ name = "vmm-sys-util"
+-version = "0.11.2"
++version = "0.15.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "48b7b084231214f7427041e4220d77dfe726897a6d41fddee450696e66ff2a29"
++checksum = "506c62fdf617a5176827c2f9afbcf1be155b03a9b4bf9617a60dbc07e3a1642f"
+ dependencies = [
+  "bitflags 1.3.2",
+  "libc",
+diff --git a/snix/Cargo.nix b/snix/Cargo.nix
+index df762352e..29e6e48ce 100644
+--- a/snix/Cargo.nix
++++ b/snix/Cargo.nix
+@@ -8137,9 +8137,9 @@ rec {
+       };
+       "fuse-backend-rs" = rec {
+         crateName = "fuse-backend-rs";
+-        version = "0.12.0";
++        version = "0.14.0";
+         edition = "2018";
+-        sha256 = "06yimnygx8k1mx7wgbs6fg8id346zgnanxbzdhx28rg1ra038rp1";
++        sha256 = "0zgx13pyl3bq91l166bfx1llpgs2qzl4m3h739hglcg7hn0i9n0k";
+         libName = "fuse_backend_rs";
+         authors = [
+           "Liu Bo <bo.liu@linux.alibaba.com>"
+@@ -8195,12 +8195,6 @@ rec {
+             name = "radix_trie";
+             packageId = "radix_trie";
+           }
+-          {
+-            name = "vhost";
+-            packageId = "vhost";
+-            optional = true;
+-            features = [ "vhost-user-slave" ];
+-          }
+           {
+             name = "virtio-queue";
+             packageId = "virtio-queue";
+@@ -8268,6 +8262,7 @@ rec {
+             "vhost"
+             "caps"
+           ];
++          "virtio-bindings" = [ "dep:virtio-bindings" ];
+           "virtio-queue" = [ "dep:virtio-queue" ];
+           "virtiofs" = [
+             "virtio-queue"
+@@ -8281,8 +8276,6 @@ rec {
+           "core-foundation-sys"
+           "default"
+           "fusedev"
+-          "vhost"
+-          "vhost-user-fs"
+           "virtio-queue"
+           "virtiofs"
+           "vmm-sys-util"
+@@ -22696,7 +22689,7 @@ rec {
+           }
+           {
+             name = "virtio-bindings";
+-            packageId = "virtio-bindings 0.2.6";
++            packageId = "virtio-bindings";
+             optional = true;
+           }
+           {
+@@ -22805,7 +22798,6 @@ rec {
+             "dep:vm-memory"
+             "dep:vmm-sys-util"
+             "dep:virtio-bindings"
+-            "fuse-backend-rs?/vhost-user-fs"
+             "fuse-backend-rs?/virtiofs"
+           ];
+           "xp-composition-cli" = [
+@@ -29631,6 +29623,19 @@ rec {
+                 && (builtins.elem "atomics" targetFeatures)
+               );
+           }
++          {
++            name = "rand";
++            packageId = "rand 0.9.2";
++            optional = true;
++            target =
++              { target, features }:
++              (
++                !(
++                  ("wasm32" == target."arch" or null)
++                  && (("unknown" == target."os" or null) || ("none" == target."os" or null))
++                )
++              );
++          }
+           {
+             name = "wasm-bindgen";
+             packageId = "wasm-bindgen";
+@@ -29707,6 +29712,7 @@ rec {
+         };
+         resolvedDefaultFeatures = [
+           "default"
++          "fast-rng"
+           "rng"
+           "std"
+           "v4"
+@@ -29740,54 +29746,57 @@ rec {
+       };
+       "vhost" = rec {
+         crateName = "vhost";
+-        version = "0.6.1";
+-        edition = "2018";
+-        sha256 = "0dczb95w5vcq852fzxsbc6zh7ll0p1mz7yrrchvv8xjjpy6rwxm6";
++        version = "0.16.0";
++        edition = "2021";
++        sha256 = "11mcbgv5vrsaz8nw57y0gc6fzn47g1mdp83012d4wr580dr6b47f";
+         authors = [
+           "Liu Jiang <gerry@linux.alibaba.com>"
+         ];
+         dependencies = [
+           {
+             name = "bitflags";
+-            packageId = "bitflags 1.3.2";
++            packageId = "bitflags 2.10.0";
+           }
+           {
+             name = "libc";
+             packageId = "libc";
+           }
++          {
++            name = "uuid";
++            packageId = "uuid";
++            features = [
++              "v4"
++              "fast-rng"
++            ];
++          }
+           {
+             name = "vm-memory";
+             packageId = "vm-memory";
++            features = [ "backend-mmap" ];
+           }
+           {
+             name = "vmm-sys-util";
+             packageId = "vmm-sys-util";
+           }
+         ];
+-        devDependencies = [
+-          {
+-            name = "vm-memory";
+-            packageId = "vm-memory";
+-            features = [ "backend-mmap" ];
+-          }
+-        ];
+         features = {
+           "vhost-net" = [ "vhost-kern" ];
+-          "vhost-user-master" = [ "vhost-user" ];
+-          "vhost-user-slave" = [ "vhost-user" ];
++          "vhost-user-backend" = [ "vhost-user" ];
++          "vhost-user-frontend" = [ "vhost-user" ];
+           "vhost-vdpa" = [ "vhost-kern" ];
++          "xen" = [ "vm-memory/xen" ];
+         };
+         resolvedDefaultFeatures = [
+           "default"
+           "vhost-user"
+-          "vhost-user-slave"
++          "vhost-user-backend"
+         ];
+       };
+       "vhost-user-backend" = rec {
+         crateName = "vhost-user-backend";
+-        version = "0.8.0";
+-        edition = "2018";
+-        sha256 = "00s33wy8cj2i8b4hlxn7wd8zm1fpaa5kjhzv77b3khsavf8pn8wz";
++        version = "0.22.0";
++        edition = "2021";
++        sha256 = "03yaksf9b2kc14x7gdkwwxfzmaqp196609iymm97flzvv21mk4nm";
+         libName = "vhost_user_backend";
+         authors = [
+           "The Cloud Hypervisor Authors"
+@@ -29804,11 +29813,11 @@ rec {
+           {
+             name = "vhost";
+             packageId = "vhost";
+-            features = [ "vhost-user-slave" ];
++            features = [ "vhost-user-backend" ];
+           }
+           {
+             name = "virtio-bindings";
+-            packageId = "virtio-bindings 0.1.0";
++            packageId = "virtio-bindings";
+           }
+           {
+             name = "virtio-queue";
+@@ -29820,6 +29829,7 @@ rec {
+             features = [
+               "backend-mmap"
+               "backend-atomic"
++              "backend-bitmap"
+             ];
+           }
+           {
+@@ -29832,8 +29842,9 @@ rec {
+             name = "vhost";
+             packageId = "vhost";
+             features = [
+-              "vhost-user-master"
+-              "vhost-user-slave"
++              "test-utils"
++              "vhost-user-frontend"
++              "vhost-user-backend"
+             ];
+           }
+           {
+@@ -29842,25 +29853,22 @@ rec {
+             features = [
+               "backend-mmap"
+               "backend-atomic"
+-              "backend-bitmap"
+             ];
+           }
+         ];
+-
+-      };
+-      "virtio-bindings 0.1.0" = rec {
+-        crateName = "virtio-bindings";
+-        version = "0.1.0";
+-        edition = "2018";
+-        sha256 = "0sxxhhmz1r4s4q5pd2lykswcv9qk05fmpwc5xlb8aj45h8bi5x9z";
+-        libName = "virtio_bindings";
+-        authors = [
+-          "Sergio Lopez <slp@redhat.com>"
+-        ];
+         features = {
++          "postcopy" = [
++            "vhost/postcopy"
++            "userfaultfd"
++          ];
++          "userfaultfd" = [ "dep:userfaultfd" ];
++          "xen" = [
++            "vm-memory/xen"
++            "vhost/xen"
++          ];
+         };
+       };
+-      "virtio-bindings 0.2.6" = rec {
++      "virtio-bindings" = rec {
+         crateName = "virtio-bindings";
+         version = "0.2.6";
+         edition = "2021";
+@@ -29873,26 +29881,37 @@ rec {
+       };
+       "virtio-queue" = rec {
+         crateName = "virtio-queue";
+-        version = "0.7.1";
++        version = "0.17.0";
+         edition = "2021";
+-        sha256 = "1gbppbapj7c0vyca88vl34cx4sp2cy9yg0v6bvyd5h11rhmixa1v";
++        sha256 = "1bwbd22jwbj23d513mnq26b8ph7kgwdzz60xnkfmy5pd697hhn73";
+         libName = "virtio_queue";
+         authors = [
+           "The Chromium OS Authors"
+         ];
+         dependencies = [
++          {
++            name = "libc";
++            packageId = "libc";
++            target = { target, features }: (target."kani" or false);
++          }
+           {
+             name = "log";
+             packageId = "log";
+           }
+           {
+             name = "virtio-bindings";
+-            packageId = "virtio-bindings 0.1.0";
++            packageId = "virtio-bindings";
+           }
+           {
+             name = "vm-memory";
+             packageId = "vm-memory";
+           }
++          {
++            name = "vm-memory";
++            packageId = "vm-memory";
++            target = { target, features }: (target."kani" or false);
++            features = [ "backend-mmap" ];
++          }
+           {
+             name = "vmm-sys-util";
+             packageId = "vmm-sys-util";
+@@ -29913,9 +29932,9 @@ rec {
+       };
+       "vm-memory" = rec {
+         crateName = "vm-memory";
+-        version = "0.10.0";
++        version = "0.17.1";
+         edition = "2021";
+-        sha256 = "0z423a8i4s3addq4yjad4ar5l6qwarjwdn94lismbd0mcqv712k8";
++        sha256 = "103kgafjwicn7287jfw2dxmcfvjjpy193pbw6z9sp73896h4i4zk";
+         libName = "vm_memory";
+         authors = [
+           "Liu Jiang <gerry@linux.alibaba.com>"
+@@ -29929,11 +29948,17 @@ rec {
+           {
+             name = "libc";
+             packageId = "libc";
++            optional = true;
++          }
++          {
++            name = "thiserror";
++            packageId = "thiserror 2.0.17";
+           }
+           {
+             name = "winapi";
+             packageId = "winapi";
+-            target = { target, features }: (target."windows" or false);
++            optional = true;
++            target = { target, features }: (builtins.elem "windows" target."family");
+             features = [
+               "errhandlingapi"
+               "sysinfoapi"
+@@ -29943,19 +29968,38 @@ rec {
+         features = {
+           "arc-swap" = [ "dep:arc-swap" ];
+           "backend-atomic" = [ "arc-swap" ];
++          "backend-bitmap" = [
++            "dep:libc"
++            "dep:winapi"
++          ];
++          "backend-mmap" = [
++            "dep:libc"
++            "dep:winapi"
++          ];
++          "bitflags" = [ "dep:bitflags" ];
++          "default" = [ "rawfd" ];
++          "rawfd" = [ "dep:libc" ];
++          "vmm-sys-util" = [ "dep:vmm-sys-util" ];
++          "xen" = [
++            "backend-mmap"
++            "bitflags"
++            "vmm-sys-util"
++          ];
+         };
+         resolvedDefaultFeatures = [
+           "arc-swap"
+           "backend-atomic"
++          "backend-bitmap"
+           "backend-mmap"
+           "default"
++          "rawfd"
+         ];
+       };
+       "vmm-sys-util" = rec {
+         crateName = "vmm-sys-util";
+-        version = "0.11.2";
++        version = "0.15.0";
+         edition = "2021";
+-        sha256 = "0a9azxk6wsahwkggshbdga4jdryzfw6j5r21f11gf50j4f2b1ds8";
++        sha256 = "0bv4l7ihgg0dlqbrdgxlm41mn5dyy6yazyf24xl1g98pyvyn4v2h";
+         libName = "vmm_sys_util";
+         authors = [
+           "Intel Virtualization Team <vmm-maintainers@intel.com>"
+@@ -29964,8 +30008,6 @@ rec {
+           {
+             name = "bitflags";
+             packageId = "bitflags 1.3.2";
+-            target =
+-              { target, features }: (("linux" == target."os" or null) || ("android" == target."os" or null));
+           }
+           {
+             name = "libc";
+diff --git a/snix/Cargo.toml b/snix/Cargo.toml
+index b50adef62..2514ff626 100644
+--- a/snix/Cargo.toml
++++ b/snix/Cargo.toml
+@@ -89,7 +89,7 @@ ed25519-dalek = "2.1.1"
+ erased-serde = "0.4.5"
+ expect-test = "1.5.0"
+ fastcdc = "3.1.0"
+-fuse-backend-rs = "=0.12.0"
++fuse-backend-rs = "=0.14.0"
+ futures = "0.3.30"
+ genawaiter = { version = "0.99.1", default-features = false }
+ googleapis-tonic-google-bigtable-v2 = "0.39.0"
+@@ -179,12 +179,12 @@ tracing-test = "0.2.5"
+ tracing-tracy = "=0.11.4"
+ trybuild = "1.0.99"
+ url = "2.5.2"
+-vhost = "=0.6.1"
+-vhost-user-backend = "=0.8.0"
++vhost = "=0.16.0"
++vhost-user-backend = "=0.22.0"
+ virtio-bindings = "=0.2.6"
+-virtio-queue = "=0.7.1"
+-vm-memory = "=0.10.0"
+-vmm-sys-util = "=0.11.2"
++virtio-queue = "=0.17.0"
++vm-memory = "=0.17.1"
++vmm-sys-util = "=0.15.0"
+ vu128 = "1.1.0"
+ walkdir = "2.5.0"
+ which = "^8.0.0"
+diff --git a/snix/castore/Cargo.toml b/snix/castore/Cargo.toml
+index 6475eb21b..4ae1d0b7c 100644
+--- a/snix/castore/Cargo.toml
++++ b/snix/castore/Cargo.toml
+@@ -100,7 +100,6 @@ virtiofs = [
+   "dep:vm-memory",
+   "dep:vmm-sys-util",
+   "dep:virtio-bindings",
+-  "fuse-backend-rs?/vhost-user-fs", # impl FsCacheReqHandler for SlaveFsCacheReq
+   "fuse-backend-rs?/virtiofs",
+ ]
+ fuse = ["fs"]
+diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
+index 100349248..1fd3ebd3f 100644
+--- a/snix/castore/src/fs/mod.rs
++++ b/snix/castore/src/fs/mod.rs
+@@ -116,6 +116,13 @@ pub struct SnixStoreFs<BS, DS, RN: RootNodes> {
+     next_file_handle: AtomicU64,
+ 
+     tokio_handle: tokio::runtime::Handle,
++
++    /// Backing store for DAX mappings, if the filesystem is serving them.
++    ///
++    /// Without one, `setupmapping` reports `ENOSYS` and guests fall back to
++    /// ordinary reads.
++    #[cfg(feature = "virtiofs")]
++    dax_cache: Option<dax::DaxCache>,
+ }
+ 
+ /// Configures some filesystem settings
+@@ -161,9 +168,23 @@ where
+             file_handles: RwLock::new(Default::default()),
+             next_file_handle: AtomicU64::new(1),
+             tokio_handle,
++
++            #[cfg(feature = "virtiofs")]
++            dax_cache: None,
+         }
+     }
+ 
++    /// Serve DAX mappings for regular files, backed by `dax_cache`.
++    ///
++    /// Blobs are materialized into the cache on demand. Point several
++    /// filesystems at one cache directory to have them share host pages for
++    /// blobs they both map.
++    #[cfg(feature = "virtiofs")]
++    pub fn with_dax_cache(mut self, dax_cache: dax::DaxCache) -> Self {
++        self.dax_cache = Some(dax_cache);
++        self
++    }
++
+     /// Retrieves the inode for a given root node basename, if present.
+     /// This obtains a read lock on self.root_nodes.
+     fn get_inode_for_root_name(&self, name: &PathComponent) -> Option<u64> {
+@@ -870,6 +891,80 @@ where
+         Ok(bytes_written as usize)
+     }
+ 
++    /// Sets up a DAX mapping for a regular file.
++    ///
++    /// Blob contents are streamed and have no descriptor of their own, so the
++    /// blob is materialized into the configured [dax::DaxCache] and the
++    /// resulting descriptor is handed to the VMM. Guests sharing a cache
++    /// directory therefore map the same host file for the same blob.
++    ///
++    /// Reports `ENOSYS` when no cache is configured, which makes the guest fall
++    /// back to ordinary reads.
++    #[cfg(feature = "virtiofs")]
++    #[tracing::instrument(skip_all, fields(rq.inode = inode, rq.foffset = foffset, rq.len = len, rq.moffset = moffset), err)]
++    fn setupmapping(
++        &self,
++        _ctx: &Context,
++        inode: Self::Inode,
++        _handle: Self::Handle,
++        foffset: u64,
++        len: u64,
++        flags: u64,
++        moffset: u64,
++        vu_req: &mut dyn fuse_backend_rs::transport::FsCacheReqHandler,
++    ) -> io::Result<()> {
++        use fuse_backend_rs::abi::virtio_fs::SetupmappingFlags;
++        use std::os::fd::AsRawFd;
++
++        let Some(dax_cache) = self.dax_cache.as_ref() else {
++            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
++        };
++
++        // A castore is immutable, and the cache entry is shared between every
++        // guest mapping that blob. A writable mapping could never be honoured.
++        if flags & SetupmappingFlags::WRITE.bits() != 0 {
++            warn!("rejecting writable DAX mapping");
++            return Err(io::Error::from_raw_os_error(libc::EROFS));
++        }
++
++        let blob_digest = match *self.inode_tracker.read().get(inode).ok_or_else(|| {
++            warn!("inode not found");
++            io::Error::from_raw_os_error(libc::EBADF)
++        })? {
++            InodeData::Regular(ref blob_digest, _, _) => *blob_digest,
++            InodeData::Directory(..) => return Err(io::Error::from_raw_os_error(libc::EISDIR)),
++            InodeData::Symlink(_) => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
++        };
++
++        Span::current().record("blob.digest", blob_digest.to_string());
++
++        let file = dax_cache.open_blob(&blob_digest, &self.blob_service, &self.tokio_handle)?;
++
++        // SCM_RIGHTS duplicates the descriptor into the VMM while this
++        // synchronous request is being sent.
++        vu_req.map(foffset, moffset, len, flags, file.as_raw_fd())
++    }
++
++    /// Tears down DAX mappings previously established by [Self::setupmapping].
++    ///
++    /// Mappings are identified by their position in the DAX window, so this
++    /// needs no per-inode state and is simply forwarded to the VMM.
++    #[cfg(feature = "virtiofs")]
++    #[tracing::instrument(skip_all, fields(rq.inode = inode, rq.requests = requests.len()), err)]
++    fn removemapping(
++        &self,
++        _ctx: &Context,
++        inode: Self::Inode,
++        requests: Vec<fuse_backend_rs::abi::virtio_fs::RemovemappingOne>,
++        vu_req: &mut dyn fuse_backend_rs::transport::FsCacheReqHandler,
++    ) -> io::Result<()> {
++        if self.dax_cache.is_none() {
++            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
++        }
++
++        vu_req.unmap(requests)
++    }
++
+     #[tracing::instrument(skip_all, fields(rq.inode = inode))]
+     fn readlink(&self, _ctx: &Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
+         if inode == ROOT_ID {
+diff --git a/snix/castore/src/fs/virtiofs.rs b/snix/castore/src/fs/virtiofs.rs
+index 695615808..a7dffdcac 100644
+--- a/snix/castore/src/fs/virtiofs.rs
++++ b/snix/castore/src/fs/virtiofs.rs
+@@ -1,17 +1,21 @@
+ use std::{
+     convert, error, fmt, io,
+     ops::Deref,
++    os::fd::{AsRawFd, RawFd},
+     path::Path,
+     sync::{Arc, MutexGuard, RwLock},
+ };
+ 
+ use fuse_backend_rs::{
++    abi::virtio_fs::{RemovemappingOne, SetupmappingFlags},
+     api::{filesystem::FileSystem, server::Server},
+     transport::{FsCacheReqHandler, Reader, VirtioFsWriter},
+ };
+ use tracing::error;
+ use vhost::vhost_user::{
+-    Listener, SlaveFsCacheReq, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
++    Backend, Listener, VhostUserFrontendReqHandler, VhostUserProtocolFeatures,
++    VhostUserVirtioFeatures,
++    message::{VhostUserMMap, VhostUserMMapFlags, VhostUserShMemConfig},
+ };
+ use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringMutex, VringState, VringT};
+ use virtio_bindings::bindings::virtio_ring::{
+@@ -23,7 +27,85 @@ use vmm_sys_util::epoll::EventSet;
+ 
+ const VIRTIO_F_VERSION_1: u32 = 32;
+ const NUM_QUEUES: usize = 2;
+-const QUEUE_SIZE: usize = 1024;
++// This is the default used by crosvm's generic vhost-user frontend. The queue
++// size is not negotiated independently, so a smaller backend limit makes
++// crosvm's initial SET_VRING_NUM fail before the device can start.
++const QUEUE_SIZE: usize = 32_768;
++const VIRTIO_FS_TAG_LEN: usize = 36;
++const VIRTIO_FS_CONFIG_LEN: usize = VIRTIO_FS_TAG_LEN + size_of::<u32>();
++const VIRTIO_FS_SHMCAP_ID_CACHE: u8 = 0;
++const DAX_WINDOW_SIZE: u64 = 1 << 33;
++
++fn device_config(tag: &str) -> io::Result<[u8; VIRTIO_FS_CONFIG_LEN]> {
++    if tag.len() > VIRTIO_FS_TAG_LEN {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            format!("virtio-fs tag may be at most {VIRTIO_FS_TAG_LEN} bytes"),
++        ));
++    }
++
++    let mut config = [0; VIRTIO_FS_CONFIG_LEN];
++    config[..tag.len()].copy_from_slice(tag.as_bytes());
++    config[VIRTIO_FS_TAG_LEN..].copy_from_slice(&((NUM_QUEUES - 1) as u32).to_le_bytes());
++    Ok(config)
++}
++
++struct MappingFile(RawFd);
++
++impl AsRawFd for MappingFile {
++    fn as_raw_fd(&self) -> RawFd {
++        self.0
++    }
++}
++
++struct DaxMapper {
++    backend: Backend,
++}
++
++impl FsCacheReqHandler for DaxMapper {
++    fn map(
++        &mut self,
++        foffset: u64,
++        moffset: u64,
++        len: u64,
++        flags: u64,
++        fd: RawFd,
++    ) -> io::Result<()> {
++        let flags = SetupmappingFlags::from_bits(flags)
++            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
++        let mmap_flags = if flags.contains(SetupmappingFlags::WRITE) {
++            VhostUserMMapFlags::WRITABLE
++        } else {
++            VhostUserMMapFlags::empty()
++        };
++        let request = VhostUserMMap {
++            shmid: VIRTIO_FS_SHMCAP_ID_CACHE,
++            padding: [0; 7],
++            fd_offset: foffset,
++            shm_offset: moffset,
++            len,
++            flags: mmap_flags.bits(),
++        };
++
++        self.backend.shmem_map(&request, &MappingFile(fd))?;
++        Ok(())
++    }
++
++    fn unmap(&mut self, requests: Vec<RemovemappingOne>) -> io::Result<()> {
++        for mapping in requests {
++            let request = VhostUserMMap {
++                shmid: VIRTIO_FS_SHMCAP_ID_CACHE,
++                padding: [0; 7],
++                fd_offset: 0,
++                shm_offset: mapping.moffset,
++                len: mapping.len,
++                flags: VhostUserMMapFlags::empty().bits(),
++            };
++            self.backend.shmem_unmap(&request)?;
++        }
++        Ok(())
++    }
++}
+ 
+ #[derive(Debug)]
+ enum Error {
+@@ -38,6 +120,8 @@ enum Error {
+     HandleRequests(fuse_backend_rs::Error),
+     /// Failed to construct new vhost user daemon.
+     NewDaemon,
++    /// Failed to create the vhost-user socket listener.
++    NewListener,
+     /// Failed to start the vhost user daemon.
+     StartDaemon,
+     /// Failed to wait for the vhost user daemon.
+@@ -65,7 +149,9 @@ where
+     server: Arc<Server<Arc<FS>>>,
+     event_idx: bool,
+     guest_mem: GuestMemoryAtomic<GuestMemoryMmap>,
+-    cache_req: Option<SlaveFsCacheReq>,
++    config: [u8; VIRTIO_FS_CONFIG_LEN],
++    dax_window_size: Option<u64>,
++    cache_req: Option<DaxMapper>,
+ }
+ 
+ impl<FS> VhostUserFsBackend<FS>
+@@ -134,10 +220,13 @@ where
+     }
+ }
+ 
+-impl<FS> VhostUserBackendMut<VringMutex> for VhostUserFsBackend<FS>
++impl<FS> VhostUserBackendMut for VhostUserFsBackend<FS>
+ where
+     FS: FileSystem + Send + Sync,
+ {
++    type Bitmap = ();
++    type Vring = VringMutex;
++
+     fn num_queues(&self) -> usize {
+         NUM_QUEUES
+     }
+@@ -154,7 +243,23 @@ where
+     }
+ 
+     fn protocol_features(&self) -> VhostUserProtocolFeatures {
+-        VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::SLAVE_REQ
++        let mut features = VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::CONFIG;
++        if self.dax_window_size.is_some() {
++            features |= VhostUserProtocolFeatures::BACKEND_REQ
++                | VhostUserProtocolFeatures::REPLY_ACK
++                | VhostUserProtocolFeatures::SHMEM;
++        }
++        features
++    }
++
++    fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
++        let Some(end) = offset.checked_add(size) else {
++            return Vec::new();
++        };
++        let Some(config) = self.config.get(offset as usize..end as usize) else {
++            return Vec::new();
++        };
++        config.to_vec()
+     }
+ 
+     fn set_event_idx(&mut self, enabled: bool) {
+@@ -166,8 +271,15 @@ where
+         Ok(())
+     }
+ 
+-    fn set_slave_req_fd(&mut self, cache_req: SlaveFsCacheReq) {
+-        self.cache_req = Some(cache_req);
++    fn set_backend_req_fd(&mut self, backend: Backend) {
++        self.cache_req = Some(DaxMapper { backend });
++    }
++
++    fn get_shmem_config(&self) -> io::Result<VhostUserShMemConfig> {
++        Ok(match self.dax_window_size {
++            Some(size) => VhostUserShMemConfig::new(1, &[size]),
++            None => VhostUserShMemConfig::default(),
++        })
+     }
+ 
+     fn handle_event(
+@@ -176,7 +288,7 @@ where
+         evset: vmm_sys_util::epoll::EventSet,
+         vrings: &[VringMutex],
+         _thread_id: usize,
+-    ) -> std::io::Result<bool> {
++    ) -> std::io::Result<()> {
+         if evset != EventSet::IN {
+             return Err(Error::HandleEventNotEpollIn.into());
+         }
+@@ -191,7 +303,7 @@ where
+             }
+         };
+ 
+-        if self.event_idx {
++        let result = if self.event_idx {
+             loop {
+                 queue
+                     .get_queue_mut()
+@@ -201,20 +313,33 @@ where
+                     break;
+                 }
+             }
++            Ok(())
+         } else {
+-            self.process_queue(&mut queue)?;
+-        }
++            self.process_queue(&mut queue).map(|_| ())
++        };
+ 
+-        Ok(false)
++        result.inspect_err(|error| {
++            error!(
++                ?error,
++                queue = device_event,
++                "failed to process virtio-fs queue"
++            )
++        })
+     }
+ }
+ 
+-pub fn start_virtiofs_daemon<FS, P>(fs: FS, socket: P) -> io::Result<()>
++pub fn start_virtiofs_daemon<FS, P>(
++    fs: FS,
++    socket: P,
++    tag: &str,
++    dax_enabled: bool,
++) -> io::Result<()>
+ where
+     FS: FileSystem + Send + Sync + 'static,
+     P: AsRef<Path>,
+ {
+     let guest_mem = GuestMemoryAtomic::new(GuestMemoryMmap::new());
++    let config = device_config(tag)?;
+ 
+     let server = Arc::new(fuse_backend_rs::api::server::Server::new(Arc::new(fs)));
+ 
+@@ -222,10 +347,12 @@ where
+         server,
+         guest_mem: guest_mem.clone(),
+         event_idx: false,
++        config,
++        dax_window_size: dax_enabled.then_some(DAX_WINDOW_SIZE),
+         cache_req: None,
+     }));
+ 
+-    let listener = Listener::new(socket, true).unwrap();
++    let mut listener = Listener::new(socket, true).map_err(|_| Error::NewListener)?;
+ 
+     let mut fs_daemon = VhostUserDaemon::new(
+         String::from("vhost-user-fs-snix-castore"),
+@@ -234,9 +361,159 @@ where
+     )
+     .map_err(|_| Error::NewDaemon)?;
+ 
+-    fs_daemon.start(listener).map_err(|_| Error::StartDaemon)?;
++    fs_daemon
++        .start(&mut listener)
++        .map_err(|_| Error::StartDaemon)?;
+ 
+     fs_daemon.wait().map_err(|_| Error::WaitDaemon)?;
+ 
+     Ok(())
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::{
++        os::fd::{AsRawFd, FromRawFd},
++        os::unix::net::UnixStream,
++        sync::{Arc, Mutex},
++    };
++
++    use fuse_backend_rs::{
++        abi::virtio_fs::{RemovemappingOne, SetupmappingFlags},
++        transport::FsCacheReqHandler,
++    };
++    use vhost::vhost_user::{
++        Backend, FrontendReqHandler, HandlerResult, VhostUserFrontendReqHandlerMut,
++        message::{VhostUserMMap, VhostUserMMapFlags},
++    };
++
++    use super::{
++        DaxMapper, NUM_QUEUES, VIRTIO_FS_CONFIG_LEN, VIRTIO_FS_SHMCAP_ID_CACHE, VIRTIO_FS_TAG_LEN,
++        device_config,
++    };
++
++    #[derive(Default)]
++    struct Frontend {
++        maps: Vec<(u8, u64, u64, u64, u64)>,
++        unmaps: Vec<(u8, u64, u64)>,
++    }
++
++    impl VhostUserFrontendReqHandlerMut for Frontend {
++        fn shmem_map(&mut self, request: &VhostUserMMap, fd: &dyn AsRawFd) -> HandlerResult<u64> {
++            assert!(fd.as_raw_fd() >= 0);
++            self.maps.push((
++                request.shmid,
++                request.fd_offset,
++                request.shm_offset,
++                request.len,
++                request.flags,
++            ));
++            Ok(0)
++        }
++
++        fn shmem_unmap(&mut self, request: &VhostUserMMap) -> HandlerResult<u64> {
++            self.unmaps
++                .push((request.shmid, request.shm_offset, request.len));
++            Ok(0)
++        }
++    }
++
++    fn mapper_and_frontend() -> (
++        DaxMapper,
++        FrontendReqHandler<Mutex<Frontend>>,
++        Arc<Mutex<Frontend>>,
++    ) {
++        let frontend = Arc::new(Mutex::new(Frontend::default()));
++        let handler = FrontendReqHandler::new(frontend.clone()).unwrap();
++
++        // SAFETY: handler owns a live Unix socket and dup either returns a new
++        // owned descriptor or reports failure.
++        let fd = unsafe { libc::dup(handler.get_tx_raw_fd()) };
++        assert!(fd >= 0);
++        // SAFETY: fd was just returned by dup and ownership moves to the stream.
++        let stream = unsafe { UnixStream::from_raw_fd(fd) };
++        let backend = Backend::from_stream(stream);
++        backend.set_shmem_flag(true);
++
++        (DaxMapper { backend }, handler, frontend)
++    }
++
++    #[test]
++    fn builds_virtio_fs_config() {
++        let config = device_config("snix").unwrap();
++        assert_eq!(&config[..4], b"snix");
++        assert!(config[4..VIRTIO_FS_TAG_LEN].iter().all(|byte| *byte == 0));
++        assert_eq!(
++            &config[VIRTIO_FS_TAG_LEN..VIRTIO_FS_CONFIG_LEN],
++            &((NUM_QUEUES - 1) as u32).to_le_bytes()
++        );
++
++        assert!(device_config(&"x".repeat(VIRTIO_FS_TAG_LEN)).is_ok());
++        assert!(device_config(&"x".repeat(VIRTIO_FS_TAG_LEN + 1)).is_err());
++    }
++
++    #[test]
++    fn translates_dax_requests_to_shmem_messages() {
++        let (mut mapper, mut handler, frontend) = mapper_and_frontend();
++        let file = tempfile::tempfile().unwrap();
++
++        mapper
++            .map(
++                0x1000,
++                0x2000,
++                0x3000,
++                SetupmappingFlags::READ.bits(),
++                file.as_raw_fd(),
++            )
++            .unwrap();
++        assert_eq!(handler.handle_request().unwrap(), 0);
++
++        mapper
++            .map(
++                0x4000,
++                0x5000,
++                0x6000,
++                SetupmappingFlags::WRITE.bits(),
++                file.as_raw_fd(),
++            )
++            .unwrap();
++        assert_eq!(handler.handle_request().unwrap(), 0);
++
++        mapper
++            .unmap(vec![
++                RemovemappingOne {
++                    moffset: 0x2000,
++                    len: 0x3000,
++                },
++                RemovemappingOne {
++                    moffset: 0x5000,
++                    len: 0x6000,
++                },
++            ])
++            .unwrap();
++        assert_eq!(handler.handle_request().unwrap(), 0);
++        assert_eq!(handler.handle_request().unwrap(), 0);
++
++        let frontend = frontend.lock().unwrap();
++        assert_eq!(
++            frontend.maps,
++            vec![
++                (VIRTIO_FS_SHMCAP_ID_CACHE, 0x1000, 0x2000, 0x3000, 0),
++                (
++                    VIRTIO_FS_SHMCAP_ID_CACHE,
++                    0x4000,
++                    0x5000,
++                    0x6000,
++                    VhostUserMMapFlags::WRITABLE.bits(),
++                ),
++            ]
++        );
++        assert_eq!(
++            frontend.unmaps,
++            vec![
++                (VIRTIO_FS_SHMCAP_ID_CACHE, 0x2000, 0x3000),
++                (VIRTIO_FS_SHMCAP_ID_CACHE, 0x5000, 0x6000),
++            ]
++        );
++    }
++}
+diff --git a/snix/cli/castore/src/main.rs b/snix/cli/castore/src/main.rs
+index f5cece62b..ebed250ca 100644
+--- a/snix/cli/castore/src/main.rs
++++ b/snix/cli/castore/src/main.rs
+@@ -277,7 +277,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+                 );
+                 tracing::info!(socket_path=?socket, "starting virtiofs-daemon");
+ 
+-                start_virtiofs_daemon(fs, socket)
++                start_virtiofs_daemon(fs, socket, "snix", false)
+             })
+             .await??;
+         }
+diff --git a/snix/cli/store/src/main.rs b/snix/cli/store/src/main.rs
+index 8187babf2..ae2b8d147 100644
+--- a/snix/cli/store/src/main.rs
++++ b/snix/cli/store/src/main.rs
+@@ -697,7 +697,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+             tokio::task::spawn_blocking(move || {
+                 info!(socket_path=?socket, "starting virtiofs-daemon");
+ 
+-                start_virtiofs_daemon(fs, socket)
++                start_virtiofs_daemon(fs, socket, "snix", false)
+             })
+             .await??;
+         }

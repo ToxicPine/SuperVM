@@ -1,0 +1,168 @@
+From caacf2ed859052de453ea5e3dfc9b2c65ee02b84 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Tue, 28 Jul 2026 22:19:11 +0100
+Subject: [PATCH 1/4] fix(castore/fs): include mode in inode identity
+
+Include executable mode in regular-file inode identity so equal contents with
+different modes cannot share kernel-cached attributes.
+
+Change-Id: I49ecb0e2e541203417538fa9ba52421337e7249e
+---
+ snix/castore/src/fs/inode_tracker.rs | 83 +++++++++++++++++++++++++---
+ snix/castore/src/fs/mod.rs           |  7 ++-
+ 2 files changed, 80 insertions(+), 10 deletions(-)
+
+diff --git a/snix/castore/src/fs/inode_tracker.rs b/snix/castore/src/fs/inode_tracker.rs
+index e0c072d33..3d02a7e57 100644
+--- a/snix/castore/src/fs/inode_tracker.rs
++++ b/snix/castore/src/fs/inode_tracker.rs
+@@ -3,13 +3,25 @@ use std::{collections::HashMap, sync::Arc};
+ use super::inodes::{DirectoryInodeData, InodeData};
+ use crate::B3Digest;
+ 
++/// What makes two regular files the same inode.
++///
++/// Not just the blob digest: two nodes with identical contents but different
++/// modes are different files, and the kernel is entitled to assume one inode
++/// has one set of attributes. Keying on the digest alone made whichever of them
++/// was looked up first decide the mode of both.
++#[derive(PartialEq, Eq, Hash)]
++struct FileKey {
++    digest: B3Digest,
++    executable: bool,
++}
++
+ /// InodeTracker keeps track of inodes, stores data being these inodes and deals
+ /// with inode allocation.
+ pub struct InodeTracker {
+     data: HashMap<u64, Arc<InodeData>>,
+ 
+-    // lookup table for blobs by their B3Digest
+-    blob_digest_to_inode: HashMap<B3Digest, u64>,
++    // lookup table for blobs by everything that distinguishes them
++    file_to_inode: HashMap<FileKey, u64>,
+ 
+     // lookup table for symlinks by their target
+     symlink_target_to_inode: HashMap<bytes::Bytes, u64>,
+@@ -27,7 +39,7 @@ impl Default for InodeTracker {
+         Self {
+             data: Default::default(),
+ 
+-            blob_digest_to_inode: Default::default(),
++            file_to_inode: Default::default(),
+             symlink_target_to_inode: Default::default(),
+             directory_digest_to_inode: Default::default(),
+ 
+@@ -36,6 +48,20 @@ impl Default for InodeTracker {
+     }
+ }
+ 
++impl InodeData {
++    /// The key under which this node is shared with identical ones, if it is a
++    /// regular file.
++    fn file_key(&self) -> Option<FileKey> {
++        match self {
++            InodeData::Regular(digest, _, executable) => Some(FileKey {
++                digest: *digest,
++                executable: *executable,
++            }),
++            _ => None,
++        }
++    }
++}
++
+ impl InodeTracker {
+     // Retrieves data for a given inode, if it exists.
+     pub fn get(&self, ino: u64) -> Option<Arc<InodeData>> {
+@@ -57,8 +83,9 @@ impl InodeTracker {
+     // up
+     pub fn put(&mut self, data: InodeData) -> u64 {
+         match data {
+-            InodeData::Regular(ref digest, _, _) => {
+-                match self.blob_digest_to_inode.get(digest) {
++            InodeData::Regular(..) => {
++                let key = data.file_key().expect("Snix bug: must be a regular file");
++                match self.file_to_inode.get(&key) {
+                     Some(found_ino) => {
+                         // We already have it, return the inode.
+                         *found_ino
+@@ -102,8 +129,11 @@ impl InodeTracker {
+         let ino = self.next_inode;
+         // insert into lookup tables
+         match data {
+-            InodeData::Regular(ref digest, _, _) => {
+-                self.blob_digest_to_inode.insert(*digest, ino);
++            InodeData::Regular(..) => {
++                self.file_to_inode.insert(
++                    data.file_key().expect("Snix bug: must be a regular file"),
++                    ino,
++                );
+             }
+             InodeData::Symlink(ref target) => {
+                 self.symlink_target_to_inode.insert(target.clone(), ino);
+@@ -180,6 +210,45 @@ mod tests {
+         );
+     }
+ 
++    /// Two files with identical contents but different modes are different
++    /// files. Sharing an inode between them would let whichever was looked up
++    /// first decide the mode of both, since the kernel caches attributes per
++    /// inode.
++    #[test]
++    fn put_regular_differing_in_mode() {
++        let mut inode_tracker = InodeTracker::default();
++
++        let plain = InodeData::Regular(
++            *fixtures::BLOB_A_DIGEST,
++            fixtures::BLOB_A.len() as u64,
++            false,
++        );
++        let executable = InodeData::Regular(
++            *fixtures::BLOB_A_DIGEST,
++            fixtures::BLOB_A.len() as u64,
++            true,
++        );
++
++        let plain_ino = inode_tracker.put(plain.clone());
++        let executable_ino = inode_tracker.put(executable.clone());
++
++        assert_ne!(plain_ino, executable_ino);
++
++        // and each keeps answering with what it was inserted as, in either
++        // order.
++        assert_eq!(executable_ino, inode_tracker.put(executable));
++        assert_eq!(plain_ino, inode_tracker.put(plain));
++
++        assert!(matches!(
++            *inode_tracker.get(plain_ino).unwrap(),
++            InodeData::Regular(_, _, false)
++        ));
++        assert!(matches!(
++            *inode_tracker.get(executable_ino).unwrap(),
++            InodeData::Regular(_, _, true)
++        ));
++    }
++
+     // Put of a symlink should allocate a uid, which should be the same when inserting again
+     #[test]
+     fn put_symlink() {
+diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
+index 1fd3ebd3f..e8e21e0d3 100644
+--- a/snix/castore/src/fs/mod.rs
++++ b/snix/castore/src/fs/mod.rs
+@@ -66,11 +66,12 @@ use tracing::{Span, debug, error, instrument, warn};
+ ///    deeper.
+ ///  - Processing a `readdir` request
+ ///
+-///  Things pointing to the same contents get the same inodes, irrespective of
+-///  their own location.
++///  Things representing the same filesystem object get the same inodes,
++///  irrespective of their own location.
+ ///  This means:
+ ///  - Symlinks with the same target will get the same inode.
+-///  - Regular/executable files with the same contents will get the same inode
++///  - Regular files with the same contents and executable bit will get the same
++///    inode.
+ ///  - Directories with the same contents will get the same inode.
+ ///
+ /// Due to the above being valid across the whole store, and considering the

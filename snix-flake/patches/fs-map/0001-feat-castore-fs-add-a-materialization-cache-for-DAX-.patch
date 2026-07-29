@@ -1,0 +1,371 @@
+From b79f993f6393bc26385c481b73ac7f35ad666528 Mon Sep 17 00:00:00 2001
+From: SuperVM <supervm@localhost>
+Date: Tue, 28 Jul 2026 13:43:14 +0100
+Subject: [PATCH 1/6] feat(castore/fs): cache blobs for DAX
+
+Add DaxCache to materialize blobs as stable, digest-named host files for DAX
+mappings. Staged writes expose only complete entries, and a shared cache lets
+guests map the same host page-cache pages.
+
+Change-Id: I6d6139b3e0d779b4c735c4859309237417c4dc74
+---
+ snix/castore/src/fs/dax.rs | 335 +++++++++++++++++++++++++++++++++++++
+ snix/castore/src/fs/mod.rs |   3 +
+ 2 files changed, 338 insertions(+)
+ create mode 100644 snix/castore/src/fs/dax.rs
+
+diff --git a/snix/castore/src/fs/dax.rs b/snix/castore/src/fs/dax.rs
+new file mode 100644
+index 0000000..3b0fab1
+--- /dev/null
++++ b/snix/castore/src/fs/dax.rs
+@@ -0,0 +1,335 @@
++//! Materialization cache backing virtio-fs DAX mappings.
++//!
++//! Regular files in a castore are blobs, and [SnixStoreFs](super::SnixStoreFs)
++//! serves their contents lazily: `read` streams bytes out of a [BlobReader],
++//! which may be assembled from chunks and may be backed by remote storage.
++//!
++//! DAX cannot be served that way. Setting up a mapping means handing the VMM a
++//! file descriptor to `mmap` into its DAX window, so the content has to exist
++//! as a real file on the host with a stable offset. This module provides that
++//! backing by materializing blobs into a directory, one file per blob, named by
++//! the blob's digest.
++//!
++//! Entries are content-addressed, which is what makes the cache useful beyond a
++//! single guest: when several virtio-fs frontends share one cache directory, a
++//! blob mapped by more than one guest resolves to the same host file, and hence
++//! to the same host page cache pages. Sharing is a property of the addressing
++//! scheme rather than of any deduplication pass.
++//!
++//! Entries are immutable once published and are never evicted while a mapping
++//! could reference them.
++
++use std::{
++    collections::HashMap,
++    fs, io,
++    path::{Path, PathBuf},
++    sync::{
++        Arc,
++        atomic::{AtomicU64, Ordering},
++    },
++};
++
++use data_encoding::HEXLOWER;
++use parking_lot::RwLock;
++use tracing::{debug, instrument, warn};
++
++use crate::{B3Digest, blobservice::BlobService};
++
++/// A directory of blob contents materialized as files, keyed by blob digest.
++///
++/// Cloning is cheap; clones share the underlying cache. Multiple processes may
++/// share one directory concurrently.
++#[derive(Clone)]
++pub struct DaxCache(Arc<Inner>);
++
++struct Inner {
++    dir: PathBuf,
++
++    /// Files we have already materialized and opened, so repeat mappings of the
++    /// same blob don't re-open it.
++    ///
++    /// Holding the [fs::File] keeps the descriptor alive for as long as the
++    /// cache lives, which is what lets us hand a raw fd to the VMM.
++    open: RwLock<HashMap<B3Digest, Arc<fs::File>>>,
++
++    /// Distinguishes concurrent temporary files within this process.
++    next_temp: AtomicU64,
++}
++
++impl DaxCache {
++    /// Opens (creating if necessary) a cache in `dir`.
++    pub fn new(dir: impl Into<PathBuf>) -> io::Result<Self> {
++        let dir = dir.into();
++        fs::create_dir_all(&dir)?;
++
++        Ok(Self(Arc::new(Inner {
++            dir,
++            open: RwLock::new(HashMap::new()),
++            next_temp: AtomicU64::new(0),
++        })))
++    }
++
++    /// The directory backing this cache.
++    pub fn dir(&self) -> &Path {
++        &self.0.dir
++    }
++
++    /// The path at which `digest` is (or would be) materialized.
++    ///
++    /// Digests are hex-encoded here rather than rendered with [B3Digest]'s
++    /// [std::fmt::Display], which uses standard base64 and can contain `/`.
++    fn entry_path(&self, digest: &B3Digest) -> PathBuf {
++        self.0.dir.join(HEXLOWER.encode(digest.as_ref()))
++    }
++
++    /// Returns an open file holding the contents of `digest`, materializing it
++    /// from `blob_service` if it is not present yet.
++    ///
++    /// Safe to call concurrently for the same digest, both across threads and
++    /// across processes sharing the directory.
++    #[instrument(skip_all, fields(blob.digest = %digest), err)]
++    pub fn open_blob<BS>(
++        &self,
++        digest: &B3Digest,
++        blob_service: &BS,
++        tokio_handle: &tokio::runtime::Handle,
++    ) -> io::Result<Arc<fs::File>>
++    where
++        BS: BlobService + ?Sized,
++    {
++        if let Some(file) = self.0.open.read().get(digest) {
++            return Ok(file.clone());
++        }
++
++        let path = self.entry_path(digest);
++
++        // Another process (or a previous run) may already have published this
++        // entry, so try opening before doing any work.
++        let file = match fs::File::open(&path) {
++            Ok(file) => file,
++            Err(e) if e.kind() == io::ErrorKind::NotFound => {
++                self.materialize(digest, &path, blob_service, tokio_handle)?;
++                fs::File::open(&path)?
++            }
++            Err(e) => return Err(e),
++        };
++
++        let file = Arc::new(file);
++
++        // If another thread materialized the same blob concurrently, keep
++        // whichever entry landed first so callers observe a stable descriptor.
++        let mut open = self.0.open.write();
++        Ok(open.entry(*digest).or_insert(file).clone())
++    }
++
++    /// Writes the contents of `digest` to `path`.
++    ///
++    /// The content is staged in a temporary file and renamed into place, so a
++    /// reader either sees no entry or sees a complete one, even if we crash or
++    /// race another writer. Entries are content-addressed, so a racing writer
++    /// produces identical bytes and either rename is equally correct.
++    fn materialize<BS>(
++        &self,
++        digest: &B3Digest,
++        path: &Path,
++        blob_service: &BS,
++        tokio_handle: &tokio::runtime::Handle,
++    ) -> io::Result<()>
++    where
++        BS: BlobService + ?Sized,
++    {
++        let temp = self.0.dir.join(format!(
++            ".{}.{}.{}.tmp",
++            HEXLOWER.encode(digest.as_ref()),
++            std::process::id(),
++            self.0.next_temp.fetch_add(1, Ordering::Relaxed),
++        ));
++
++        let result = tokio_handle.block_on(async {
++            let mut reader = blob_service
++                .open_read(digest)
++                .await
++                .map_err(io::Error::other)?
++                .ok_or_else(|| {
++                    io::Error::new(io::ErrorKind::NotFound, "blob not found in blob service")
++                })?;
++
++            let mut out = tokio::fs::File::create(&temp).await?;
++            let size = tokio::io::copy(&mut reader, &mut out).await?;
++
++            // The descriptor is handed to a VMM which maps it directly, so the
++            // contents must be durable and visible before we publish the entry.
++            out.sync_all().await?;
++
++            Ok::<_, io::Error>(size)
++        });
++
++        match result {
++            Ok(size) => {
++                fs::rename(&temp, path)?;
++                debug!(blob.size = size, "materialized blob for DAX");
++                Ok(())
++            }
++            Err(e) => {
++                // Best-effort: a leftover temporary file is inert, but there is
++                // no reason to keep it around.
++                if let Err(e) = fs::remove_file(&temp)
++                    && e.kind() != io::ErrorKind::NotFound
++                {
++                    warn!(%e, "failed to remove temporary DAX cache file");
++                }
++                Err(e)
++            }
++        }
++    }
++}
++
++impl std::fmt::Debug for DaxCache {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("DaxCache")
++            .field("dir", &self.0.dir)
++            .finish()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::{io::Read, os::unix::fs::MetadataExt, sync::Arc};
++
++    use tempfile::TempDir;
++
++    use super::DaxCache;
++    use crate::{
++        blobservice::{BlobService, MemoryBlobService},
++        fixtures::{HELLOWORLD_BLOB_CONTENTS, HELLOWORLD_BLOB_DIGEST},
++    };
++
++    async fn blob_service_with_helloworld() -> Arc<dyn BlobService> {
++        let blob_service = Arc::new(MemoryBlobService::default()) as Arc<dyn BlobService>;
++        let mut w = blob_service.open_write().await;
++        let mut contents: &[u8] = HELLOWORLD_BLOB_CONTENTS;
++        tokio::io::copy(&mut contents, &mut w)
++            .await
++            .unwrap();
++        w.close().await.unwrap();
++        blob_service
++    }
++
++    fn read_all(file: &std::fs::File) -> Vec<u8> {
++        let mut buf = Vec::new();
++        file.try_clone().unwrap().read_to_end(&mut buf).unwrap();
++        buf
++    }
++
++    #[tokio::test]
++    async fn materializes_blob_contents() {
++        let dir = TempDir::new().unwrap();
++        let blob_service = blob_service_with_helloworld().await;
++        let cache = DaxCache::new(dir.path()).unwrap();
++
++        let file = tokio::task::spawn_blocking({
++            let cache = cache.clone();
++            let blob_service = blob_service.clone();
++            let handle = tokio::runtime::Handle::current();
++            move || {
++                cache
++                    .open_blob(&HELLOWORLD_BLOB_DIGEST, blob_service.as_ref(), &handle)
++                    .unwrap()
++            }
++        })
++        .await
++        .unwrap();
++
++        assert_eq!(read_all(&file), HELLOWORLD_BLOB_CONTENTS.to_vec());
++    }
++
++    /// Opening the same blob twice must yield the same underlying file, since
++    /// that is what makes guests share host pages.
++    #[tokio::test]
++    async fn repeated_open_is_the_same_file() {
++        let dir = TempDir::new().unwrap();
++        let blob_service = blob_service_with_helloworld().await;
++        let cache = DaxCache::new(dir.path()).unwrap();
++
++        let (a, b) = tokio::task::spawn_blocking({
++            let cache = cache.clone();
++            let blob_service = blob_service.clone();
++            let handle = tokio::runtime::Handle::current();
++            move || {
++                let a = cache
++                    .open_blob(&HELLOWORLD_BLOB_DIGEST, blob_service.as_ref(), &handle)
++                    .unwrap();
++                let b = cache
++                    .open_blob(&HELLOWORLD_BLOB_DIGEST, blob_service.as_ref(), &handle)
++                    .unwrap();
++                (a, b)
++            }
++        })
++        .await
++        .unwrap();
++
++        assert!(Arc::ptr_eq(&a, &b), "expected a cached descriptor");
++
++        let (ma, mb) = (a.metadata().unwrap(), b.metadata().unwrap());
++        assert_eq!((ma.dev(), ma.ino()), (mb.dev(), mb.ino()));
++    }
++
++    /// A second cache over the same directory must reuse the entry written by
++    /// the first, rather than materializing its own copy. This is the property
++    /// that lets separate frontends share pages.
++    #[tokio::test]
++    async fn separate_caches_share_one_entry() {
++        let dir = TempDir::new().unwrap();
++        let blob_service = blob_service_with_helloworld().await;
++
++        let (a, b) = tokio::task::spawn_blocking({
++            let dir = dir.path().to_path_buf();
++            let blob_service = blob_service.clone();
++            let handle = tokio::runtime::Handle::current();
++            move || {
++                let a = DaxCache::new(&dir)
++                    .unwrap()
++                    .open_blob(&HELLOWORLD_BLOB_DIGEST, blob_service.as_ref(), &handle)
++                    .unwrap();
++                let b = DaxCache::new(&dir)
++                    .unwrap()
++                    .open_blob(&HELLOWORLD_BLOB_DIGEST, blob_service.as_ref(), &handle)
++                    .unwrap();
++                (a, b)
++            }
++        })
++        .await
++        .unwrap();
++
++        let (ma, mb) = (a.metadata().unwrap(), b.metadata().unwrap());
++        assert_eq!(
++            (ma.dev(), ma.ino()),
++            (mb.dev(), mb.ino()),
++            "expected both caches to resolve to one host file"
++        );
++    }
++
++    #[tokio::test]
++    async fn missing_blob_is_an_error() {
++        let dir = TempDir::new().unwrap();
++        let blob_service = Arc::new(MemoryBlobService::default()) as Arc<dyn BlobService>;
++        let cache = DaxCache::new(dir.path()).unwrap();
++
++        let err = tokio::task::spawn_blocking({
++            let handle = tokio::runtime::Handle::current();
++            move || cache.open_blob(&HELLOWORLD_BLOB_DIGEST, blob_service.as_ref(), &handle)
++        })
++        .await
++        .unwrap()
++        .expect_err("expected a missing blob to fail");
++
++        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
++
++        // A failed materialization must not leave anything behind.
++        let entries: Vec<_> = std::fs::read_dir(dir.path())
++            .unwrap()
++            .map(|e| e.unwrap().file_name())
++            .collect();
++        assert!(entries.is_empty(), "leftover files: {entries:?}");
++    }
++}
+diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
+index 380badf..1003492 100644
+--- a/snix/castore/src/fs/mod.rs
++++ b/snix/castore/src/fs/mod.rs
+@@ -6,6 +6,9 @@ pub mod root_nodes;
+ #[cfg(feature = "fuse")]
+ pub mod fuse;
+ 
++#[cfg(feature = "virtiofs")]
++pub mod dax;
++
+ #[cfg(feature = "virtiofs")]
+ pub mod virtiofs;
+ 

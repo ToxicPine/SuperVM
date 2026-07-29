@@ -1,0 +1,35 @@
+From 309db849a2bc6e3169b8c55112be9b056bb3df4b Mon Sep 17 00:00:00 2001
+From: SuperVM <supervm@localhost>
+Date: Tue, 28 Jul 2026 14:45:54 +0100
+Subject: [PATCH 5/6] fix(castore/fs): advertise DAX protocol features
+
+Advertise SLAVE_SEND_FD, REPLY_ACK, and CONFIGURE_MEM_SLOTS so VMMs can accept
+the backend, receive DAX file descriptors, and report failed mappings.
+
+Change-Id: Iacf5783095463d289b3f7e36398b7e61164c70a0
+---
+ snix/castore/src/fs/virtiofs.rs | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/snix/castore/src/fs/virtiofs.rs b/snix/castore/src/fs/virtiofs.rs
+index 6956158..2fa419a 100644
+--- a/snix/castore/src/fs/virtiofs.rs
++++ b/snix/castore/src/fs/virtiofs.rs
+@@ -154,7 +154,16 @@ where
+     }
+ 
+     fn protocol_features(&self) -> VhostUserProtocolFeatures {
+-        VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::SLAVE_REQ
++        VhostUserProtocolFeatures::MQ
++            | VhostUserProtocolFeatures::SLAVE_REQ
++            // Required to pass a file descriptor along a backend request,
++            // which is how a DAX mapping reaches the VMM. Without it there is
++            // no way to answer `setupmapping` at all.
++            | VhostUserProtocolFeatures::SLAVE_SEND_FD
++            // Backend requests are acknowledged, so the VMM can report a
++            // failed mapping rather than leaving the guest to fault on it.
++            | VhostUserProtocolFeatures::REPLY_ACK
++            | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
+     }
+ 
+     fn set_event_idx(&mut self, enabled: bool) {
