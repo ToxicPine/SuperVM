@@ -39,11 +39,11 @@ the NAR and is covered by the NAR hash and existing signatures.
 SuperVM with crosvm.
 
 ```sh
-nix build ./snix-flake#snix
-nix build ./snix-flake#snix-fs-map
-nix build ./snix-flake#snix-shmem-map
-nix build ./snix-flake#snix-fsmeta-fs-map
-nix build ./snix-flake#snix-fsmeta-shmem-map
+nix build ./flakes/snix#snix
+nix build ./flakes/snix#snix-fs-map
+nix build ./flakes/snix#snix-shmem-map
+nix build ./flakes/snix#snix-fsmeta-fs-map
+nix build ./flakes/snix#snix-fsmeta-shmem-map
 ```
 
 The flake supports `x86_64-linux` and `aarch64-linux`. It also exposes the Snix
@@ -53,7 +53,7 @@ libraries and `lib.depotsFor` for consumers that need the full patched depot.
 
 ```nix
 {
-  inputs.snix-super.url = "path:./snix-flake";
+  inputs.snix-super.url = "path:./flakes/snix";
 
   outputs = { nixpkgs, snix-super, ... }: {
     nixosConfigurations.host = nixpkgs.lib.nixosSystem {

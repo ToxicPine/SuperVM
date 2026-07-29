@@ -7,16 +7,16 @@
         ]
       },
       "locked": {
-        "path": "./crosvm-flake",
+        "path": "./flakes/crosvm",
         "type": "path"
       },
       "original": {
-        "path": "./crosvm-flake",
+        "path": "./flakes/crosvm",
         "type": "path"
       },
       "parent": []
     },
-    "microvm-super": {
+    "microvm-lame": {
       "inputs": {
         "nixpkgs": [
           "nixpkgs"
@@ -24,21 +24,21 @@
         "spectrum": "spectrum"
       },
       "locked": {
-        "lastModified": 1785353051,
-        "narHash": "sha256-FhoWwSFQZZTAUgMawW+F2/n5M5W72rHmNqBs3ruwirc=",
+        "lastModified": 1785356196,
+        "narHash": "sha256-KAnT/C2yAlaGZbzBMBcWvViZ0mpXfTk4f8nhLjJTfmo=",
         "owner": "ToxicPine",
         "repo": "microvm.nix",
-        "rev": "5e4f8868413b69c93a8642a54de880076d332d96",
+        "rev": "86ee28bd668ab285fe1b22a2673d9621f47b26ba",
         "type": "github"
       },
       "original": {
         "owner": "ToxicPine",
-        "ref": "supervm",
+        "ref": "lamevm",
         "repo": "microvm.nix",
         "type": "github"
       }
     },
-    "microvm-vanilla": {
+    "microvm-super": {
       "inputs": {
         "nixpkgs": [
           "nixpkgs"
@@ -46,16 +46,16 @@
         "spectrum": "spectrum_2"
       },
       "locked": {
-        "lastModified": 1785246989,
-        "narHash": "sha256-7CjGBACbXXIJvGrPed75QI8ytqc48M78GP9aB/h2VSc=",
+        "lastModified": 1785356201,
+        "narHash": "sha256-O5oWcQWxFOaUs022RDzTDwI5fGns2WhyRVD0jzhKA3U=",
         "owner": "ToxicPine",
         "repo": "microvm.nix",
-        "rev": "39a499ab85311b56dddb09ec43351cc3658f22c1",
+        "rev": "a5b7fd67c7ad2674ff6dbd18d4aca6e17df644f3",
         "type": "github"
       },
       "original": {
         "owner": "ToxicPine",
-        "ref": "main",
+        "ref": "supervm",
         "repo": "microvm.nix",
         "type": "github"
       }
@@ -79,8 +79,8 @@
     "root": {
       "inputs": {
         "crosvm-super": "crosvm-super",
+        "microvm-lame": "microvm-lame",
         "microvm-super": "microvm-super",
-        "microvm-vanilla": "microvm-vanilla",
         "nixpkgs": "nixpkgs",
         "snix": "snix"
       }
@@ -93,11 +93,11 @@
         "snix-src": "snix-src"
       },
       "locked": {
-        "path": "./snix-flake",
+        "path": "./flakes/snix",
         "type": "path"
       },
       "original": {
-        "path": "./snix-flake",
+        "path": "./flakes/snix",
         "type": "path"
       },
       "parent": []

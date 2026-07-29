@@ -36,6 +36,7 @@ let
           microvm = {
             hypervisor = "crosvm";
             socket = "crosvm.sock";
+            balloon = true;
 
             # This is the vanilla microvm.nix store path: a read-only image
             # containing the guest closure. There is deliberately no writable

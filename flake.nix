@@ -3,16 +3,16 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    snix.url = "path:./snix-flake";
+    snix.url = "path:./flakes/snix";
     snix.inputs.nixpkgs.follows = "nixpkgs";
 
     microvm-super.url = "github:ToxicPine/microvm.nix/supervm";
     microvm-super.inputs.nixpkgs.follows = "nixpkgs";
 
-    microvm-vanilla.url = "github:ToxicPine/microvm.nix/main";
-    microvm-vanilla.inputs.nixpkgs.follows = "nixpkgs";
+    microvm-lame.url = "github:ToxicPine/microvm.nix/lamevm";
+    microvm-lame.inputs.nixpkgs.follows = "nixpkgs";
 
-    crosvm-super.url = "path:./crosvm-flake";
+    crosvm-super.url = "path:./flakes/crosvm";
     crosvm-super.inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -22,7 +22,7 @@
       nixpkgs,
       snix,
       microvm-super,
-      microvm-vanilla,
+      microvm-lame,
       crosvm-super,
     }:
     let
@@ -51,7 +51,7 @@
       mkLameRunner = import ./lame/mk-runner.nix {
         inherit defaultGuestFor;
         guestKernelFor = system: self.packages.${system}.guest-kernel;
-        microvm = microvm-vanilla;
+        microvm = microvm-lame;
       };
     in
     {

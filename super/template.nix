@@ -78,6 +78,7 @@
 
       microvm = {
         hypervisor = "crosvm";
+        balloon = true;
         # The wrapper starts each runner in a private per-VM runtime directory,
         # making this relative control-socket name unique without embedding a
         # host runtime path in the Nix derivation.

@@ -35,7 +35,7 @@ implementation-specific.
 
 ```nix
 {
-  inputs.crosvm-super.url = "path:./crosvm-flake";
+  inputs.crosvm-super.url = "path:./flakes/crosvm";
 
   outputs = { nixpkgs, crosvm-super, ... }: {
     nixosConfigurations.host = nixpkgs.lib.nixosSystem {

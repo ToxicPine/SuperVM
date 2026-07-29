@@ -36,10 +36,10 @@ belong to the dependency.
 ## Choosing one
 
 ```sh
-nix build ./snix-flake#snix-fs-map
-nix build ./snix-flake#snix-shmem-map
-nix build ./snix-flake#snix-fsmeta-fs-map
-nix build ./snix-flake#snix-fsmeta-shmem-map
+nix build ./flakes/snix#snix-fs-map
+nix build ./flakes/snix#snix-shmem-map
+nix build ./flakes/snix#snix-fsmeta-fs-map
+nix build ./flakes/snix#snix-fsmeta-shmem-map
 ```
 
 `snix`, `default`, the libraries, and the overlay select `fsmeta-shmem-map`:
@@ -141,7 +141,7 @@ git clone https://git.snix.dev/snix/snix.git && cd snix
 git checkout efbc95558ac72105dce13ee7bef679b766d0c69a
 git switch -c my-patchset
 # ... commits ...
-git format-patch --no-signature -o /path/to/supervm/snix-flake/patches/<name>/ \
+git format-patch --no-signature -o /path/to/supervm/flakes/snix/patches/<name>/ \
   efbc95558ac72105dce13ee7bef679b766d0c69a
 ```
 
