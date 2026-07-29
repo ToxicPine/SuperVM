@@ -16,23 +16,43 @@ writeShellApplication {
   text = ''
     usage() {
       cat >&2 <<'USAGE'
-    usage: lamevm [flake-ref#nixos-configuration]
+    usage: lamevm [--profile=FLAKE#CONFIG]
 
       Boots the same guest configuration through vanilla microvm.nix,
       nixpkgs crosvm and a read-only store disk. It has no persistent state.
+
+      --profile  NixOS configuration to boot, as a flake reference and
+                  nixosConfigurations attribute. Defaults to the same minimal
+                  configuration as supervm.
     USAGE
       exit 2
     }
 
-    [[ $# -le 1 ]] || usage
-    case "''${1:-}" in
-      -h | --help) usage ;;
-      *) ;;
-    esac
+    profile=
+    while (( $# > 0 )); do
+      case "''${1}" in
+        --profile=*)
+          profile=''${1#--profile=}
+          [[ -n ''${profile} ]] || usage
+          shift
+          ;;
+        --profile)
+          (( $# >= 2 )) || usage
+          profile=''${2}
+          [[ -n ''${profile} ]] || usage
+          shift 2
+          ;;
+        -h | --help)
+          usage
+          ;;
+        *)
+          usage
+          ;;
+      esac
+    done
 
-    guest=''${1:-}
-    if [[ -n ''${guest} ]]; then
-      guest_arg="guest = (builtins.getFlake \"''${guest%%#*}\").nixosConfigurations.\"''${guest##*#}\";"
+    if [[ -n ''${profile} ]]; then
+      guest_arg="guest = (builtins.getFlake \"''${profile%%#*}\").nixosConfigurations.\"''${profile##*#}\";"
     else
       guest_arg=""
     fi

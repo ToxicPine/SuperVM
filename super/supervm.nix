@@ -53,21 +53,24 @@ writeTextFile {
 
     usage() {
       cat >&2 <<'USAGE'
-    usage: supervm [--dax=MODE] <upper-store-dir> [flake-ref#nixos-configuration]
+    usage: supervm [--dax=MODE] [--profile=FLAKE#CONFIG] <upper-store-dir>
 
       --dax      DAX policy: never, inode, or always. Defaults to inode.
+
+      --profile  NixOS configuration to boot, as a flake reference and
+                  nixosConfigurations attribute. SuperVM merges its guest
+                  template over it. Defaults to a minimal configuration.
 
       upper-store-dir
                   directory holding this VM's persistent private state.
                   Created if absent; reusing one resumes that VM.
-
-      flake-ref   a NixOS configuration to boot. SuperVM merges its guest
-                  template over it. Defaults to a minimal configuration.
     USAGE
       exit 2
     }
 
     dax_mode=inode
+    profile=
+    positionals=()
     while (( $# > 0 )); do
       case "''${1}" in
         --dax=*)
@@ -79,18 +82,31 @@ writeTextFile {
           dax_mode=''${2}
           shift 2
           ;;
+        --profile=*)
+          profile=''${1#--profile=}
+          [[ -n ''${profile} ]] || usage
+          shift
+          ;;
+        --profile)
+          (( $# >= 2 )) || usage
+          profile=''${2}
+          [[ -n ''${profile} ]] || usage
+          shift 2
+          ;;
         -h | --help)
           usage
           ;;
         --)
           shift
+          positionals+=("''${@}")
           break
           ;;
         -*)
           usage
           ;;
         *)
-          break
+          positionals+=("''${1}")
+          shift
           ;;
       esac
     done
@@ -99,10 +115,9 @@ writeTextFile {
       never | inode | always) ;;
       *) usage ;;
     esac
-    (( $# >= 1 && $# <= 2 )) || usage
+    (( ''${#positionals[@]} == 1 )) || usage
 
-    upper_store_dir=$(realpath -m "''${1}")
-    guest=''${2:-}
+    upper_store_dir=$(realpath -m "''${positionals[0]}")
 
     runtime_dir=''${XDG_RUNTIME_DIR:-/tmp}/supervm
     state_dir=''${XDG_STATE_HOME:-''${HOME}/.local/state}/supervm
@@ -171,8 +186,8 @@ writeTextFile {
       return 1
     }
 
-    if [[ -n ''${guest} ]]; then
-      guest_arg="guest = (builtins.getFlake \"''${guest%%#*}\").nixosConfigurations.\"''${guest##*#}\";"
+    if [[ -n ''${profile} ]]; then
+      guest_arg="guest = (builtins.getFlake \"''${profile%%#*}\").nixosConfigurations.\"''${profile##*#}\";"
     else
       guest_arg=""
     fi

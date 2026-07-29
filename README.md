@@ -54,12 +54,12 @@ nix run .#supervm -- ./vm-a
 nix run .#supervm -- ./vm-b
 ```
 
-An optional second argument selects a NixOS configuration, so the VMs can run
+The optional `--profile` flag selects a NixOS configuration, so the VMs can run
 different systems:
 
 ```console
-nix run .#supervm -- ./vm-web ./machines#web
-nix run .#supervm -- ./vm-worker ./machines#worker
+nix run .#supervm -- --profile ./machines#web ./vm-web
+nix run .#supervm -- --profile ./machines#worker ./vm-worker
 ```
 
 SuperVM builds each guest, adds its packages to the shared store, and boots it
@@ -77,7 +77,7 @@ nix run .#supervm -- --dax=always ./vm-a
 
 ```console
 nix run .#lamevm
-nix run .#lamevm -- ./machines#web
+nix run .#lamevm -- --profile ./machines#web
 ```
 
 For a fair comparison, run multiple instances of each, since SuperVM's benefit
