@@ -17,12 +17,14 @@ that is invisible to every other guest.
 
 ## Why this exists
 
-SuperVM asks how far VM memory efficiency can be pushed under production
-constraints. It demonstrates that we can exercise granular control over what
-enters shared memory, avoiding broad cache-side-channel exposure. The same
-mechanism has near-zero discovery cost at runtime: known pages are mapped
-directly rather than found by scanning memory for duplicates, so the safer
-approach is also faster than scan-based deduplication.
+SuperVM is a proof of concept for seeing how far VM memory efficiency can be
+pushed under production constraints using selective kernel-page merging and
+policy-controlled sharing of Nix package files. It demonstrates that we can
+exercise granular control over what enters shared memory, avoiding broad
+cache-side-channel exposure. The same mechanism has near-zero discovery cost at
+runtime: known pages are mapped directly rather than found by scanning memory
+for duplicates, so the safer approach is also faster than scan-based
+deduplication.
 
 ## Why it is so efficient
 
