@@ -13,5 +13,5 @@ source "${script_dir}/libexec/variants/nginx.sh"
 # shellcheck source=libexec/objectives/max-count.sh
 source "${script_dir}/libexec/objectives/max-count.sh"
 
-BENCHMARK_PROGRAM_NAME=$0
+BENCHMARK_PROGRAM_NAME=${BENCHMARK_PROGRAM_NAME:-$0}
 run_max_count "$@"

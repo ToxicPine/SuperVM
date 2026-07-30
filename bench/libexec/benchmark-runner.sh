@@ -770,8 +770,8 @@ run_benchmark() {
   mkdir -p "${OUTPUT_DIR}"
   [[ ! -e ${OUTPUT_DIR}/lamevm && ! -e ${OUTPUT_DIR}/supervm ]] ||
     fail "output already contains benchmark data"
-  BENCHMARK_FLAKE="path:${benchmark_dir}"
-  SUPERVM_SOURCE_FLAKE="path:${benchmark_dir}/.."
+  BENCHMARK_FLAKE=${SUPERVM_BENCH_FLAKE:-path:${benchmark_dir}}
+  SUPERVM_SOURCE_FLAKE=${SUPERVM_SOURCE_FLAKE:-path:${benchmark_dir}/..}
   PROCESS_MEMORY_REPORTER="${libexec_dir}/process-memory-report.sh"
   HOST_RESERVE_BYTES=$((2 * 1024 * 1024 * 1024))
   KSM_SYSFS_DIR=/sys/kernel/mm/ksm
@@ -784,7 +784,7 @@ run_benchmark() {
       --no-write-lock-file \
       --no-link \
       --print-out-paths \
-      "${benchmark_dir}#supervm"
+      "${BENCHMARK_FLAKE}#supervm"
   )
   SUPERVM_LAUNCHER="${supervm_package}/bin/supervm"
   [[ -x ${SUPERVM_LAUNCHER} ]] || fail "SuperVM launcher build failed"

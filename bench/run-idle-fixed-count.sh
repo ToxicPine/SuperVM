@@ -13,5 +13,5 @@ source "${script_dir}/libexec/variants/idle.sh"
 # shellcheck source=libexec/objectives/fixed-count.sh
 source "${script_dir}/libexec/objectives/fixed-count.sh"
 
-BENCHMARK_PROGRAM_NAME=$0
+BENCHMARK_PROGRAM_NAME=${BENCHMARK_PROGRAM_NAME:-$0}
 run_fixed_count "$@"
