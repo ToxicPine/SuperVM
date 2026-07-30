@@ -55,6 +55,7 @@
         ./patches/fsmeta/0002-feat-castore-model-attributes-a-tree-declares-about-.patch
         ./patches/fsmeta/0003-feat-castore-fs-serve-the-attributes-a-tree-declares.patch
         ./patches/fsmeta/0004-feat-castore-fs-decide-DAX-per-inode-rather-than-per.patch
+        ./patches/fsmeta/0005-fix-castore-fs-open-blob-readers-lazily.patch
       ];
 
       patchsets = {

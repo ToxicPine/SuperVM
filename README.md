@@ -1,7 +1,6 @@
 # SuperVM
 
-> [!WARNING]
-> Experimental Demo, Not Audited! Works on x86_64.
+> [!WARNING] Experimental Demo, Not Audited! Works on x86_64.
 
 SuperVM is an aggressively memory-optimized runner for heterogeneous VMs.
 SuperVM VMs can run different packages, services, etc, but must use NixOS. Any
@@ -9,7 +8,8 @@ software packages from public Nix caches are stored exactly once on disk and
 cached once in shared memory across all guests; private state remains private.
 
 ```console
-nix run .#supervm -- ./my-vm
+nix run .#supervm -- prepare ./my-vm
+nix run .#supervm -- launch ./my-vm
 ```
 
 Yet, each guest retains its own kernel, distinct writable Nix store, and state
@@ -50,28 +50,39 @@ Firecracker.
 
 Use a Linux host with Nix flakes and KVM.
 
-Start two VMs in two terminals, each with its own state folder:
+Preparation builds the guest and adds its packages to the shared store.
+Launching boots that prepared guest with the state folder as its private layer.
+
+Prepare first:
 
 ```console
-nix run .#supervm -- ./vm-a
-nix run .#supervm -- ./vm-b
+nix run .#supervm -- prepare ./vm-a
+nix run .#supervm -- prepare ./vm-b
 ```
 
-The optional `--profile` flag selects a NixOS configuration, so the VMs can run
-different systems:
+Then, start the VMs in two terminals:
 
 ```console
-nix run .#supervm -- --profile ./machines#web ./vm-web
-nix run .#supervm -- --profile ./machines#worker ./vm-worker
+nix run .#supervm -- launch ./vm-a
+nix run .#supervm -- launch ./vm-b
 ```
 
-SuperVM builds each guest, adds its packages to the shared store, and boots it
-with the state folder as its private layer.
-
-Select `--dax=never`, `--dax=inode` (the default), or `--dax=always`:
+The optional `--profile` flag selects a NixOS configuration:
 
 ```console
-nix run .#supervm -- --dax=always ./vm-a
+nix run .#supervm -- prepare --profile ./machines#web ./vm-web
+nix run .#supervm -- launch ./vm-web
+```
+
+`launch` boots the last successfully prepared runner without evaluating the
+guest again.
+
+Select `--dax=never`, `--dax=inode` (the default), or `--dax=always` while
+preparing:
+
+```console
+nix run .#supervm -- prepare --dax=always ./vm-a
+nix run .#supervm -- launch ./vm-a
 ```
 
 ## Compare with vanilla crosvm

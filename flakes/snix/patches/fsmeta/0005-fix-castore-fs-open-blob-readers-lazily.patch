@@ -1,0 +1,220 @@
+From caadf1509639a16fdb9136884881a7db12234477 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Thu, 30 Jul 2026 02:45:00 +0100
+Subject: [PATCH] fix(castore/fs): open blob readers lazily
+
+Defer BlobService::open_read until the first ordinary read on a file
+handle. DAX setupmapping materializes through DaxCache instead, so opening
+a reader eagerly duplicates backend I/O for files that are only mapped.
+
+Keep one reader on the handle after the first read, preserving the existing
+seek and reuse behavior for ordinary access. Add a regression test proving
+that open followed by release performs no blob read.
+---
+ snix/castore/src/fs/dax_tests.rs | 47 +++++++++++++++-
+ snix/castore/src/fs/mod.rs       | 96 +++++++++++++++++++-------------
+ 2 files changed, 102 insertions(+), 41 deletions(-)
+
+diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
+index 8b55699..0c048de 100644
+--- a/snix/castore/src/fs/mod.rs
++++ b/snix/castore/src/fs/mod.rs
+@@ -87,6 +87,11 @@
+ /// allocation", aka reserve Directory.size inodes for each directory node we
+ /// explore.
+ /// Tests for this live in the snix-store crate.
++struct FileHandle {
++    digest: B3Digest,
++    reader: Option<Box<dyn BlobReader>>,
++}
++
+ pub struct SnixStoreFs<BS, DS, RN: RootNodes> {
+     blob_service: BS,
+     directory_service: DS,
+@@ -118,9 +123,10 @@
+ 
+     next_dir_handle: AtomicU64,
+ 
+-    /// This holds all open file handles
+-    #[allow(clippy::type_complexity)]
+-    file_handles: RwLock<HashMap<u64, (Span, Arc<Mutex<Box<dyn BlobReader>>>)>>,
++    /// This holds all open file handles. Blob readers are created lazily on the
++    /// first ordinary read so a file subsequently served through DAX does not
++    /// also fetch its castore contents.
++    file_handles: RwLock<HashMap<u64, (Span, Arc<Mutex<FileHandle>>)>>,
+ 
+     next_file_handle: AtomicU64,
+ 
+@@ -983,38 +989,30 @@
+             InodeData::Regular(ref blob_digest, _blob_size, ..) => {
+                 Span::current().record("blob.digest", blob_digest.to_string());
+ 
+-                match self
+-                    .tokio_handle
+-                    .block_on(async { self.blob_service.open_read(blob_digest).await })
+-                {
+-                    Ok(None) => {
+-                        warn!("blob not found");
+-                        Err(io::Error::from_raw_os_error(libc::EIO))
+-                    }
+-                    Err(e) => {
+-                        warn!(e=?e, "error opening blob");
+-                        Err(io::Error::from_raw_os_error(libc::EIO))
+-                    }
+-                    Ok(Some(blob_reader)) => {
+-                        // get a new file handle
+-                        // TODO: this will overflow after 2**64 operations,
+-                        // which is fine for now.
+-                        // See https://cl.tvl.fyi/c/depot/+/8834/comment/a6684ce0_d72469d1
+-                        // for the discussion on alternatives.
+-                        let fh = self.next_file_handle.fetch_add(1, Ordering::SeqCst);
+-
+-                        self.file_handles
+-                            .write()
+-                            .insert(fh, (Span::current(), Arc::new(Mutex::new(blob_reader))));
+-
+-                        Ok((
+-                            Some(fh),
+-                            // Don't invalidate the data cache on open.
+-                            OpenOptions::KEEP_CACHE,
+-                            None,
+-                        ))
+-                    }
+-                }
++                // get a new file handle
++                // TODO: this will overflow after 2**64 operations,
++                // which is fine for now.
++                // See https://cl.tvl.fyi/c/depot/+/8834/comment/a6684ce0_d72469d1
++                // for the discussion on alternatives.
++                let fh = self.next_file_handle.fetch_add(1, Ordering::SeqCst);
++
++                self.file_handles.write().insert(
++                    fh,
++                    (
++                        Span::current(),
++                        Arc::new(Mutex::new(FileHandle {
++                            digest: *blob_digest,
++                            reader: None,
++                        })),
++                    ),
++                );
++
++                Ok((
++                    Some(fh),
++                    // Don't invalidate the data cache on open.
++                    OpenOptions::KEEP_CACHE,
++                    None,
++                ))
+             }
+         }
+     }
+@@ -1056,10 +1054,7 @@
+     ) -> io::Result<usize> {
+         debug!("read");
+ 
+-        // We need to take out the blob reader from self.file_handles, so we can
+-        // interact with it in the separate task.
+-        // On success, we pass it back out of the task, so we can put it back in self.file_handles.
+-        let (_span, blob_reader) = self
++        let (_span, file_handle) = self
+             .file_handles
+             .read()
+             .get(&handle)
+@@ -1069,10 +1064,31 @@
+             })
+             .cloned()?;
+ 
+-        let mut blob_reader = blob_reader
++        let mut file_handle = file_handle
+             .lock()
+             .map_err(|_| io::Error::other("mutex poisoned"))?;
+ 
++        if file_handle.reader.is_none() {
++            let digest = file_handle.digest;
++            file_handle.reader = Some(
++                match self
++                    .tokio_handle
++                    .block_on(async { self.blob_service.open_read(&digest).await })
++                {
++                    Ok(Some(reader)) => reader,
++                    Ok(None) => {
++                        warn!("blob not found");
++                        return Err(io::Error::from_raw_os_error(libc::EIO));
++                    }
++                    Err(e) => {
++                        warn!(e=?e, "error opening blob");
++                        return Err(io::Error::from_raw_os_error(libc::EIO));
++                    }
++                },
++            );
++        }
++        let blob_reader = file_handle.reader.as_mut().expect("reader initialized");
++
+         let buf = self.tokio_handle.block_on(async move {
+             // seek to the offset specified, which is relative to the start of the file.
+             let pos = blob_reader
+diff --git a/snix/castore/src/fs/dax_tests.rs b/snix/castore/src/fs/dax_tests.rs
+index da142fb..d27210e 100644
+--- a/snix/castore/src/fs/dax_tests.rs
++++ b/snix/castore/src/fs/dax_tests.rs
+@@ -17,7 +17,7 @@
+ use crate::{
+     Directory, Node, PathComponent,
+     attrs::ATTR_DAX,
+-    blobservice::{BlobService, MemoryBlobService},
++    blobservice::{BlobService, MemoryBlobService, MockBlobService},
+     directoryservice::DirectoryService,
+     fixtures,
+     fs::{FSSettings, SnixStoreFs, dax::DaxCache},
+@@ -138,6 +138,51 @@
+     format!("{ATTR_DAX} bin/hello\n")
+ }
+ 
++fn mock_fs(blob_service: MockBlobService) -> Arc<Fs> {
++    let root_nodes = BTreeMap::from([(
++        ROOT.try_into().unwrap(),
++        Node::File {
++            digest: *fixtures::BLOB_A_DIGEST,
++            size: fixtures::BLOB_A.len() as u64,
++            executable: false,
++        },
++    )]);
++
++    Arc::new(SnixStoreFs::new(
++        Arc::new(blob_service) as Arc<dyn BlobService>,
++        Arc::new(crate::utils::gen_test_directory_service()) as Arc<dyn DirectoryService>,
++        Arc::new(root_nodes),
++        FSSettings::default(),
++        tokio::runtime::Handle::current(),
++    ))
++}
++
++#[tokio::test]
++async fn open_without_read_does_not_open_blob_reader() {
++    let mut blob_service = MockBlobService::new();
++    blob_service.expect_open_read().times(0);
++    let fs = mock_fs(blob_service);
++    let entry = lookup(&fs, &[ROOT]).await;
++
++    tokio::task::spawn_blocking(move || {
++        let (handle, _, _) = fs
++            .open(&Context::default(), entry.inode, 0, 0)
++            .expect("open must succeed");
++        fs.release(
++            &Context::default(),
++            entry.inode,
++            0,
++            handle.expect("regular files have handles"),
++            false,
++            false,
++            None,
++        )
++        .expect("release must succeed");
++    })
++    .await
++    .unwrap();
++}
++
+ /// The whole point: with a guest that decides per inode and somewhere to
+ /// materialize blobs, exactly the file the tree named is marked.
+ #[tokio::test]
