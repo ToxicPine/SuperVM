@@ -1,0 +1,265 @@
+From bfac0418c0b1161a89b1f75dc14f33d7515b7d20 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Fri, 31 Jul 2026 15:19:12 +0100
+Subject: [PATCH 1/2] fix(castore/fs): return ESTALE for unknown inodes
+
+The filesystem panicked (unwrap/expect) whenever a request named an inode
+the tracker did not know about. That never happened while the tracker only
+ever grew, but it is not a safe assumption: once inodes can be evicted, the
+kernel is entitled to race a request against its own FORGET, and a virtio-fs
+guest can send an arbitrary inode number at any time.
+
+Audit every inode_tracker consumer (getattr, lookup, open, read, readlink,
+getxattr, listxattr, get_directory_children, and the root-name resolver) and
+turn a missing inode into ESTALE -- the errno the kernel expects for a handle
+that no longer refers to anything -- instead of unwinding the server thread.
+
+No inode is evicted yet, so this is behaviour-preserving on the happy path;
+it only replaces panics with the correct error. A follow-up change adds the
+eviction that makes stale inodes reachable in the first place.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ snix/castore/src/fs/mod.rs | 161 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 139 insertions(+), 22 deletions(-)
+
+diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
+index 380badf..b67465a 100644
+--- a/snix/castore/src/fs/mod.rs
++++ b/snix/castore/src/fs/mod.rs
+@@ -180,7 +180,11 @@ where
+         &self,
+         ino: u64,
+     ) -> io::Result<(B3Digest, Vec<(u64, PathComponent, Node)>)> {
+-        let data = self.inode_tracker.read().get(ino).unwrap();
++        let data = self
++            .inode_tracker
++            .read()
++            .get(ino)
++            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
+         match *data {
+             // if it's populated already, return children.
+             InodeData::Directory(DirectoryInodeData::Populated(parent_digest, ref children)) => {
+@@ -259,7 +263,7 @@ where
+                 self.inode_tracker
+                     .read()
+                     .get(inode)
+-                    .expect("must exist")
++                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?
+                     .to_owned(),
+             ));
+         }
+@@ -280,7 +284,10 @@ where
+                 if let Some(ino) = self.root_nodes.read().get(name) {
+                     return Ok((
+                         *ino,
+-                        self.inode_tracker.read().get(*ino).expect("must exist"),
++                        self.inode_tracker
++                            .read()
++                            .get(*ino)
++                            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?,
+                     ));
+                 }
+ 
+@@ -424,7 +431,7 @@ where
+                 self.inode_tracker
+                     .read()
+                     .get(inode)
+-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?
++                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?
+                     .as_ref(),
+                 inode,
+             )
+@@ -477,7 +484,7 @@ where
+             self.inode_tracker
+                 .read()
+                 .get(ino)
+-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?
++                .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?
+                 .as_ref(),
+             ino,
+         );
+@@ -732,8 +739,13 @@ where
+             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+         }
+ 
+-        // lookup the inode
+-        match *self.inode_tracker.read().get(inode).unwrap() {
++        // lookup the inode; a request for an inode we no longer track is stale.
++        let inode_data = self
++            .inode_tracker
++            .read()
++            .get(inode)
++            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
++        match *inode_data {
+             // read is invalid on non-files.
+             InodeData::Directory(..) | InodeData::Symlink(_) => {
+                 warn!("is directory");
+@@ -873,8 +885,13 @@ where
+             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+         }
+ 
+-        // lookup the inode
+-        match *self.inode_tracker.read().get(inode).unwrap() {
++        // lookup the inode; a request for an inode we no longer track is stale.
++        let inode_data = self
++            .inode_tracker
++            .read()
++            .get(inode)
++            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
++        match *inode_data {
+             InodeData::Directory(..) | InodeData::Regular(..) => {
+                 Err(io::Error::from_raw_os_error(libc::EINVAL))
+             }
+@@ -894,12 +911,13 @@ where
+             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+         }
+ 
+-        // Peek at the inode requested, and construct the response.
++        // Peek at the inode requested, and construct the response. A request
++        // for an inode we no longer track is stale.
+         let digest_str = match *self
+             .inode_tracker
+             .read()
+             .get(inode)
+-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODATA))?
++            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?
+         {
+             InodeData::Directory(DirectoryInodeData::Sparse(ref digest, _))
+             | InodeData::Directory(DirectoryInodeData::Populated(ref digest, _))
+@@ -935,21 +953,26 @@ where
+             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+         }
+ 
++        // A request for an inode we no longer track is stale.
++        let inode_data = self
++            .inode_tracker
++            .read()
++            .get(inode)
++            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
++
+         // determine the (\0-terminated list) to of xattr keys present, depending on the type of the inode.
+         let xattrs_names = {
+             let mut out = Vec::new();
+-            if let Some(inode_data) = self.inode_tracker.read().get(inode) {
+-                match *inode_data {
+-                    InodeData::Directory(_) => {
+-                        out.extend_from_slice(XATTR_NAME_DIRECTORY_DIGEST);
+-                        out.push_byte(b'\x00');
+-                    }
+-                    InodeData::Regular(..) => {
+-                        out.extend_from_slice(XATTR_NAME_BLOB_DIGEST);
+-                        out.push_byte(b'\x00');
+-                    }
+-                    _ => {}
++            match *inode_data {
++                InodeData::Directory(_) => {
++                    out.extend_from_slice(XATTR_NAME_DIRECTORY_DIGEST);
++                    out.push_byte(b'\x00');
+                 }
++                InodeData::Regular(..) => {
++                    out.extend_from_slice(XATTR_NAME_BLOB_DIGEST);
++                    out.push_byte(b'\x00');
++                }
++                _ => {}
+             }
+             out
+         };
+@@ -963,3 +986,97 @@ where
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::collections::BTreeMap;
++    use std::sync::Arc;
++
++    use fuse_backend_rs::api::filesystem::{Context, FileSystem, ROOT_ID};
++
++    use super::{FSSettings, SnixStoreFs};
++    use crate::blobservice::{BlobService, MemoryBlobService};
++    use crate::directoryservice::DirectoryService;
++    use crate::{Node, path::PathComponent};
++
++    type TestFs =
++        SnixStoreFs<Arc<dyn BlobService>, Arc<dyn DirectoryService>, Arc<BTreeMap<PathComponent, Node>>>;
++
++    /// Builds a filesystem over the given root nodes.
++    ///
++    /// The returned runtime must be kept alive for as long as the filesystem:
++    /// its handle drives the blocking castore calls, and the synchronous
++    /// [FileSystem] methods have to be invoked from outside it (never from a
++    /// runtime worker thread), exactly as the FUSE and virtio-fs servers do.
++    fn make_fs(
++        root_nodes: BTreeMap<PathComponent, Node>,
++        settings: FSSettings,
++    ) -> (tokio::runtime::Runtime, TestFs) {
++        let rt = tokio::runtime::Builder::new_multi_thread()
++            .worker_threads(1)
++            .enable_all()
++            .build()
++            .expect("build runtime");
++        let blob_service = Arc::new(MemoryBlobService::default()) as Arc<dyn BlobService>;
++        let directory_service =
++            Arc::new(crate::utils::gen_test_directory_service()) as Arc<dyn DirectoryService>;
++        let fs = SnixStoreFs::new(
++            blob_service,
++            directory_service,
++            Arc::new(root_nodes),
++            settings,
++            rt.handle().clone(),
++        );
++        (rt, fs)
++    }
++
++    /// Accessing an inode the tracker never handed out (or has already evicted)
++    /// must fail with ESTALE rather than panic, matching the FUSE contract for a
++    /// forgotten inode.
++    #[test]
++    fn unknown_inode_is_stale() {
++        let (_rt, fs) = make_fs(
++            BTreeMap::new(),
++            FSSettings {
++                show_xattr: true,
++                ..Default::default()
++            },
++        );
++        let ctx = Context::default();
++        const UNKNOWN: u64 = 42;
++
++        assert_eq!(
++            fs.getattr(&ctx, UNKNOWN, None).unwrap_err().raw_os_error(),
++            Some(libc::ESTALE),
++        );
++        assert_eq!(
++            fs.open(&ctx, UNKNOWN, 0, 0).unwrap_err().raw_os_error(),
++            Some(libc::ESTALE),
++        );
++        assert_eq!(
++            fs.readlink(&ctx, UNKNOWN).unwrap_err().raw_os_error(),
++            Some(libc::ESTALE),
++        );
++        // GetxattrReply / ListxattrReply do not implement Debug, so match
++        // rather than unwrap_err.
++        let name = std::ffi::CString::new("user.snix.castore.blob.digest").unwrap();
++        match fs.getxattr(&ctx, UNKNOWN, &name, 0) {
++            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ESTALE)),
++            Ok(_) => panic!("getxattr on unknown inode should be ESTALE"),
++        }
++        match fs.listxattr(&ctx, UNKNOWN, 0) {
++            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ESTALE)),
++            Ok(_) => panic!("listxattr on unknown inode should be ESTALE"),
++        }
++    }
++
++    /// The root inode is special: it is always resolvable, even on an empty
++    /// tree, and never lives in the inode tracker.
++    #[test]
++    fn root_getattr_ok() {
++        let (_rt, fs) = make_fs(BTreeMap::new(), FSSettings::default());
++        let ctx = Context::default();
++        let (attr, _) = fs.getattr(&ctx, ROOT_ID, None).expect("root getattr");
++        assert_eq!(attr.st_ino, ROOT_ID);
++    }
++}

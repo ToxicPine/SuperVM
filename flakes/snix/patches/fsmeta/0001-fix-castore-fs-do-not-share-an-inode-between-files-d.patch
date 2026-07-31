@@ -8,15 +8,15 @@ different modes cannot share kernel-cached attributes.
 
 Change-Id: I49ecb0e2e541203417538fa9ba52421337e7249e
 ---
- snix/castore/src/fs/inode_tracker.rs | 83 +++++++++++++++++++++++++---
- snix/castore/src/fs/mod.rs           |  7 ++-
- 2 files changed, 80 insertions(+), 10 deletions(-)
+ snix/castore/src/fs/inode_tracker.rs | 95 ++++++++++++++++++++++++----
+ snix/castore/src/fs/mod.rs           |  7 +-
+ 2 files changed, 87 insertions(+), 15 deletions(-)
 
 diff --git a/snix/castore/src/fs/inode_tracker.rs b/snix/castore/src/fs/inode_tracker.rs
-index e0c072d33..3d02a7e57 100644
+index dd08c6b..e4a7182 100644
 --- a/snix/castore/src/fs/inode_tracker.rs
 +++ b/snix/castore/src/fs/inode_tracker.rs
-@@ -3,13 +3,25 @@ use std::{collections::HashMap, sync::Arc};
+@@ -3,6 +3,18 @@ use std::{collections::HashMap, sync::Arc};
  use super::inodes::{DirectoryInodeData, InodeData};
  use crate::B3Digest;
  
@@ -34,6 +34,8 @@ index e0c072d33..3d02a7e57 100644
 +
  /// InodeTracker keeps track of inodes, stores data being these inodes and deals
  /// with inode allocation.
+ ///
+@@ -39,8 +51,8 @@ use crate::B3Digest;
  pub struct InodeTracker {
      data: HashMap<u64, Arc<InodeData>>,
  
@@ -44,7 +46,7 @@ index e0c072d33..3d02a7e57 100644
  
      // lookup table for symlinks by their target
      symlink_target_to_inode: HashMap<bytes::Bytes, u64>,
-@@ -27,7 +39,7 @@ impl Default for InodeTracker {
+@@ -62,7 +74,7 @@ impl Default for InodeTracker {
          Self {
              data: Default::default(),
  
@@ -52,8 +54,8 @@ index e0c072d33..3d02a7e57 100644
 +            file_to_inode: Default::default(),
              symlink_target_to_inode: Default::default(),
              directory_digest_to_inode: Default::default(),
- 
-@@ -36,6 +48,20 @@ impl Default for InodeTracker {
+             lookup_counts: Default::default(),
+@@ -72,6 +84,20 @@ impl Default for InodeTracker {
      }
  }
  
@@ -74,7 +76,7 @@ index e0c072d33..3d02a7e57 100644
  impl InodeTracker {
      // Retrieves data for a given inode, if it exists.
      pub fn get(&self, ino: u64) -> Option<Arc<InodeData>> {
-@@ -57,8 +83,9 @@ impl InodeTracker {
+@@ -96,8 +122,9 @@ impl InodeTracker {
      // up
      pub fn put(&mut self, data: InodeData) -> u64 {
          match data {
@@ -86,7 +88,7 @@ index e0c072d33..3d02a7e57 100644
                      Some(found_ino) => {
                          // We already have it, return the inode.
                          *found_ino
-@@ -102,8 +129,11 @@ impl InodeTracker {
+@@ -141,8 +168,11 @@ impl InodeTracker {
          let ino = self.next_inode;
          // insert into lookup tables
          match data {
@@ -100,7 +102,33 @@ index e0c072d33..3d02a7e57 100644
              }
              InodeData::Symlink(ref target) => {
                  self.symlink_target_to_inode.insert(target.clone(), ino);
-@@ -180,6 +210,45 @@ mod tests {
+@@ -225,9 +255,10 @@ impl InodeTracker {
+         };
+ 
+         match &*data {
+-            InodeData::Regular(digest, _, _) => {
+-                if self.blob_digest_to_inode.get(digest) == Some(&ino) {
+-                    self.blob_digest_to_inode.remove(digest);
++            InodeData::Regular(..) => {
++                let key = data.file_key().expect("Snix bug: must be a regular file");
++                if self.file_to_inode.get(&key) == Some(&ino) {
++                    self.file_to_inode.remove(&key);
+                 }
+             }
+             InodeData::Symlink(target) => {
+@@ -273,8 +304,9 @@ impl InodeTracker {
+         }
+ 
+         match &data {
+-            InodeData::Regular(digest, _, _) => {
+-                self.blob_digest_to_inode.entry(*digest).or_insert(ino);
++            InodeData::Regular(..) => {
++                let key = data.file_key().expect("Snix bug: must be a regular file");
++                self.file_to_inode.entry(key).or_insert(ino);
+             }
+             InodeData::Symlink(target) => {
+                 self.symlink_target_to_inode
+@@ -343,6 +375,45 @@ mod tests {
          );
      }
  
@@ -147,7 +175,7 @@ index e0c072d33..3d02a7e57 100644
      #[test]
      fn put_symlink() {
 diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
-index 1fd3ebd3f..e8e21e0d3 100644
+index 0cebe72..19766c5 100644
 --- a/snix/castore/src/fs/mod.rs
 +++ b/snix/castore/src/fs/mod.rs
 @@ -66,11 +66,12 @@ use tracing::{Span, debug, error, instrument, warn};

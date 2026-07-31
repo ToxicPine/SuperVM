@@ -46,6 +46,16 @@
         ./patches/shmem-map/0004-fix-castore-fs-complete-failed-virtio-descriptor-cha.patch
       ];
 
+      # An upstream-facing fix for snix's FUSE/virtio-fs filesystem: honour
+      # FUSE FORGET so the castore inode tracker stops growing without bound
+      # for the life of a mount, and return ESTALE (not a panic) for inodes
+      # that have since been evicted. Standalone: it touches only upstream's
+      # existing `fs` module and shares nothing with the DAX series.
+      forget = [
+        ./patches/forget/0001-fix-castore-fs-return-ESTALE-for-unknown-inodes.patch
+        ./patches/forget/0002-fix-castore-fs-honour-FUSE-FORGET-and-bound-the-inod.patch
+      ];
+
       # Per-inode DAX, driven by attributes a store path declares about itself
       # in a file it carries. Transport-independent: per-inode DAX is
       # negotiated in FUSE_INIT and communicated in lookup replies, so this
@@ -59,14 +69,18 @@
       ];
 
       patchsets = {
-        inherit fs-map shmem-map;
+        inherit fs-map shmem-map forget;
 
-        # Each transport, plus the metadata work: a continuation rather than an
-        # alternative, so each lists its baseline's patches first and the
-        # prerequisite order is explicit. `fsmeta` itself is one series, shared
-        # verbatim, because nothing in it is transport-specific.
-        fsmeta-fs-map = fs-map ++ fsmeta;
-        fsmeta-shmem-map = shmem-map ++ fsmeta;
+        # The inode-lifetime fix, a transport, and the metadata work stacked in
+        # that order: a continuation rather than an alternative, so each lists
+        # its prerequisites first and the order is explicit. `forget` is the
+        # base because eviction is what makes the tracker's identity and the
+        # DAX resolution paths have to cope with a missing inode at all; both
+        # `fsmeta` and the transports are then adapted to it. `fsmeta` itself is
+        # one series, shared verbatim, because nothing in it is
+        # transport-specific.
+        fsmeta-fs-map = forget ++ fs-map ++ fsmeta;
+        fsmeta-shmem-map = forget ++ shmem-map ++ fsmeta;
       };
 
       patchedSource =

@@ -21,7 +21,7 @@ Change-Id: I1999de02032feb208bd7af2520cbba1e619f17f6
  8 files changed, 513 insertions(+), 103 deletions(-)
 
 diff --git a/snix/Cargo.lock b/snix/Cargo.lock
-index 2b099e0e1..1f93d4e4e 100644
+index 2b099e0..1f93d4e 100644
 --- a/snix/Cargo.lock
 +++ b/snix/Cargo.lock
 @@ -1976,9 +1976,9 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
@@ -149,7 +149,7 @@ index 2b099e0e1..1f93d4e4e 100644
   "bitflags 1.3.2",
   "libc",
 diff --git a/snix/Cargo.nix b/snix/Cargo.nix
-index df762352e..29e6e48ce 100644
+index df76235..29e6e48 100644
 --- a/snix/Cargo.nix
 +++ b/snix/Cargo.nix
 @@ -8137,9 +8137,9 @@ rec {
@@ -507,7 +507,7 @@ index df762352e..29e6e48ce 100644
            {
              name = "libc";
 diff --git a/snix/Cargo.toml b/snix/Cargo.toml
-index b50adef62..2514ff626 100644
+index b50adef..2514ff6 100644
 --- a/snix/Cargo.toml
 +++ b/snix/Cargo.toml
 @@ -89,7 +89,7 @@ ed25519-dalek = "2.1.1"
@@ -538,7 +538,7 @@ index b50adef62..2514ff626 100644
  walkdir = "2.5.0"
  which = "^8.0.0"
 diff --git a/snix/castore/Cargo.toml b/snix/castore/Cargo.toml
-index 6475eb21b..4ae1d0b7c 100644
+index 6475eb2..4ae1d0b 100644
 --- a/snix/castore/Cargo.toml
 +++ b/snix/castore/Cargo.toml
 @@ -100,7 +100,6 @@ virtiofs = [
@@ -550,7 +550,7 @@ index 6475eb21b..4ae1d0b7c 100644
  ]
  fuse = ["fs"]
 diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
-index 100349248..1fd3ebd3f 100644
+index 1003492..b93bef7 100644
 --- a/snix/castore/src/fs/mod.rs
 +++ b/snix/castore/src/fs/mod.rs
 @@ -116,6 +116,13 @@ pub struct SnixStoreFs<BS, DS, RN: RootNodes> {
@@ -567,16 +567,10 @@ index 100349248..1fd3ebd3f 100644
  }
  
  /// Configures some filesystem settings
-@@ -161,9 +168,23 @@ where
-             file_handles: RwLock::new(Default::default()),
-             next_file_handle: AtomicU64::new(1),
-             tokio_handle,
-+
-+            #[cfg(feature = "virtiofs")]
-+            dax_cache: None,
-         }
-     }
- 
+@@ -137,6 +144,17 @@ where
+     DS: DirectoryService,
+     RN: RootNodes,
+ {
 +    /// Serve DAX mappings for regular files, backed by `dax_cache`.
 +    ///
 +    /// Blobs are materialized into the cache on demand. Point several
@@ -588,9 +582,19 @@ index 100349248..1fd3ebd3f 100644
 +        self
 +    }
 +
-     /// Retrieves the inode for a given root node basename, if present.
-     /// This obtains a read lock on self.root_nodes.
-     fn get_inode_for_root_name(&self, name: &PathComponent) -> Option<u64> {
+     pub fn new(
+         blob_service: BS,
+         directory_service: DS,
+@@ -161,6 +179,9 @@ where
+             file_handles: RwLock::new(Default::default()),
+             next_file_handle: AtomicU64::new(1),
+             tokio_handle,
++
++            #[cfg(feature = "virtiofs")]
++            dax_cache: None,
+         }
+     }
+ 
 @@ -870,6 +891,80 @@ where
          Ok(bytes_written as usize)
      }
@@ -673,7 +677,7 @@ index 100349248..1fd3ebd3f 100644
      fn readlink(&self, _ctx: &Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
          if inode == ROOT_ID {
 diff --git a/snix/castore/src/fs/virtiofs.rs b/snix/castore/src/fs/virtiofs.rs
-index 695615808..a7dffdcac 100644
+index 6956158..a7dffdc 100644
 --- a/snix/castore/src/fs/virtiofs.rs
 +++ b/snix/castore/src/fs/virtiofs.rs
 @@ -1,17 +1,21 @@
@@ -1096,7 +1100,7 @@ index 695615808..a7dffdcac 100644
 +    }
 +}
 diff --git a/snix/cli/castore/src/main.rs b/snix/cli/castore/src/main.rs
-index f5cece62b..ebed250ca 100644
+index f5cece6..ebed250 100644
 --- a/snix/cli/castore/src/main.rs
 +++ b/snix/cli/castore/src/main.rs
 @@ -277,7 +277,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -1109,7 +1113,7 @@ index f5cece62b..ebed250ca 100644
              .await??;
          }
 diff --git a/snix/cli/store/src/main.rs b/snix/cli/store/src/main.rs
-index 8187babf2..ae2b8d147 100644
+index 8187bab..ae2b8d1 100644
 --- a/snix/cli/store/src/main.rs
 +++ b/snix/cli/store/src/main.rs
 @@ -697,7 +697,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

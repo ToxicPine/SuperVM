@@ -11,18 +11,18 @@ Change-Id: I882149ae234e35a29feb7e4323b16b36bb7a5dd4
 ---
  snix/build/src/buildservice/bwrap.rs |   2 +
  snix/build/src/buildservice/oci.rs   |   2 +
- snix/castore/src/fs/attrs_tests.rs   | 196 +++++++++++++++++
+ snix/castore/src/fs/attrs_tests.rs   | 196 ++++++++++++++++
  snix/castore/src/fs/fuse/tests.rs    |   3 +
- snix/castore/src/fs/inode_tracker.rs | 136 ++++++++++--
+ snix/castore/src/fs/inode_tracker.rs | 164 ++++++++++---
  snix/castore/src/fs/inodes.rs        |  45 +++-
- snix/castore/src/fs/mod.rs           | 305 ++++++++++++++++++++++-----
+ snix/castore/src/fs/mod.rs           | 334 ++++++++++++++++++++++-----
  snix/cli/castore/src/main.rs         |  10 +
  snix/cli/store/src/main.rs           |   4 +
- 9 files changed, 625 insertions(+), 78 deletions(-)
+ 9 files changed, 666 insertions(+), 94 deletions(-)
  create mode 100644 snix/castore/src/fs/attrs_tests.rs
 
 diff --git a/snix/build/src/buildservice/bwrap.rs b/snix/build/src/buildservice/bwrap.rs
-index 9ebd0fde4..59b8369cf 100644
+index 9ebd0fd..59b8369 100644
 --- a/snix/build/src/buildservice/bwrap.rs
 +++ b/snix/build/src/buildservice/bwrap.rs
 @@ -85,6 +85,8 @@ where
@@ -35,7 +35,7 @@ index 9ebd0fde4..59b8369cf 100644
                      tokio::runtime::Handle::current(),
                  );
 diff --git a/snix/build/src/buildservice/oci.rs b/snix/build/src/buildservice/oci.rs
-index 76e4aaf65..d116bd4f9 100644
+index 76e4aaf..d116bd4 100644
 --- a/snix/build/src/buildservice/oci.rs
 +++ b/snix/build/src/buildservice/oci.rs
 @@ -104,6 +104,8 @@ where
@@ -49,7 +49,7 @@ index 76e4aaf65..d116bd4f9 100644
                  );
 diff --git a/snix/castore/src/fs/attrs_tests.rs b/snix/castore/src/fs/attrs_tests.rs
 new file mode 100644
-index 000000000..bb8d317e5
+index 0000000..bb8d317
 --- /dev/null
 +++ b/snix/castore/src/fs/attrs_tests.rs
 @@ -0,0 +1,196 @@
@@ -250,7 +250,7 @@ index 000000000..bb8d317e5
 +    .unwrap();
 +}
 diff --git a/snix/castore/src/fs/fuse/tests.rs b/snix/castore/src/fs/fuse/tests.rs
-index 8bd153fef..4e91006b5 100644
+index 8bd153f..4e91006 100644
 --- a/snix/castore/src/fs/fuse/tests.rs
 +++ b/snix/castore/src/fs/fuse/tests.rs
 @@ -303,6 +303,7 @@ async fn root_with_listing() {
@@ -278,7 +278,7 @@ index 8bd153fef..4e91006b5 100644
      )
      .expect("must succeed");
 diff --git a/snix/castore/src/fs/inode_tracker.rs b/snix/castore/src/fs/inode_tracker.rs
-index 3d02a7e57..8d5abfd42 100644
+index e4a7182..9bc80ec 100644
 --- a/snix/castore/src/fs/inode_tracker.rs
 +++ b/snix/castore/src/fs/inode_tracker.rs
 @@ -9,10 +9,28 @@ use crate::B3Digest;
@@ -308,30 +308,30 @@ index 3d02a7e57..8d5abfd42 100644
 +    digest: B3Digest,
 +    attrs: B3Digest,
  }
-
+ 
  /// InodeTracker keeps track of inodes, stores data being these inodes and deals
-@@ -26,9 +44,9 @@ pub struct InodeTracker {
+@@ -57,9 +75,9 @@ pub struct InodeTracker {
      // lookup table for symlinks by their target
      symlink_target_to_inode: HashMap<bytes::Bytes, u64>,
-
+ 
 -    // lookup table for directories by their B3Digest.
 +    // lookup table for directories by everything that distinguishes them.
      // Note the corresponding directory may not be present in data yet.
 -    directory_digest_to_inode: HashMap<B3Digest, u64>,
 +    directory_to_inode: HashMap<DirKey, u64>,
-
-     // the next inode to allocate
-     next_inode: u64,
-@@ -41,7 +59,7 @@ impl Default for InodeTracker {
-
+ 
+     // The number of outstanding kernel references (the FUSE "lookup count") for
+     // each inode. An inode absent from this map has no outstanding references.
+@@ -76,7 +94,7 @@ impl Default for InodeTracker {
+ 
              file_to_inode: Default::default(),
              symlink_target_to_inode: Default::default(),
 -            directory_digest_to_inode: Default::default(),
 +            directory_to_inode: Default::default(),
-
+             lookup_counts: Default::default(),
+ 
              next_inode: 2,
-         }
-@@ -53,13 +71,29 @@ impl InodeData {
+@@ -89,13 +107,29 @@ impl InodeData {
      /// regular file.
      fn file_key(&self) -> Option<FileKey> {
          match self {
@@ -360,9 +360,9 @@ index 3d02a7e57..8d5abfd42 100644
 +        }
 +    }
  }
-
+ 
  impl InodeTracker {
-@@ -102,9 +136,9 @@ impl InodeTracker {
+@@ -141,9 +175,9 @@ impl InodeTracker {
                      None => self.insert_and_increment(data),
                  }
              }
@@ -375,7 +375,7 @@ index 3d02a7e57..8d5abfd42 100644
                      Some(found_ino) => {
                          // We already have it, return the inode.
                          *found_ino
-@@ -138,17 +172,15 @@ impl InodeTracker {
+@@ -177,17 +211,15 @@ impl InodeTracker {
              InodeData::Symlink(ref target) => {
                  self.symlink_target_to_inode.insert(target.clone(), ino);
              }
@@ -397,13 +397,50 @@ index 3d02a7e57..8d5abfd42 100644
              }
          }
          // Insert data
-@@ -162,9 +194,18 @@ impl InodeTracker {
-
- #[cfg(test)]
+@@ -266,14 +298,16 @@ impl InodeTracker {
+                     self.symlink_target_to_inode.remove(target);
+                 }
+             }
+-            InodeData::Directory(DirectoryInodeData::Sparse(digest, _)) => {
+-                if self.directory_digest_to_inode.get(digest) == Some(&ino) {
+-                    self.directory_digest_to_inode.remove(digest);
++            InodeData::Directory(DirectoryInodeData::Sparse(..)) => {
++                let key = data.dir_key().expect("Snix bug: must be a directory");
++                if self.directory_to_inode.get(&key) == Some(&ino) {
++                    self.directory_to_inode.remove(&key);
+                 }
+             }
+-            InodeData::Directory(DirectoryInodeData::Populated(digest, children)) => {
+-                if self.directory_digest_to_inode.get(digest) == Some(&ino) {
+-                    self.directory_digest_to_inode.remove(digest);
++            InodeData::Directory(DirectoryInodeData::Populated(_, _, children)) => {
++                let key = data.dir_key().expect("Snix bug: must be a directory");
++                if self.directory_to_inode.get(&key) == Some(&ino) {
++                    self.directory_to_inode.remove(&key);
+                 }
+ 
+                 // Sweep children the kernel no longer references.
+@@ -313,9 +347,10 @@ impl InodeTracker {
+                     .entry(target.clone())
+                     .or_insert(ino);
+             }
+-            InodeData::Directory(DirectoryInodeData::Sparse(digest, _))
+-            | InodeData::Directory(DirectoryInodeData::Populated(digest, _)) => {
+-                self.directory_digest_to_inode.entry(*digest).or_insert(ino);
++            InodeData::Directory(DirectoryInodeData::Sparse(..))
++            | InodeData::Directory(DirectoryInodeData::Populated(..)) => {
++                let key = data.dir_key().expect("Snix bug: must be a directory");
++                self.directory_to_inode.entry(key).or_insert(ino);
+             }
+         }
+ 
+@@ -327,9 +362,18 @@ impl InodeTracker {
  mod tests {
+     use std::sync::Arc;
+ 
 +    use crate::attrs::AttrTree;
      use crate::fixtures;
-
+ 
      use super::InodeData;
 +
 +    fn no_attrs() -> std::sync::Arc<AttrTree> {
@@ -414,17 +451,17 @@ index 3d02a7e57..8d5abfd42 100644
 +        AttrTree::parse(format!("{} ", crate::attrs::ATTR_DAX).as_bytes()).unwrap()
 +    }
      use super::InodeTracker;
-
+ 
      /// Getting something non-existent should be none
-@@ -182,6 +223,7 @@ mod tests {
+@@ -347,6 +391,7 @@ mod tests {
              *fixtures::BLOB_A_DIGEST,
              fixtures::BLOB_A.len() as u64,
              false,
 +            no_attrs(),
          );
-
+ 
          // put it in
-@@ -190,7 +232,7 @@ mod tests {
+@@ -355,7 +400,7 @@ mod tests {
          // a get should return the right data
          let data = inode_tracker.get(ino).expect("must be some");
          match *data {
@@ -433,7 +470,7 @@ index 3d02a7e57..8d5abfd42 100644
                  assert_eq!(&fixtures::BLOB_A_DIGEST.clone(), digest);
              }
              InodeData::Symlink(_) | InodeData::Directory(..) => panic!("wrong type"),
-@@ -206,6 +248,7 @@ mod tests {
+@@ -371,6 +416,7 @@ mod tests {
                  *fixtures::BLOB_B_DIGEST,
                  fixtures::BLOB_B.len() as u64,
                  false,
@@ -441,7 +478,7 @@ index 3d02a7e57..8d5abfd42 100644
              ))
          );
      }
-@@ -222,11 +265,13 @@ mod tests {
+@@ -387,11 +433,13 @@ mod tests {
              *fixtures::BLOB_A_DIGEST,
              fixtures::BLOB_A.len() as u64,
              false,
@@ -453,10 +490,10 @@ index 3d02a7e57..8d5abfd42 100644
              true,
 +            no_attrs(),
          );
-
+ 
          let plain_ino = inode_tracker.put(plain.clone());
-@@ -241,14 +286,73 @@ mod tests {
-
+@@ -406,14 +454,73 @@ mod tests {
+ 
          assert!(matches!(
              *inode_tracker.get(plain_ino).unwrap(),
 -            InodeData::Regular(_, _, false)
@@ -468,7 +505,7 @@ index 3d02a7e57..8d5abfd42 100644
 +            InodeData::Regular(_, _, true, _)
          ));
      }
-
+ 
 +    /// Two occurrences of one blob, one declared better mapped than copied and
 +    /// one not, are different files for the same reason: the declaration
 +    /// decides how the inode is served, and the kernel caches that per inode.
@@ -531,8 +568,43 @@ index 3d02a7e57..8d5abfd42 100644
      // Put of a symlink should allocate a uid, which should be the same when inserting again
      #[test]
      fn put_symlink() {
+@@ -444,6 +551,7 @@ mod tests {
+             *fixtures::BLOB_A_DIGEST,
+             fixtures::BLOB_A.len() as u64,
+             false,
++            no_attrs(),
+         )
+     }
+ 
+@@ -564,6 +672,7 @@ mod tests {
+         let dir = inode_tracker.put(InodeData::Directory(DirectoryInodeData::Sparse(
+             digest,
+             fixtures::DIRECTORY_WITH_KEEP.size(),
++            no_attrs(),
+         )));
+ 
+         let kids: Vec<(u64, PathComponent, Node)> = children
+@@ -587,7 +696,9 @@ mod tests {
+         inode_tracker.replace(
+             dir,
+             Arc::new(InodeData::Directory(DirectoryInodeData::Populated(
+-                digest, kids,
++                digest,
++                no_attrs(),
++                kids,
+             ))),
+         );
+         dir
+@@ -605,6 +716,7 @@ mod tests {
+             *fixtures::BLOB_B_DIGEST,
+             fixtures::BLOB_B.len() as u64,
+             false,
++            no_attrs(),
+         ));
+ 
+         let dir = put_dir_with_children(&mut inode_tracker, &[child_a, child_b]);
 diff --git a/snix/castore/src/fs/inodes.rs b/snix/castore/src/fs/inodes.rs
-index 84049b5be..6845214c4 100644
+index 84049b5..6845214 100644
 --- a/snix/castore/src/fs/inodes.rs
 +++ b/snix/castore/src/fs/inodes.rs
 @@ -1,37 +1,62 @@
@@ -542,7 +614,7 @@ index 84049b5be..6845214c4 100644
 +use std::sync::Arc;
 +
 +use crate::{B3Digest, Node, attrs::AttrTree, path::PathComponent};
-
+ 
  #[derive(Clone, Debug)]
  pub enum InodeData {
 -    Regular(B3Digest, u64, bool),  // digest, size, executable
@@ -558,7 +630,7 @@ index 84049b5be..6845214c4 100644
 +    /// either [DirectoryInodeData:Sparse] or [DirectoryInodeData:Populated]
 +    Directory(DirectoryInodeData),
  }
-
+ 
  /// This encodes the two different states of [InodeData::Directory].
  /// Either the data still is sparse (we only saw a [crate::Node::Directory],
  /// but didn't fetch the [crate::Directory] struct yet, or we processed a
@@ -576,7 +648,7 @@ index 84049b5be..6845214c4 100644
 +    /// digest, declared attributes, [(child_inode, name, node)]
 +    Populated(B3Digest, Arc<AttrTree>, Vec<(u64, PathComponent, Node)>),
  }
-
+ 
  impl InodeData {
 -    /// Constructs a new InodeData from a `&Node`.
 -    pub fn from_node(node: &Node) -> Self {
@@ -609,19 +681,19 @@ index 84049b5be..6845214c4 100644
 +    }
  }
 diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
-index e8e21e0d3..6021aeae6 100644
+index 19766c5..c9cedcb 100644
 --- a/snix/castore/src/fs/mod.rs
 +++ b/snix/castore/src/fs/mod.rs
 @@ -3,6 +3,9 @@ mod inode_tracker;
  mod inodes;
  pub mod root_nodes;
-
+ 
 +#[cfg(all(test, target_os = "linux"))]
 +mod attrs_tests;
 +
  #[cfg(feature = "fuse")]
  pub mod fuse;
-
+ 
 @@ -20,6 +23,7 @@ use self::{
  };
  use crate::{
@@ -644,7 +716,7 @@ index e8e21e0d3..6021aeae6 100644
  /// Due to the above being valid across the whole store, and considering the
  /// merkle structure is a DAG, not a tree, this also means we can't do "bucketed
 @@ -137,6 +142,18 @@ pub struct FSSettings {
-
+ 
      /// Whether to expose blob and directory digests as extended attributes.
      pub show_xattr: bool,
 +
@@ -660,12 +732,12 @@ index e8e21e0d3..6021aeae6 100644
 +    /// filesystem that knows nothing about declared attributes.
 +    pub fsmeta_path: Option<crate::PathBuf>,
  }
-
+ 
  impl<BS, DS, RN> SnixStoreFs<BS, DS, RN>
 @@ -186,6 +203,104 @@ where
-         self
+         }
      }
-
+ 
 +    /// Reads what `root_node` declares about itself, from the file named by
 +    /// [FSSettings::fsmeta_path] inside it.
 +    ///
@@ -764,16 +836,45 @@ index e8e21e0d3..6021aeae6 100644
 +        AttrTree::parse(&buf).map(Some).map_err(io::Error::other)
 +    }
 +
-     /// Retrieves the inode for a given root node basename, if present.
-     /// This obtains a read lock on self.root_nodes.
-     fn get_inode_for_root_name(&self, name: &PathComponent) -> Option<u64> {
-@@ -208,12 +323,12 @@ where
-         let data = self.inode_tracker.read().get(ino).unwrap();
+     /// Retrieves the inode for a given root node basename, if we still hold it.
+     ///
+     /// A name we allocated an inode for once may since have been evicted by a
+@@ -218,12 +333,18 @@ where
+             .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
          match *data {
              // if it's populated already, return children.
 -            InodeData::Directory(DirectoryInodeData::Populated(parent_digest, ref children)) => {
-+            InodeData::Directory(DirectoryInodeData::Populated(parent_digest, _, ref children)) => {
-                 Ok((parent_digest, children.clone()))
++            InodeData::Directory(DirectoryInodeData::Populated(
++                parent_digest,
++                ref attrs,
++                ref children,
++            )) => {
+                 // The kernel may still reference children of this cached
+                 // directory that it has since forgotten, and which we therefore
+                 // evicted. Reinstate their data under the same inode numbers
+                 // before handing them out, so a subsequent getattr/open/read on
+-                // any of them resolves instead of spuriously going stale.
++                // any of them resolves instead of spuriously going stale. Each
++                // child is restored with what the tree declares for it, exactly
++                // as when it was first allocated.
+                 let missing = {
+                     let inode_tracker = self.inode_tracker.read();
+                     children
+@@ -232,8 +353,11 @@ where
+                 };
+                 if missing {
+                     let mut inode_tracker = self.inode_tracker.write();
+-                    for (child_ino, _, child_node) in children {
+-                        inode_tracker.restore(*child_ino, InodeData::from_node(child_node));
++                    for (child_ino, name, child_node) in children {
++                        inode_tracker.restore(
++                            *child_ino,
++                            InodeData::from_node(child_node, attrs.child(name)),
++                        );
+                     }
+                 }
+ 
+@@ -241,7 +365,7 @@ where
              }
              // if it's sparse, fetch data using directory_service, populate child nodes
              // and update it in [self.inode_tracker].
@@ -782,7 +883,7 @@ index e8e21e0d3..6021aeae6 100644
                  let directory = self
                      .tokio_handle
                      .block_on(async { self.directory_service.get(&parent_digest).await })
-@@ -236,7 +351,12 @@ where
+@@ -264,7 +388,12 @@ where
                      let children: Vec<(u64, PathComponent, Node)> = directory
                          .into_nodes()
                          .map(|(child_name, child_node)| {
@@ -793,10 +894,10 @@ index e8e21e0d3..6021aeae6 100644
 +                            // declarations.
 +                            let inode_data =
 +                                InodeData::from_node(&child_node, attrs.child(&child_name));
-
+ 
                              let child_ino = inode_tracker.put(inode_data);
                              (child_ino, child_name, child_node)
-@@ -248,6 +368,7 @@ where
+@@ -276,6 +405,7 @@ where
                          ino,
                          Arc::new(InodeData::Directory(DirectoryInodeData::Populated(
                              parent_digest,
@@ -804,26 +905,26 @@ index e8e21e0d3..6021aeae6 100644
                              children.clone(),
                          ))),
                      );
-@@ -300,6 +421,9 @@ where
+@@ -324,6 +454,9 @@ where
              Ok(None) => Err(io::Error::from_raw_os_error(libc::ENOENT)),
              // The root node does exist
              Ok(Some(root_node)) => {
 +                // What the tree says about itself, read once per root node.
 +                let attrs = self.declared_attrs(&root_node);
 +
-                 // Let's check if someone else beat us to updating the inode tracker and
-                 // root_nodes map. This avoids locking inode_tracker for writing.
-                 if let Some(ino) = self.root_nodes.read().get(name) {
-@@ -316,7 +440,7 @@ where
-
+                 // Lock [self.root_nodes] and [self.inode_tracker] for writing.
+                 let mut root_nodes = self.root_nodes.write();
+                 let mut inode_tracker = self.inode_tracker.write();
+@@ -338,7 +471,7 @@ where
+ 
                  // insert the (sparse) inode data and register in
-                 // self.root_nodes.
+                 // self.root_nodes, replacing any stale (evicted) entry.
 -                let inode_data = InodeData::from_node(&root_node);
 +                let inode_data = InodeData::from_node(&root_node, attrs);
                  let ino = inode_tracker.put(inode_data.clone());
                  root_nodes.insert(name.to_owned(), ino);
-
-@@ -329,9 +453,9 @@ where
+ 
+@@ -351,9 +484,9 @@ where
      /// applying uid/gid override if configured.
      fn inode_data_to_attr(&self, inode_data: &InodeData, ino: u64) -> Attr {
          let mode = match inode_data {
@@ -835,7 +936,7 @@ index e8e21e0d3..6021aeae6 100644
              InodeData::Symlink(_) => libc::S_IFLNK | 0o444,
              InodeData::Directory(_) => libc::S_IFDIR | 0o555,
          };
-@@ -343,10 +467,10 @@ where
+@@ -365,10 +498,10 @@ where
              // FUTUREWORK: play with this numbers, as it affects read sizes for client applications.
              blocks: 1024,
              size: match inode_data {
@@ -849,8 +950,8 @@ index e8e21e0d3..6021aeae6 100644
                      children.len() as u64
                  }
              },
-@@ -363,6 +487,15 @@ where
-
+@@ -385,6 +518,15 @@ where
+ 
          attr
      }
 +
@@ -865,9 +966,9 @@ index e8e21e0d3..6021aeae6 100644
  }
  fn attr_to_fuse_entry(attr: Attr) -> Entry {
      Entry {
-@@ -472,9 +605,9 @@ where
+@@ -520,9 +662,9 @@ where
          let name: PathComponent = name.try_into().map_err(|_| std::io::ErrorKind::NotFound)?;
-
+ 
          // This goes from a parent inode to a node.
 -        let (ino, inode_data) = if parent == ROOT_ID {
 +        let ino = if parent == ROOT_ID {
@@ -877,42 +978,48 @@ index e8e21e0d3..6021aeae6 100644
          } else {
              // else the parent must be a directory, otherwise we would never come up with this request.
              // Lookup the parent in [self.inode_tracker] (which must be a [InodeData::Directory]), and find the child with that name.
-@@ -490,23 +623,21 @@ where
+@@ -538,28 +680,26 @@ where
                      io::Error::from_raw_os_error(libc::ENOENT)
                  })?;
-
+ 
 -            let (child_ino, _, child_node) = &children[idx];
 -
 -            // Reply with the file attributes for the child,
 -            (*child_ino, Arc::new(InodeData::from_node(child_node)))
 +            children[idx].0
          };
-
+ 
+-        debug!(inode_data=?&inode_data, ino=ino, "Some");
 +        // The tracker is the authority on what this inode is: it holds the
 +        // declarations the inode was allocated with, which cannot be recovered
-+        // from the [Node] alone.
++        // from the [Node] alone. A request for an inode we no longer track is
++        // stale.
 +        let inode_data = self
 +            .inode_tracker
 +            .read()
 +            .get(ino)
-+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-+
-         debug!(inode_data=?&inode_data, ino=ino, "Some");
-
++            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
+ 
 -        let attr = self.inode_data_to_attr(
 -            self.inode_tracker
 -                .read()
 -                .get(ino)
--                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?
+-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?
 -                .as_ref(),
 -            ino,
 -        );
++        debug!(inode_data=?&inode_data, ino=ino, "Some");
+ 
+         // We are about to hand the kernel an Entry for this inode, which adds
+         // one to its lookup count; a later FORGET draws it back down.
+         self.inode_tracker.write().increment_lookup(ino, 1);
+ 
 -        Ok(attr_to_fuse_entry(attr))
 +        Ok(self.inode_data_to_fuse_entry(&inode_data, ino))
      }
-
+ 
      #[tracing::instrument(skip_all, fields(rq.inode = inode))]
-@@ -591,7 +722,11 @@ where
+@@ -644,7 +784,11 @@ where
                  let ino = self.get_inode_for_root_name(&name).unwrap_or_else(|| {
                      // insert the (sparse) inode data and register in
                      // self.root_nodes.
@@ -925,10 +1032,10 @@ index e8e21e0d3..6021aeae6 100644
                      self.root_nodes.write().insert(name.clone(), ino);
                      ino
                  });
-@@ -670,17 +805,28 @@ where
+@@ -723,17 +867,28 @@ where
                      io::Error::from_raw_os_error(libc::EPERM)
                  })?;
-
+ 
 -                let inode_data = InodeData::from_node(&node);
 -
 -                // obtain the inode, or allocate a new one.
@@ -948,7 +1055,7 @@ index e8e21e0d3..6021aeae6 100644
                      self.root_nodes.write().insert(name.clone(), ino);
                      ino
                  });
-
+ 
 +                let inode_data = self
 +                    .inode_tracker
 +                    .read()
@@ -958,7 +1065,7 @@ index e8e21e0d3..6021aeae6 100644
                  let written = add_entry(
                      fuse_backend_rs::api::filesystem::DirEntry {
                          ino,
-@@ -688,7 +834,7 @@ where
+@@ -741,7 +896,7 @@ where
                          type_: node_to_fuse_type(&node),
                          name: name.as_ref(),
                      },
@@ -967,9 +1074,9 @@ index e8e21e0d3..6021aeae6 100644
                  )?;
                  // If the buffer is full, add_entry will return `Ok(0)`.
                  if written == 0 {
-@@ -703,7 +849,14 @@ where
+@@ -759,7 +914,14 @@ where
          Span::current().record("directory.digest", parent_digest.to_string());
-
+ 
          for (i, (ino, name, child_node)) in children.into_iter().skip(offset as usize).enumerate() {
 -            let inode_data = InodeData::from_node(&child_node);
 +            // Read the child back out of the tracker rather than rebuilding it
@@ -980,10 +1087,10 @@ index e8e21e0d3..6021aeae6 100644
 +                .read()
 +                .get(ino)
 +                .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
-
+ 
              // the second parameter will become the "offset" parameter on the next call.
              let written = add_entry(
-@@ -713,7 +866,7 @@ where
+@@ -769,7 +931,7 @@ where
                      type_: node_to_fuse_type(&child_node),
                      name: name.as_ref(),
                  },
@@ -992,25 +1099,33 @@ index e8e21e0d3..6021aeae6 100644
              )?;
              // If the buffer is full, add_entry will return `Ok(0)`.
              if written == 0 {
-@@ -764,7 +917,7 @@ where
+@@ -828,7 +990,7 @@ where
                  warn!("is directory");
                  Err(io::Error::from_raw_os_error(libc::EISDIR))
              }
 -            InodeData::Regular(ref blob_digest, _blob_size, _) => {
 +            InodeData::Regular(ref blob_digest, _blob_size, ..) => {
                  Span::current().record("blob.digest", blob_digest.to_string());
-
+ 
                  match self
-@@ -932,7 +1085,7 @@ where
+@@ -993,10 +1155,14 @@ where
+         }
+ 
+         let blob_digest = match *self.inode_tracker.read().get(inode).ok_or_else(|| {
++            // A mapping request for an inode we no longer track is stale, just
++            // like any other access to an evicted inode: the guest is expected
++            // to remove a mapping before forgetting the inode, but a buggy or
++            // malicious one need not, and the tracker is free of it either way.
              warn!("inode not found");
-             io::Error::from_raw_os_error(libc::EBADF)
+-            io::Error::from_raw_os_error(libc::EBADF)
++            io::Error::from_raw_os_error(libc::ESTALE)
          })? {
 -            InodeData::Regular(ref blob_digest, _, _) => *blob_digest,
 +            InodeData::Regular(ref blob_digest, ..) => *blob_digest,
              InodeData::Directory(..) => return Err(io::Error::from_raw_os_error(libc::EISDIR)),
              InodeData::Symlink(_) => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
          };
-@@ -989,24 +1142,47 @@ where
+@@ -1058,25 +1224,48 @@ where
          name: &CStr,
          size: u32,
      ) -> io::Result<GetxattrReply> {
@@ -1023,18 +1138,20 @@ index e8e21e0d3..6021aeae6 100644
 +        if !self.settings.show_xattr && self.settings.fsmeta_path.is_none() {
              return Err(io::Error::from_raw_os_error(libc::ENOSYS));
          }
-
--        // Peek at the inode requested, and construct the response.
+ 
+-        // Peek at the inode requested, and construct the response. A request
+-        // for an inode we no longer track is stale.
 -        let digest_str = match *self
++        // A request for an inode we no longer track is stale.
 +        let inode_data = self
              .inode_tracker
              .read()
              .get(inode)
--            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODATA))?
+-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?
 -        {
 -            InodeData::Directory(DirectoryInodeData::Sparse(ref digest, _))
 -            | InodeData::Directory(DirectoryInodeData::Populated(ref digest, _))
-+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODATA))?;
++            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
 +
 +        // What the tree declares about the file is an attribute of the file,
 +        // so it is served whether or not the synthetic digest attributes below
@@ -1066,10 +1183,10 @@ index e8e21e0d3..6021aeae6 100644
                  digest.to_string()
              }
              _ => {
-@@ -1014,13 +1190,7 @@ where
+@@ -1084,13 +1273,7 @@ where
              }
          };
-
+ 
 -        if size == 0 {
 -            Ok(GetxattrReply::Count(digest_str.len() as u32))
 -        } else if size < digest_str.len() as u32 {
@@ -1079,9 +1196,9 @@ index e8e21e0d3..6021aeae6 100644
 -        }
 +        reply_xattr(digest_str.as_bytes(), size)
      }
-
+ 
      #[tracing::instrument(skip_all, fields(rq.inode = inode))]
-@@ -1030,7 +1200,7 @@ where
+@@ -1100,7 +1283,7 @@ where
          inode: Self::Inode,
          size: u32,
      ) -> io::Result<ListxattrReply> {
@@ -1089,24 +1206,28 @@ index e8e21e0d3..6021aeae6 100644
 +        if !self.settings.show_xattr && self.settings.fsmeta_path.is_none() {
              return Err(io::Error::from_raw_os_error(libc::ENOSYS));
          }
-
-@@ -1038,6 +1208,15 @@ where
+ 
+@@ -1114,6 +1297,19 @@ where
+         // determine the (\0-terminated list) to of xattr keys present, depending on the type of the inode.
          let xattrs_names = {
              let mut out = Vec::new();
-             if let Some(inode_data) = self.inode_tracker.read().get(inode) {
-+                for name in inode_data.attrs().attrs().xattrs.keys() {
-+                    out.extend_from_slice(name.as_bytes());
-+                    out.push_byte(b'\x00');
-+                }
 +
-+                if !self.settings.show_xattr {
-+                    return reply_names(out, size);
-+                }
++            // Declared attributes come first: they are attributes of the file
++            // in their own right, served whether or not the synthetic digest
++            // attributes below are enabled.
++            for name in inode_data.attrs().attrs().xattrs.keys() {
++                out.extend_from_slice(name.as_bytes());
++                out.push_byte(b'\x00');
++            }
 +
-                 match *inode_data {
-                     InodeData::Directory(_) => {
-                         out.extend_from_slice(XATTR_NAME_DIRECTORY_DIGEST);
-@@ -1062,3 +1241,25 @@ where
++            if !self.settings.show_xattr {
++                return reply_names(out, size);
++            }
++
+             match *inode_data {
+                 InodeData::Directory(_) => {
+                     out.extend_from_slice(XATTR_NAME_DIRECTORY_DIGEST);
+@@ -1435,3 +1631,25 @@ mod tests {
          }
      }
  }
@@ -1133,10 +1254,10 @@ index e8e21e0d3..6021aeae6 100644
 +    }
 +}
 diff --git a/snix/cli/castore/src/main.rs b/snix/cli/castore/src/main.rs
-index 79e0dd031..8505c0f92 100644
+index 112187e..58e1816 100644
 --- a/snix/cli/castore/src/main.rs
 +++ b/snix/cli/castore/src/main.rs
-@@ -237,6 +237,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+@@ -233,6 +233,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                          list_root: true,
                          uid_gid_override: uid_gid,
                          show_xattr,
@@ -1148,7 +1269,7 @@ index 79e0dd031..8505c0f92 100644
                      },
                      tokio::runtime::Handle::current(),
                  );
-@@ -293,6 +298,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+@@ -288,6 +293,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                          list_root: true,
                          uid_gid_override: uid_gid,
                          show_xattr,
@@ -1161,10 +1282,10 @@ index 79e0dd031..8505c0f92 100644
                      tokio::runtime::Handle::current(),
                  );
 diff --git a/snix/cli/store/src/main.rs b/snix/cli/store/src/main.rs
-index 8291d34e5..164e1ed1e 100644
+index f252ffe..cc078ca 100644
 --- a/snix/cli/store/src/main.rs
 +++ b/snix/cli/store/src/main.rs
-@@ -660,6 +660,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+@@ -656,6 +656,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                      list_root,
                      uid_gid_override: uid_gid,
                      show_xattr,
@@ -1173,7 +1294,7 @@ index 8291d34e5..164e1ed1e 100644
                  },
                  tokio::runtime::Handle::current(),
              );
-@@ -711,6 +713,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+@@ -706,6 +708,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                      list_root,
                      uid_gid_override: uid_gid,
                      show_xattr,

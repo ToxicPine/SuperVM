@@ -1,0 +1,891 @@
+From a5307e7836aa2a4fdb506537f77ae1484aa4c8d7 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Fri, 31 Jul 2026 15:24:30 +0100
+Subject: [PATCH 2/2] fix(castore/fs): honour FUSE FORGET and bound the inode
+ tracker
+
+The castore filesystem never implemented forget/batch_forget, so the inode
+tracker only ever grew: every lookup allocated tracker state that lived until
+the mount was torn down. A long-lived virtio-fs mount serving a large store
+leaks an inode (and its data and reverse-lookup entry) for every path the
+guest ever touches.
+
+Track the FUSE lookup count the protocol already defines. Every reply that
+hands the kernel an Entry -- a lookup, and each readdirplus entry -- adds one
+to the inode's count; forget/batch_forget draw it back down, and the tracker
+evicts the inode once its last reference is gone, dropping its data and the
+content->inode reverse mapping together. Content-addressed deduplication
+means several names share one inode and one count, so eviction only happens
+at a true zero; a re-put of the same content afterwards allocates a fresh
+inode rather than resurrecting the old number.
+
+Enumeration is the one path that hands out an inode without taking a
+reference: a plain readdir returns a child's d_ino with no Entry, so those
+children sit at a zero lookup count that no FORGET will ever draw down. To
+keep an enumerate-only guest from leaking them, evicting a populated
+directory sweeps its zero-count children. The sweep does not recurse: a
+directory only becomes populated through a lookup that raised its count above
+zero, so a zero-count inode is never a populated directory and evicting one
+finds no further children. The sole residue left unreclaimed is the root
+listing itself, which the permanent root inode pins; that is documented on
+InodeTracker rather than swept.
+
+Eviction makes stale inodes reachable, so the lifetime is closed off at both
+ends:
+
+  - The root inode is permanent: it never enters the tracker and forget
+    ignores it.
+
+  - A directory caches its children's inode numbers, and the kernel may
+    forget a child while still holding the parent. get_directory_children
+    reinstates any such evicted child under its original number before
+    handing it out; the root-name resolver does the same for root entries,
+    re-fetching and re-allocating when its cached inode has been evicted.
+
+Unit tests cover the lookup/forget refcount cycle, partial forget, that
+eviction frees the reverse map (a re-put allocates a fresh inode), restore,
+and the directory sweep (both a mixed directory and an enumerate-only one);
+filesystem-level tests cover a lookup/forget/revive cycle, partial forget
+keeping an inode alive, the root surviving an unbounded forget, and a
+readdir-then-forget reclaiming never-looked-up children.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ snix/castore/src/fs/inode_tracker.rs | 384 ++++++++++++++++++++++++++-
+ snix/castore/src/fs/mod.rs           | 322 +++++++++++++++++++---
+ 2 files changed, 668 insertions(+), 38 deletions(-)
+
+diff --git a/snix/castore/src/fs/inode_tracker.rs b/snix/castore/src/fs/inode_tracker.rs
+index e0c072d..dd08c6b 100644
+--- a/snix/castore/src/fs/inode_tracker.rs
++++ b/snix/castore/src/fs/inode_tracker.rs
+@@ -5,6 +5,37 @@ use crate::B3Digest;
+ 
+ /// InodeTracker keeps track of inodes, stores data being these inodes and deals
+ /// with inode allocation.
++///
++/// # Inode lifetime
++///
++/// FUSE inodes are reference-counted by the kernel. Every reply that hands the
++/// kernel an `Entry` for an inode (a `lookup`, or a `readdirplus` entry) adds
++/// one to that inode's *lookup count*; a `FORGET` request carries the number of
++/// references to drop. The kernel guarantees it will not use an inode again
++/// once it has forgotten it down to zero without looking it up anew.
++///
++/// The tracker mirrors that count in [`InodeTracker::lookup_counts`]. When a
++/// count reaches zero the inode is *evicted*: its data and the reverse-lookup
++/// entry that maps its content to it are both removed, so the number is free to
++/// be reused and the tracker no longer grows without bound for the life of a
++/// mount. Content-addressed deduplication means several paths can resolve to
++/// one inode; their lookups accumulate on that single count, so eviction only
++/// happens once the *last* reference is forgotten.
++///
++/// Enumeration does not take a reference: a plain `readdir` hands the kernel a
++/// child's inode number without an `Entry`, so those children sit at a zero
++/// lookup count and no FORGET ever names them. To keep an enumerate-only
++/// workload from leaking them, evicting a populated directory *sweeps* its
++/// zero-count children (see [`Self::evict`]).
++///
++/// Inodes are handed out by [`InodeTracker::put`], which deduplicates by
++/// content, so re-`put`ting the same content after an eviction allocates a
++/// *fresh* inode rather than resurrecting the old number.
++///
++/// One class of zero-count residue is not reclaimed: entries of the mount root
++/// enumerated under `list_root`. The root inode is permanent and never held
++/// here, so there is no populated directory whose eviction would sweep them;
++/// they are instead bounded by, and pinned to, the root listing itself.
+ pub struct InodeTracker {
+     data: HashMap<u64, Arc<InodeData>>,
+ 
+@@ -18,6 +49,10 @@ pub struct InodeTracker {
+     // Note the corresponding directory may not be present in data yet.
+     directory_digest_to_inode: HashMap<B3Digest, u64>,
+ 
++    // The number of outstanding kernel references (the FUSE "lookup count") for
++    // each inode. An inode absent from this map has no outstanding references.
++    lookup_counts: HashMap<u64, u64>,
++
+     // the next inode to allocate
+     next_inode: u64,
+ }
+@@ -30,6 +65,7 @@ impl Default for InodeTracker {
+             blob_digest_to_inode: Default::default(),
+             symlink_target_to_inode: Default::default(),
+             directory_digest_to_inode: Default::default(),
++            lookup_counts: Default::default(),
+ 
+             next_inode: 2,
+         }
+@@ -42,12 +78,15 @@ impl InodeTracker {
+         self.data.get(&ino).cloned()
+     }
+ 
+-    // Replaces data for a given inode.
+-    // Panics if the inode doesn't already exist.
++    // Replaces the data for a given inode, e.g. to upgrade a directory from
++    // [DirectoryInodeData::Sparse] to [DirectoryInodeData::Populated].
++    //
++    // The inode number and its lookup count are left untouched. If the inode
++    // was concurrently evicted by a FORGET this reinstates its data, which is
++    // harmless: the caller reached it through a live parent that still holds a
++    // kernel reference to it.
+     pub fn replace(&mut self, ino: u64, data: Arc<InodeData>) {
+-        if self.data.insert(ino, data).is_none() {
+-            panic!("replace called on unknown inode");
+-        }
++        self.data.insert(ino, data);
+     }
+ 
+     // Stores data and returns the inode for it.
+@@ -128,10 +167,134 @@ impl InodeTracker {
+         self.next_inode += 1;
+         ino
+     }
++
++    /// Records that the kernel was handed `delta` more references to `ino`,
++    /// e.g. one per successful `lookup` reply or per `readdirplus` entry.
++    ///
++    /// The caller must have ensured `ino`'s data is present (it just handed the
++    /// kernel an `Entry` for it); the count is what a later [`Self::forget`]
++    /// draws back down.
++    pub fn increment_lookup(&mut self, ino: u64, delta: u64) {
++        *self.lookup_counts.entry(ino).or_insert(0) += delta;
++    }
++
++    /// Drops `nlookup` of the kernel's outstanding references to `ino`, as
++    /// requested by a FORGET. When the last reference is dropped the inode is
++    /// evicted (see [`Self::evict`]).
++    ///
++    /// A FORGET for an inode with no recorded references is ignored: either it
++    /// was never handed to the kernel with an `Entry`, or it has already been
++    /// forgotten.
++    pub fn forget(&mut self, ino: u64, nlookup: u64) {
++        let Some(count) = self.lookup_counts.get_mut(&ino) else {
++            return;
++        };
++
++        *count = count.saturating_sub(nlookup);
++        if *count == 0 {
++            self.lookup_counts.remove(&ino);
++            self.evict(ino);
++        }
++    }
++
++    /// Removes an inode's data and the reverse-lookup entry that resolves to it.
++    ///
++    /// The reverse entry is only removed if it still points at `ino`: content
++    /// that was re-`put` after `ino` was handed out (allocating a newer inode
++    /// for the same content) owns the mapping now and must not be disturbed.
++    ///
++    /// If `ino` was a *populated* directory, its children are swept: any child
++    /// that has no outstanding lookup count is evicted too. Such children were
++    /// allocated by directory enumeration (`readdir` hands out `d_ino` values
++    /// but takes no reference) or were reinstated by [`Self::restore`] and never
++    /// looked up, so nothing but this parent kept them around; the kernel holds
++    /// no reference to a zero-count inode by definition. Without the sweep an
++    /// enumerate-only workload would still grow the tracker without bound, since
++    /// no FORGET ever names those children.
++    ///
++    /// The sweep does not recurse in practice: a swept child can only be a leaf
++    /// or a not-yet-explored ([`DirectoryInodeData::Sparse`]) directory. A
++    /// directory becomes [`DirectoryInodeData::Populated`] only through a
++    /// `get_directory_children` call, which the kernel can only make after a
++    /// lookup that raised the directory's count above zero; dropping back to
++    /// zero would already have evicted it. So a zero-count inode is never a
++    /// populated directory, and evicting one finds no further children to sweep.
++    fn evict(&mut self, ino: u64) {
++        let Some(data) = self.data.remove(&ino) else {
++            return;
++        };
++
++        match &*data {
++            InodeData::Regular(digest, _, _) => {
++                if self.blob_digest_to_inode.get(digest) == Some(&ino) {
++                    self.blob_digest_to_inode.remove(digest);
++                }
++            }
++            InodeData::Symlink(target) => {
++                if self.symlink_target_to_inode.get(target) == Some(&ino) {
++                    self.symlink_target_to_inode.remove(target);
++                }
++            }
++            InodeData::Directory(DirectoryInodeData::Sparse(digest, _)) => {
++                if self.directory_digest_to_inode.get(digest) == Some(&ino) {
++                    self.directory_digest_to_inode.remove(digest);
++                }
++            }
++            InodeData::Directory(DirectoryInodeData::Populated(digest, children)) => {
++                if self.directory_digest_to_inode.get(digest) == Some(&ino) {
++                    self.directory_digest_to_inode.remove(digest);
++                }
++
++                // Sweep children the kernel no longer references.
++                let sweepable: Vec<u64> = children
++                    .iter()
++                    .map(|(child_ino, _, _)| *child_ino)
++                    .filter(|child_ino| !self.lookup_counts.contains_key(child_ino))
++                    .collect();
++                for child_ino in sweepable {
++                    self.evict(child_ino);
++                }
++            }
++        }
++    }
++
++    /// Reinstates `data` under a specific inode number that the kernel still
++    /// references but which was evicted while a parent directory kept caching
++    /// it (see [`super::SnixStoreFs::get_directory_children`]).
++    ///
++    /// This is a no-op if the inode is already present. The content's
++    /// reverse-lookup entry is restored only if it is currently vacant, so a
++    /// newer inode allocated for the same content keeps ownership of the
++    /// mapping. The lookup count is not touched: the reference that kept the
++    /// parent alive is re-counted by the caller when it hands the entry out.
++    pub fn restore(&mut self, ino: u64, data: InodeData) {
++        if self.data.contains_key(&ino) {
++            return;
++        }
++
++        match &data {
++            InodeData::Regular(digest, _, _) => {
++                self.blob_digest_to_inode.entry(*digest).or_insert(ino);
++            }
++            InodeData::Symlink(target) => {
++                self.symlink_target_to_inode
++                    .entry(target.clone())
++                    .or_insert(ino);
++            }
++            InodeData::Directory(DirectoryInodeData::Sparse(digest, _))
++            | InodeData::Directory(DirectoryInodeData::Populated(digest, _)) => {
++                self.directory_digest_to_inode.entry(*digest).or_insert(ino);
++            }
++        }
++
++        self.data.insert(ino, Arc::new(data));
++    }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::sync::Arc;
++
+     use crate::fixtures;
+ 
+     use super::InodeData;
+@@ -204,4 +367,215 @@ mod tests {
+         // inserting another file should return a different ino
+         assert_ne!(ino, inode_tracker.put(InodeData::Symlink("target2".into())));
+     }
++
++    fn blob_a() -> InodeData {
++        InodeData::Regular(
++            *fixtures::BLOB_A_DIGEST,
++            fixtures::BLOB_A.len() as u64,
++            false,
++        )
++    }
++
++    /// A single lookup followed by a matching forget evicts the inode.
++    #[test]
++    fn lookup_forget_cycle() {
++        let mut inode_tracker = InodeTracker::default();
++        let ino = inode_tracker.put(blob_a());
++
++        // The kernel is handed one reference.
++        inode_tracker.increment_lookup(ino, 1);
++        assert!(inode_tracker.get(ino).is_some());
++
++        // Forgetting that reference drops the inode.
++        inode_tracker.forget(ino, 1);
++        assert!(
++            inode_tracker.get(ino).is_none(),
++            "inode must be evicted once its last reference is forgotten"
++        );
++    }
++
++    /// Forgetting fewer references than are outstanding leaves the inode alive.
++    #[test]
++    fn partial_forget_keeps_inode() {
++        let mut inode_tracker = InodeTracker::default();
++        let ino = inode_tracker.put(blob_a());
++
++        // Three references handed out (e.g. one lookup plus two readdirplus).
++        inode_tracker.increment_lookup(ino, 3);
++
++        // Forgetting two of them must not evict.
++        inode_tracker.forget(ino, 2);
++        assert!(
++            inode_tracker.get(ino).is_some(),
++            "inode with outstanding references must survive"
++        );
++
++        // The final reference does.
++        inode_tracker.forget(ino, 1);
++        assert!(inode_tracker.get(ino).is_none());
++    }
++
++    /// Deduplicated lookups accumulate on one count; eviction waits for the
++    /// last one.
++    #[test]
++    fn dedup_accumulates_then_evicts() {
++        let mut inode_tracker = InodeTracker::default();
++
++        // The same content looked up under two names shares one inode.
++        let ino = inode_tracker.put(blob_a());
++        assert_eq!(ino, inode_tracker.put(blob_a()));
++        inode_tracker.increment_lookup(ino, 1);
++        inode_tracker.increment_lookup(ino, 1);
++
++        // A forget for one of the two references keeps the inode alive.
++        inode_tracker.forget(ino, 1);
++        assert!(inode_tracker.get(ino).is_some());
++
++        // Forgetting the remaining reference evicts it.
++        inode_tracker.forget(ino, 1);
++        assert!(inode_tracker.get(ino).is_none());
++    }
++
++    /// Eviction clears the reverse-lookup entry, so re-`put`ting the same
++    /// content allocates a fresh inode rather than resurrecting the old number.
++    #[test]
++    fn eviction_frees_reverse_map() {
++        let mut inode_tracker = InodeTracker::default();
++        let ino = inode_tracker.put(blob_a());
++        inode_tracker.increment_lookup(ino, 1);
++        inode_tracker.forget(ino, 1);
++        assert!(inode_tracker.get(ino).is_none());
++
++        // The same content must now get a *new* inode number.
++        let new_ino = inode_tracker.put(blob_a());
++        assert_ne!(
++            ino, new_ino,
++            "a re-put after eviction must not resurrect the old inode number"
++        );
++    }
++
++    /// A forget for an inode with no outstanding references is a harmless no-op,
++    /// and never underflows the count into an eviction.
++    #[test]
++    fn forget_unknown_is_noop() {
++        let mut inode_tracker = InodeTracker::default();
++        // Never looked up: no recorded references.
++        inode_tracker.forget(23, 1);
++
++        let ino = inode_tracker.put(blob_a());
++        // Put but never looked up: forgetting must not evict.
++        inode_tracker.forget(ino, 1);
++        assert!(inode_tracker.get(ino).is_some());
++    }
++
++    /// A directory can reinstate a child inode the kernel still references after
++    /// it was evicted, under the very same inode number.
++    #[test]
++    fn restore_reinstates_evicted_inode() {
++        let mut inode_tracker = InodeTracker::default();
++        let ino = inode_tracker.put(blob_a());
++        inode_tracker.increment_lookup(ino, 1);
++        inode_tracker.forget(ino, 1);
++        assert!(inode_tracker.get(ino).is_none());
++
++        inode_tracker.restore(ino, blob_a());
++        assert!(inode_tracker.get(ino).is_some());
++        // With the reverse mapping restored, a put resolves to the same inode.
++        assert_eq!(ino, inode_tracker.put(blob_a()));
++    }
++
++    /// Populates a directory inode holding the given child inodes and returns it.
++    fn put_dir_with_children(inode_tracker: &mut InodeTracker, children: &[u64]) -> u64 {
++        use super::DirectoryInodeData;
++        use crate::{Node, path::PathComponent};
++
++        let digest = fixtures::DIRECTORY_WITH_KEEP.digest();
++        let dir = inode_tracker.put(InodeData::Directory(DirectoryInodeData::Sparse(
++            digest,
++            fixtures::DIRECTORY_WITH_KEEP.size(),
++        )));
++
++        let kids: Vec<(u64, PathComponent, Node)> = children
++            .iter()
++            .enumerate()
++            .map(|(i, &ino)| {
++                let name = format!("c{i}");
++                let name: PathComponent = name.as_str().try_into().unwrap();
++                (
++                    ino,
++                    name,
++                    Node::File {
++                        digest: *fixtures::BLOB_A_DIGEST,
++                        size: 0,
++                        executable: false,
++                    },
++                )
++            })
++            .collect();
++
++        inode_tracker.replace(
++            dir,
++            Arc::new(InodeData::Directory(DirectoryInodeData::Populated(
++                digest, kids,
++            ))),
++        );
++        dir
++    }
++
++    /// A directory's zero-count children -- allocated by enumeration and never
++    /// looked up -- are swept when the directory is evicted, while children the
++    /// kernel still references survive.
++    #[test]
++    fn eviction_sweeps_unreferenced_children() {
++        let mut inode_tracker = InodeTracker::default();
++
++        let child_a = inode_tracker.put(blob_a());
++        let child_b = inode_tracker.put(InodeData::Regular(
++            *fixtures::BLOB_B_DIGEST,
++            fixtures::BLOB_B.len() as u64,
++            false,
++        ));
++
++        let dir = put_dir_with_children(&mut inode_tracker, &[child_a, child_b]);
++
++        // The directory was looked up, and so was child_b -- but not child_a.
++        inode_tracker.increment_lookup(dir, 1);
++        inode_tracker.increment_lookup(child_b, 1);
++
++        // Forgetting the directory evicts it and sweeps the unreferenced child,
++        // while the still-referenced child survives.
++        inode_tracker.forget(dir, 1);
++        assert!(
++            inode_tracker.get(dir).is_none(),
++            "directory must be evicted"
++        );
++        assert!(
++            inode_tracker.get(child_a).is_none(),
++            "a zero-count child must be swept"
++        );
++        assert!(
++            inode_tracker.get(child_b).is_some(),
++            "a referenced child must survive the sweep"
++        );
++    }
++
++    /// Enumerate-only: a directory whose children were never looked up is fully
++    /// reclaimed once the directory is forgotten.
++    #[test]
++    fn eviction_sweeps_all_when_enumerate_only() {
++        let mut inode_tracker = InodeTracker::default();
++
++        let child = inode_tracker.put(blob_a());
++        let dir = put_dir_with_children(&mut inode_tracker, &[child]);
++
++        // Only the directory was looked up (to enumerate it); the child was not.
++        inode_tracker.increment_lookup(dir, 1);
++
++        inode_tracker.forget(dir, 1);
++        assert!(inode_tracker.get(dir).is_none());
++        assert!(
++            inode_tracker.get(child).is_none(),
++            "an unreferenced child must be swept"
++        );
++    }
+ }
+diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
+index b67465a..17e5d97 100644
+--- a/snix/castore/src/fs/mod.rs
++++ b/snix/castore/src/fs/mod.rs
+@@ -161,10 +161,16 @@ where
+         }
+     }
+ 
+-    /// Retrieves the inode for a given root node basename, if present.
+-    /// This obtains a read lock on self.root_nodes.
++    /// Retrieves the inode for a given root node basename, if we still hold it.
++    ///
++    /// A name we allocated an inode for once may since have been evicted by a
++    /// FORGET while its entry lingered in [`Self::root_nodes`]. Only report the
++    /// inode if its data is still resident; otherwise the caller re-allocates,
++    /// which yields a fresh inode rather than handing out a stale number.
++    /// This obtains read locks on self.root_nodes and self.inode_tracker.
+     fn get_inode_for_root_name(&self, name: &PathComponent) -> Option<u64> {
+-        self.root_nodes.read().get(name).cloned()
++        let ino = self.root_nodes.read().get(name).cloned()?;
++        self.inode_tracker.read().get(ino).map(|_| ino)
+     }
+ 
+     /// For a given inode, look up the given directory behind it (from
+@@ -188,6 +194,24 @@ where
+         match *data {
+             // if it's populated already, return children.
+             InodeData::Directory(DirectoryInodeData::Populated(parent_digest, ref children)) => {
++                // The kernel may still reference children of this cached
++                // directory that it has since forgotten, and which we therefore
++                // evicted. Reinstate their data under the same inode numbers
++                // before handing them out, so a subsequent getattr/open/read on
++                // any of them resolves instead of spuriously going stale.
++                let missing = {
++                    let inode_tracker = self.inode_tracker.read();
++                    children
++                        .iter()
++                        .any(|(child_ino, _, _)| inode_tracker.get(*child_ino).is_none())
++                };
++                if missing {
++                    let mut inode_tracker = self.inode_tracker.write();
++                    for (child_ino, _, child_node) in children {
++                        inode_tracker.restore(*child_ino, InodeData::from_node(child_node));
++                    }
++                }
++
+                 Ok((parent_digest, children.clone()))
+             }
+             // if it's sparse, fetch data using directory_service, populate child nodes
+@@ -254,21 +278,17 @@ where
+         &self,
+         name: &PathComponent,
+     ) -> io::Result<(u64, Arc<InodeData>)> {
+-        // Look up the inode for that root node.
+-        // If there's one, [self.inode_tracker] MUST also contain the data,
+-        // which we can then return.
+-        if let Some(inode) = self.get_inode_for_root_name(name) {
+-            return Ok((
+-                inode,
+-                self.inode_tracker
+-                    .read()
+-                    .get(inode)
+-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?
+-                    .to_owned(),
+-            ));
++        // Fast path: we already allocated an inode for this root node and its
++        // data is still resident (it has not been evicted by a FORGET).
++        if let Some(ino) = self.root_nodes.read().get(name).cloned() {
++            if let Some(data) = self.inode_tracker.read().get(ino) {
++                return Ok((ino, data));
++            }
+         }
+ 
+-        // We don't have it yet, look it up in [self.root_nodes].
++        // Either we've never seen this name, or its inode was evicted after the
++        // kernel forgot it. Look it up in [self.root_nodes] and (re-)allocate.
++        // A re-allocation yields a fresh inode; the old number is not resurrected.
+         match self
+             .tokio_handle
+             .block_on(async { self.root_nodes_provider.get_by_basename(name).await })
+@@ -279,25 +299,20 @@ where
+             Ok(None) => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+             // The root node does exist
+             Ok(Some(root_node)) => {
+-                // Let's check if someone else beat us to updating the inode tracker and
+-                // root_nodes map. This avoids locking inode_tracker for writing.
+-                if let Some(ino) = self.root_nodes.read().get(name) {
+-                    return Ok((
+-                        *ino,
+-                        self.inode_tracker
+-                            .read()
+-                            .get(*ino)
+-                            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?,
+-                    ));
+-                }
+-
+-                // Only in case it doesn't, lock [self.root_nodes] and
+-                // [self.inode_tracker] for writing.
++                // Lock [self.root_nodes] and [self.inode_tracker] for writing.
+                 let mut root_nodes = self.root_nodes.write();
+                 let mut inode_tracker = self.inode_tracker.write();
+ 
++                // Re-check under the write lock: another thread may have won the
++                // race and (re-)registered a still-resident inode for this name.
++                if let Some(ino) = root_nodes.get(name).cloned() {
++                    if let Some(data) = inode_tracker.get(ino) {
++                        return Ok((ino, data));
++                    }
++                }
++
+                 // insert the (sparse) inode data and register in
+-                // self.root_nodes.
++                // self.root_nodes, replacing any stale (evicted) entry.
+                 let inode_data = InodeData::from_node(&root_node);
+                 let ino = inode_tracker.put(inode_data.clone());
+                 root_nodes.insert(name.to_owned(), ino);
+@@ -417,6 +432,32 @@ where
+         Ok(opts)
+     }
+ 
++    /// Drop `count` of the kernel's outstanding references to `inode`.
++    ///
++    /// The root inode is special and permanent: it never lives in the inode
++    /// tracker and must never be evicted, so it is ignored here. Every other
++    /// inode is deferred to the tracker, which evicts it once its last
++    /// reference has been forgotten.
++    #[tracing::instrument(skip_all, fields(rq.inode = inode, rq.count = count))]
++    fn forget(&self, _ctx: &Context, inode: Self::Inode, count: u64) {
++        if inode == ROOT_ID {
++            return;
++        }
++        self.inode_tracker.write().forget(inode, count);
++    }
++
++    /// Drop references for several inodes at once; see [`Self::forget`].
++    #[tracing::instrument(skip_all, fields(rq.count = requests.len()))]
++    fn batch_forget(&self, _ctx: &Context, requests: Vec<(Self::Inode, u64)>) {
++        let mut inode_tracker = self.inode_tracker.write();
++        for (inode, count) in requests {
++            if inode == ROOT_ID {
++                continue;
++            }
++            inode_tracker.forget(inode, count);
++        }
++    }
++
+     #[tracing::instrument(skip_all, fields(rq.inode = inode))]
+     fn getattr(
+         &self,
+@@ -488,6 +529,11 @@ where
+                 .as_ref(),
+             ino,
+         );
++
++        // We are about to hand the kernel an Entry for this inode, which adds
++        // one to its lookup count; a later FORGET draws it back down.
++        self.inode_tracker.write().increment_lookup(ino, 1);
++
+         Ok(attr_to_fuse_entry(attr))
+     }
+ 
+@@ -676,6 +722,9 @@ where
+                 if written == 0 {
+                     break;
+                 }
++                // readdirplus hands the kernel an Entry for each returned name,
++                // just like lookup, so each adds one to that inode's lookup count.
++                self.inode_tracker.write().increment_lookup(ino, 1);
+             }
+             return Ok(());
+         }
+@@ -701,6 +750,9 @@ where
+             if written == 0 {
+                 break;
+             }
++            // readdirplus hands the kernel an Entry for each returned name, just
++            // like lookup, so each adds one to that inode's lookup count.
++            self.inode_tracker.write().increment_lookup(ino, 1);
+         }
+ 
+         Ok(())
+@@ -999,8 +1051,11 @@ mod tests {
+     use crate::directoryservice::DirectoryService;
+     use crate::{Node, path::PathComponent};
+ 
+-    type TestFs =
+-        SnixStoreFs<Arc<dyn BlobService>, Arc<dyn DirectoryService>, Arc<BTreeMap<PathComponent, Node>>>;
++    type TestFs = SnixStoreFs<
++        Arc<dyn BlobService>,
++        Arc<dyn DirectoryService>,
++        Arc<BTreeMap<PathComponent, Node>>,
++    >;
+ 
+     /// Builds a filesystem over the given root nodes.
+     ///
+@@ -1079,4 +1134,205 @@ mod tests {
+         let (attr, _) = fs.getattr(&ctx, ROOT_ID, None).expect("root getattr");
+         assert_eq!(attr.st_ino, ROOT_ID);
+     }
++
++    const BLOB_A_NAME: &str = "00000000000000000000000000000000-test";
++
++    /// Builds a filesystem exposing a single regular file (BLOB_A) in the root.
++    fn make_fs_with_blob_a() -> (tokio::runtime::Runtime, TestFs) {
++        let rt = tokio::runtime::Builder::new_multi_thread()
++            .worker_threads(1)
++            .enable_all()
++            .build()
++            .expect("build runtime");
++
++        let blob_service = Arc::new(MemoryBlobService::default()) as Arc<dyn BlobService>;
++        rt.block_on(async {
++            let mut bw = blob_service.open_write().await;
++            tokio::io::copy(
++                &mut std::io::Cursor::new(crate::fixtures::BLOB_A.to_vec()),
++                &mut bw,
++            )
++            .await
++            .expect("upload blob");
++            bw.close().await.expect("close blob");
++        });
++
++        let mut root_nodes = BTreeMap::new();
++        root_nodes.insert(
++            BLOB_A_NAME.try_into().unwrap(),
++            Node::File {
++                digest: *crate::fixtures::BLOB_A_DIGEST,
++                size: crate::fixtures::BLOB_A.len() as u64,
++                executable: false,
++            },
++        );
++
++        let directory_service =
++            Arc::new(crate::utils::gen_test_directory_service()) as Arc<dyn DirectoryService>;
++        let fs = SnixStoreFs::new(
++            blob_service,
++            directory_service,
++            Arc::new(root_nodes),
++            FSSettings {
++                list_root: true,
++                ..Default::default()
++            },
++            rt.handle().clone(),
++        );
++        (rt, fs)
++    }
++
++    /// A lookup makes an inode resolvable; forgetting the reference it handed
++    /// out evicts it, after which access is stale and a fresh lookup revives it
++    /// (under a possibly-different inode number).
++    #[test]
++    fn lookup_then_forget_evicts() {
++        let (_rt, fs) = make_fs_with_blob_a();
++        let ctx = Context::default();
++        let name = std::ffi::CString::new(BLOB_A_NAME).unwrap();
++
++        let entry = fs.lookup(&ctx, ROOT_ID, &name).expect("lookup");
++        let ino = entry.inode;
++        assert_ne!(ino, ROOT_ID);
++
++        // While referenced, the inode resolves.
++        fs.getattr(&ctx, ino, None)
++            .expect("getattr while referenced");
++
++        // Forgetting the single reference evicts it.
++        fs.forget(&ctx, ino, 1);
++        assert_eq!(
++            fs.getattr(&ctx, ino, None).unwrap_err().raw_os_error(),
++            Some(libc::ESTALE),
++            "a forgotten inode must be stale"
++        );
++
++        // The file still exists, so a fresh lookup revives it.
++        fs.lookup(&ctx, ROOT_ID, &name)
++            .expect("lookup after forget must succeed");
++    }
++
++    /// Two lookups take two references; the inode survives the first forget and
++    /// only dies on the second.
++    #[test]
++    fn partial_forget_keeps_inode_alive() {
++        let (_rt, fs) = make_fs_with_blob_a();
++        let ctx = Context::default();
++        let name = std::ffi::CString::new(BLOB_A_NAME).unwrap();
++
++        let ino = fs.lookup(&ctx, ROOT_ID, &name).expect("lookup 1").inode;
++        assert_eq!(
++            ino,
++            fs.lookup(&ctx, ROOT_ID, &name).expect("lookup 2").inode
++        );
++
++        // One of the two references forgotten: still alive.
++        fs.forget(&ctx, ino, 1);
++        fs.getattr(&ctx, ino, None)
++            .expect("inode with one outstanding reference must survive");
++
++        // The last reference forgotten: now stale.
++        fs.forget(&ctx, ino, 1);
++        assert_eq!(
++            fs.getattr(&ctx, ino, None).unwrap_err().raw_os_error(),
++            Some(libc::ESTALE),
++        );
++    }
++
++    /// FORGET for the root inode must never evict it, no matter the count.
++    #[test]
++    fn root_is_never_forgotten() {
++        let (_rt, fs) = make_fs_with_blob_a();
++        let ctx = Context::default();
++
++        fs.forget(&ctx, ROOT_ID, u64::MAX);
++        fs.batch_forget(&ctx, vec![(ROOT_ID, u64::MAX)]);
++
++        let (attr, _) = fs
++            .getattr(&ctx, ROOT_ID, None)
++            .expect("root must survive being forgotten");
++        assert_eq!(attr.st_ino, ROOT_ID);
++    }
++
++    const DIR_NAME: &str = "22222222222222222222222222222222-test";
++
++    /// Builds a filesystem exposing a single directory (DIRECTORY_WITH_KEEP) in
++    /// the root.
++    fn make_fs_with_dir() -> (tokio::runtime::Runtime, TestFs) {
++        let rt = tokio::runtime::Builder::new_multi_thread()
++            .worker_threads(1)
++            .enable_all()
++            .build()
++            .expect("build runtime");
++
++        let blob_service = Arc::new(MemoryBlobService::default()) as Arc<dyn BlobService>;
++        let directory_service =
++            Arc::new(crate::utils::gen_test_directory_service()) as Arc<dyn DirectoryService>;
++        rt.block_on(async {
++            directory_service
++                .put(crate::fixtures::DIRECTORY_WITH_KEEP.clone())
++                .await
++                .expect("put directory");
++        });
++
++        let mut root_nodes = BTreeMap::new();
++        root_nodes.insert(
++            DIR_NAME.try_into().unwrap(),
++            Node::Directory {
++                digest: crate::fixtures::DIRECTORY_WITH_KEEP.digest(),
++                size: crate::fixtures::DIRECTORY_WITH_KEEP.size(),
++            },
++        );
++
++        let fs = SnixStoreFs::new(
++            blob_service,
++            directory_service,
++            Arc::new(root_nodes),
++            FSSettings {
++                list_root: true,
++                ..Default::default()
++            },
++            rt.handle().clone(),
++        );
++        (rt, fs)
++    }
++
++    /// Enumerating a directory allocates inodes for its children without taking
++    /// a reference on them (readdir hands out d_ino but no Entry). Forgetting
++    /// the directory must therefore reclaim those never-looked-up children,
++    /// rather than leaking them for the life of the mount.
++    #[test]
++    fn readdir_then_forget_sweeps_children() {
++        let (_rt, fs) = make_fs_with_dir();
++        let ctx = Context::default();
++        let name = std::ffi::CString::new(DIR_NAME).unwrap();
++
++        let dir_ino = fs.lookup(&ctx, ROOT_ID, &name).expect("lookup dir").inode;
++
++        // Enumerate the directory. This populates its children in the tracker
++        // but, correctly, takes no reference on them.
++        let mut child_inos = Vec::new();
++        fs.readdir(&ctx, dir_ino, 0, 4096, 0, &mut |e| {
++            child_inos.push(e.ino);
++            Ok(1)
++        })
++        .expect("readdir");
++        assert!(!child_inos.is_empty(), "directory must have children");
++
++        // The children are resident but unreferenced.
++        for &child in &child_inos {
++            fs.getattr(&ctx, child, None)
++                .expect("child must be resident after readdir");
++        }
++
++        // Forgetting the directory evicts it and sweeps its children.
++        fs.forget(&ctx, dir_ino, 1);
++        for &child in &child_inos {
++            assert_eq!(
++                fs.getattr(&ctx, child, None).unwrap_err().raw_os_error(),
++                Some(libc::ESTALE),
++                "a never-looked-up child must be swept with its directory"
++            );
++        }
++    }
+ }

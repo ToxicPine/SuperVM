@@ -13,7 +13,7 @@ Change-Id: I598099d1c1b62e06296eed7a6fec166062ea3183
  1 file changed, 95 insertions(+)
 
 diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
-index 1003492..11360b8 100644
+index 1003492..101c554 100644
 --- a/snix/castore/src/fs/mod.rs
 +++ b/snix/castore/src/fs/mod.rs
 @@ -116,6 +116,13 @@ pub struct SnixStoreFs<BS, DS, RN: RootNodes> {
@@ -30,16 +30,10 @@ index 1003492..11360b8 100644
  }
  
  /// Configures some filesystem settings
-@@ -161,9 +168,23 @@ where
-             file_handles: RwLock::new(Default::default()),
-             next_file_handle: AtomicU64::new(1),
-             tokio_handle,
-+
-+            #[cfg(feature = "virtiofs")]
-+            dax_cache: None,
-         }
-     }
- 
+@@ -137,6 +144,17 @@ where
+     DS: DirectoryService,
+     RN: RootNodes,
+ {
 +    /// Serve DAX mappings for regular files, backed by `dax_cache`.
 +    ///
 +    /// Blobs are materialized into the cache on demand. Point several
@@ -51,9 +45,19 @@ index 1003492..11360b8 100644
 +        self
 +    }
 +
-     /// Retrieves the inode for a given root node basename, if present.
-     /// This obtains a read lock on self.root_nodes.
-     fn get_inode_for_root_name(&self, name: &PathComponent) -> Option<u64> {
+     pub fn new(
+         blob_service: BS,
+         directory_service: DS,
+@@ -161,6 +179,9 @@ where
+             file_handles: RwLock::new(Default::default()),
+             next_file_handle: AtomicU64::new(1),
+             tokio_handle,
++
++            #[cfg(feature = "virtiofs")]
++            dax_cache: None,
+         }
+     }
+ 
 @@ -870,6 +891,80 @@ where
          Ok(bytes_written as usize)
      }
