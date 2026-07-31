@@ -625,7 +625,7 @@ run_family() {
   fi
   printf 'instance_count\tcgroup_memory_current_bytes\tcgroup_memory_peak_bytes\tcgroup_anon_bytes\tcgroup_file_total_bytes\tcgroup_shmem_within_file_bytes\tcgroup_kernel_total_bytes\tcgroup_slab_within_kernel_bytes\tcgroup_pagetables_within_kernel_bytes\tcgroup_sock_within_kernel_bytes\n' \
     >"${CGROUP_MEMORY_FILE}"
-  printf 'instance_count\tpid\tinstance_index\tscope\tprocess_role\tprocess_cgroup\texecutable\tguest_memfd_rss_bytes\tguest_memfd_pss_bytes\tdax_rss_bytes\tdax_pss_bytes\tother_rss_bytes\tother_pss_bytes\n' \
+  printf 'instance_count\tpid\tinstance_index\tscope\tprocess_role\tprocess_cgroup\texecutable\tguest_memfd_rss_bytes\tguest_memfd_pss_bytes\tguest_private_rss_bytes\tguest_private_pss_bytes\tdax_rss_bytes\tdax_pss_bytes\tother_rss_bytes\tother_pss_bytes\n' \
     >"${PROCESS_MEMORY_FILE}"
 
   FAMILY_CGROUP_BASELINE_BYTES=$(median_family_memory_current)

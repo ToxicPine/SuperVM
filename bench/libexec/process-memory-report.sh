@@ -88,20 +88,70 @@ read_mapping_memory() {
   local smaps=$1
 
   awk -v dax_backing_dir="${DAX_BACKING_DIR}" '
-    /^[[:xdigit:]]+-[[:xdigit:]]+ / {
-      kind = "other"
-      if ($0 ~ /memfd:crosvm_guest/) {
-        kind = "guest"
-      } else if (dax_backing_dir != "" && index($0, dax_backing_dir) != 0) {
-        kind = "dax"
+    function commit_mapping() {
+      if (!mapping_open) {
+        return
       }
+      kind = mapping_kind
+      # The private-RAM map carves the guest kernel text and rodata out of the
+      # descriptor-backed guest memory into private anonymous mappings that
+      # crosvm marks MADV_MERGEABLE for KSM. Count that carve-out as guest RAM
+      # rather than VMM overhead, in its own bucket so its per-VM PSS can be
+      # watched falling toward size/N as KSM merges identical guests.
+      #
+      # Two discriminators, in order of preference:
+      #
+      #   1. The name "[anon:crosvm_guest_private]". crosvm-super patch 7 labels
+      #      each range with PR_SET_VMA_ANON_NAME, so on hosts whose kernel is
+      #      built with CONFIG_ANON_VMA_NAME the region is matched by pathname,
+      #      exactly as memfd:crosvm_guest is.
+      #   2. Anonymous mapping carrying the "mg" VmFlag. Naming is a silent no-op
+      #      on kernels without CONFIG_ANON_VMA_NAME, so fall back to the KSM
+      #      advice, which crosvm-super applies to no other memory. This covers
+      #      hosts where the name never appears.
+      if (mapping_named_private || (mapping_anonymous && mapping_mergeable)) {
+        kind = "guest-private"
+      }
+      rss[kind] += mapping_rss
+      pss[kind] += mapping_pss
+      mapping_open = 0
+    }
+    /^[[:xdigit:]]+-[[:xdigit:]]+ / {
+      commit_mapping()
+      mapping_open = 1
+      mapping_kind = "other"
+      if ($0 ~ /memfd:crosvm_guest/) {
+        mapping_kind = "guest"
+      } else if (dax_backing_dir != "" && index($0, dax_backing_dir) != 0) {
+        mapping_kind = "dax"
+      }
+      # A named private range carries the pathname [anon:crosvm_guest_private]
+      # (so it is not pathless); the mg fallback covers unnamed ranges. A
+      # pathless mapping has no field after the inode column, which excludes
+      # pseudo-files such as [heap] and [stack] from the anonymous fallback even
+      # if they were marked mergeable.
+      mapping_named_private = ($0 ~ /\[anon:crosvm_guest_private\]/)
+      mapping_anonymous = (NF < 6)
+      mapping_mergeable = 0
+      mapping_rss = 0
+      mapping_pss = 0
       next
     }
-    $1 == "Rss:" { rss[kind] += $2 * 1024 }
-    $1 == "Pss:" { pss[kind] += $2 * 1024 }
+    $1 == "Rss:" { mapping_rss = $2 * 1024 }
+    $1 == "Pss:" { mapping_pss = $2 * 1024 }
+    $1 == "VmFlags:" {
+      for (flag = 2; flag <= NF; flag++) {
+        if ($flag == "mg") {
+          mapping_mergeable = 1
+        }
+      }
+    }
     END {
-      printf "%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\n",
-        rss["guest"], pss["guest"], rss["dax"], pss["dax"],
+      commit_mapping()
+      printf "%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\n",
+        rss["guest"], pss["guest"],
+        rss["guest-private"], pss["guest-private"],
+        rss["dax"], pss["dax"],
         rss["other"], pss["other"]
     }
   ' "${smaps}"
@@ -200,14 +250,18 @@ while read -r pid; do
   classify_scope "${process_cgroup}"
   row=$(read_mapping_memory "/proc/${pid}/smaps")
   IFS=$'\t' read -r \
-    guest_rss_bytes guest_pss_bytes dax_rss_bytes dax_pss_bytes \
+    guest_rss_bytes guest_pss_bytes \
+    guest_private_rss_bytes guest_private_pss_bytes \
+    dax_rss_bytes dax_pss_bytes \
     other_rss_bytes other_pss_bytes <<<"${row}"
 
-  printf -v process_row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+  printf -v process_row \
+    '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "${INSTANCE_COUNT}" "${pid}" "${INSTANCE_INDEX}" \
     "${PROCESS_SCOPE}" "${PROCESS_ROLE}" \
     "${process_cgroup}" "${executable}" \
     "${guest_rss_bytes}" "${guest_pss_bytes}" \
+    "${guest_private_rss_bytes}" "${guest_private_pss_bytes}" \
     "${dax_rss_bytes}" "${dax_pss_bytes}" \
     "${other_rss_bytes}" "${other_pss_bytes}"
   process_rows+=("${process_row}")

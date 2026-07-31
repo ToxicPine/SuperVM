@@ -102,7 +102,15 @@ compatibility.
 4. `x86_64: coalesce adjacent E820 entries`
 5. `crosvm: keep virtio-fs in-process without sandboxing`
 6. `crosvm: add selective private RAM maps`
+7. `crosvm: name private guest RAM regions for host accounting`
 
 The patches come from the adjacent crosvm checkout's `private-ram-regions`
 branch. Each builds independently; adjacent-region support precedes the RAM
 layout splitting.
+
+Patch 7 names each private range `crosvm_guest_private` with
+`PR_SET_VMA_ANON_NAME`, so it shows as `[anon:crosvm_guest_private]` in
+`/proc/<pid>/smaps` and host memory accounting can attribute the carve-out as
+guest RAM. Naming needs a host kernel built with `CONFIG_ANON_VMA_NAME`; without
+it the request is a silent no-op and the ranges stay identifiable by their
+`MADV_MERGEABLE` (`mg`) VmFlag.
