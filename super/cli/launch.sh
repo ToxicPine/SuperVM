@@ -57,7 +57,11 @@ start_vm_filesystem() {
   local attempt
 
   echo "supervm: starting lower-store filesystem (tag ${lower_store_tag})"
-  snix store virtiofs \
+  # This daemon runs once per VM, so its idle footprint multiplies. Two
+  # runtime workers are plenty for one guest's request stream, and immediate
+  # purging stops the allocator from retaining boot-burst memory.
+  MIMALLOC_PURGE_DELAY=0 TOKIO_WORKER_THREADS=2 \
+    snix store virtiofs \
     --dax-backing-dir "${state_dir}/dax-backing" \
     --tag "${lower_store_tag}" \
     "${lower_store_fs_socket}" >"${runtime_dir}/${vm_id}-fs.log" 2>&1 &

@@ -117,7 +117,11 @@ ensure_castore() {
 
   stop_service store "${store_socket}"
   echo "supervm: starting shared castore daemon"
-  snix store daemon -l "${store_socket}" --unix-listen-unlink \
+  # Immediate purging returns memory retained after boot bursts. Worker
+  # threads stay unrestricted: this daemon is shared, so throughput matters
+  # more than one instance's thread cost.
+  MIMALLOC_PURGE_DELAY=0 \
+    snix store daemon -l "${store_socket}" --unix-listen-unlink \
     --blob-service-addr "objectstore+file:${castore}/blobs" \
     --directory-service-addr "redb:${castore}/directories.redb" \
     --path-info-service-addr "redb:${state_dir}/store/pathinfo.redb" \
@@ -131,7 +135,8 @@ ensure_lower_store() {
   if [[ ${service_healthy_result} != true ]]; then
     stop_service lower "${lower_meta_socket}"
     echo "supervm: starting shared lower-store daemon"
-    snix nix-daemon -l "${lower_meta_socket}" --unix-listen-unlink \
+    MIMALLOC_PURGE_DELAY=0 \
+      snix nix-daemon -l "${lower_meta_socket}" --unix-listen-unlink \
       --unix-listen-chmod everybody >"${runtime_dir}/lower.log" 2>&1 &
     write_pid_file lower "$!"
     wait_for_service lower "${lower_meta_socket}" "${lower_meta_socket}"
