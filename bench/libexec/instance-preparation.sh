@@ -20,7 +20,6 @@ prepare_instance_artifact() {
   local index=$2
   local instance="${FAMILY_OUTPUT_DIR}/instances/${index}"
   local guest
-  local profile
   local runner
   local upper
   local upper_hash
@@ -29,7 +28,7 @@ prepare_instance_artifact() {
 
   [[ ${INSTANCE_IS_PREPARED[${index}]:-} != true ]] || return 0
   mkdir -p "${instance}/runtime"
-  guest=$(benchmark_variant_guest "${index}" "${BENCHMARK_FLAKE}")
+  guest=$(benchmark_variant_guest "${index}" "${BENCHMARK_PROFILE_FLAKE}")
 
   printf 'supervm-bench: preparing %s instance %s\n' \
     "${family}" "${index}" >&2
@@ -38,16 +37,10 @@ prepare_instance_artifact() {
       runner=$(readlink -f "${FAMILY_OUTPUT_DIR}/instances/1/runner")
       ln -s "${runner}" "${instance}/runner"
     else
-      profile=${guest##*#}
-      runner=$(
-        nix build \
-          --override-input supervm "${SUPERVM_SOURCE_FLAKE}" \
-          --no-write-lock-file \
-          --out-link "${instance}/runner" \
-          --print-out-paths \
-          "${BENCHMARK_FLAKE}#lameRunners.x86_64-linux.${profile}" \
-          2>>"${prepare_log}"
-      )
+      "${LAMEVM_LAUNCHER}" prepare \
+        "--profile=${guest}" \
+        "${instance}" >>"${prepare_log}" 2>&1
+      runner=$(readlink -f "${instance}/runner")
     fi
     [[ -x ${runner}/bin/microvm-run ]] ||
       fail "prepared LameVM runner is not executable"

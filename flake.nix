@@ -26,33 +26,27 @@
       crosvm-super,
     }:
     let
+      sourceFlake = nixpkgs.legacyPackages.x86_64-linux.nix-gitignore.gitignoreSource [ "/bench/" ] ./.;
       systems = [
         "x86_64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
 
-      defaultGuestFor =
+      defaultGuestConfigurationFor =
         system:
         import ./super/default-guest.nix {
           inherit nixpkgs system;
         };
 
-      vmPackagesOverlay =
-        _final: prev:
-        {
-          crosvm = crosvm-super.packages.${prev.stdenv.hostPlatform.system}.crosvm-super;
-        };
+      vmPackagesOverlay = _final: prev: {
+        crosvm = crosvm-super.packages.${prev.stdenv.hostPlatform.system}.crosvm-super;
+      };
 
       templateModules = import ./super/template.nix {
         overlayStoreModule = self.nixosModules.overlayStore;
         microvm = microvm-super;
       };
 
-      mkLameRunner = import ./lame/mk-runner.nix {
-        inherit defaultGuestFor;
-        guestKernelFor = system: self.packages.${system}.guest-kernel;
-        microvm = microvm-lame;
-      };
     in
     {
       packages = forAllSystems (
@@ -68,11 +62,11 @@
 
           supervm = pkgs.callPackage ./super/supervm.nix {
             inherit (snix.packages.${system}) snix;
-            inherit self;
+            self = sourceFlake;
           };
 
           lamevm = pkgs.callPackage ./lame/lamevm.nix {
-            inherit self;
+            self = sourceFlake;
           };
 
           # Imported rather than callPackage'd: callPackage would replace the
@@ -110,21 +104,29 @@
         };
       });
 
-      # Reachable so `supervm` can evaluate a composed guest at run time
-      # against these pinned inputs rather than an ambient nixpkgs. Its
-      # arguments are implementation detail and stay in the let above.
-      lib.mkSuperRunner = import ./super/mk-runner.nix {
-        inherit (nixpkgs) lib;
-        inherit templateModules defaultGuestFor;
-        guestKernelFor = system: self.packages.${system}.guest-kernel;
-        vmPackagesModule =
-          { lib, ... }:
-          {
-            nixpkgs.overlays = lib.mkAfter [ vmPackagesOverlay ];
-          };
-      };
+      # The prepare commands use this narrow evaluation API at run time so
+      # runner construction stays pinned to this flake's inputs.
+      lib = {
+        lamevm.mkRunner = import ./lame/mk-runner.nix {
+          inherit defaultGuestConfigurationFor;
+          guestKernelFor = system: self.packages.${system}.guest-kernel;
+          microvm = microvm-lame;
+        };
 
-      lib.mkLameRunner = mkLameRunner;
+        supervm.mkRunner = import ./super/mk-runner.nix {
+          inherit (nixpkgs) lib;
+          inherit
+            templateModules
+            defaultGuestConfigurationFor
+            ;
+          guestKernelFor = system: self.packages.${system}.guest-kernel;
+          vmPackagesModule =
+            { lib, ... }:
+            {
+              nixpkgs.overlays = lib.mkAfter [ vmPackagesOverlay ];
+            };
+        };
+      };
 
       devShells = forAllSystems (
         system:

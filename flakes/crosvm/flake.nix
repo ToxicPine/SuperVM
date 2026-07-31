@@ -34,6 +34,7 @@
               ./patches/0004-x86_64-coalesce-adjacent-E820-entries.patch
               ./patches/0005-crosvm-keep-virtio-fs-in-process-without-sandboxing.patch
               ./patches/0006-crosvm-add-selective-private-RAM-maps.patch
+              ./patches/0007-crosvm-name-private-guest-RAM-regions-for-host-accounting.patch
             ];
           }
         );

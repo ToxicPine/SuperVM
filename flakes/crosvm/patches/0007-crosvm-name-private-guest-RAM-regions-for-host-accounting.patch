@@ -1,0 +1,130 @@
+From 597d35d9eddd9c6b65a185d3b238828fd88a01dc Mon Sep 17 00:00:00 2001
+From: Arbion Halili <99731180+ToxicPine@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 12:00:00 +0100
+Subject: [PATCH 7/7] crosvm: name private guest RAM regions for host accounting
+
+Add a set_anon_name helper beside mark_mergeable in base and an
+apply_anon_name_to_private_regions iterator in vm_memory, invoked from
+create_guest_memory right after the MADV_DONTFORK pass. The private-RAM
+map carves the guest kernel text and rodata into private anonymous
+mappings; naming them crosvm_guest_private makes them appear as
+[anon:crosvm_guest_private] in /proc/<pid>/smaps, so host memory
+accounting can attribute the carve-out as guest RAM rather than as VMM
+overhead the way it already does for memfd:crosvm_guest.
+
+PR_SET_VMA_ANON_NAME requires a host kernel built with
+CONFIG_ANON_VMA_NAME and returns EINVAL otherwise. Naming is only an
+accounting aid, so that case is a silent no-op: the guest boots
+identically and the regions stay identifiable by their MADV_MERGEABLE
+VmFlag.
+---
+ base/src/sys/linux/mmap.rs              | 37 +++++++++++++++++++++++++
+ src/crosvm/sys/linux.rs                 |  7 +++++
+ vm_memory/src/guest_memory/sys/linux.rs | 11 ++++++++
+ 3 files changed, 55 insertions(+)
+
+diff --git a/base/src/sys/linux/mmap.rs b/base/src/sys/linux/mmap.rs
+index f88f66fa..a2d7dccd 100644
+--- a/base/src/sys/linux/mmap.rs
++++ b/base/src/sys/linux/mmap.rs
+@@ -100,6 +100,38 @@ impl dyn MappedRegion {
+             Err(Error::SystemCallFailed(ErrnoError::last()))
+         }
+     }
++
++    /// Names the whole region `name` via `PR_SET_VMA_ANON_NAME` so it appears as
++    /// `[anon:NAME]` in `/proc/<pid>/smaps`. Kernels built without
++    /// `CONFIG_ANON_VMA_NAME` reject this with `EINVAL`; since the name is only a
++    /// host-accounting aid, that case is a silent success.
++    pub fn set_anon_name(&self, name: &std::ffi::CStr) -> Result<()> {
++        // Not exported by the libc crate; values from <linux/prctl.h>.
++        const PR_SET_VMA: libc::c_int = 0x53564d41;
++        const PR_SET_VMA_ANON_NAME: libc::c_ulong = 0;
++
++        // SAFETY:
++        // The MappedRegion interface guarantees the pointer and size are correct, and the kernel
++        // copies the name during the call, so the borrow need not outlive it.
++        let ret = unsafe {
++            libc::prctl(
++                PR_SET_VMA,
++                PR_SET_VMA_ANON_NAME,
++                self.as_ptr() as usize as libc::c_ulong,
++                self.size() as libc::c_ulong,
++                name.as_ptr() as usize as libc::c_ulong,
++            )
++        };
++        if ret != -1 {
++            return Ok(());
++        }
++        let error = ErrnoError::last();
++        if error.errno() == libc::EINVAL {
++            // The host kernel lacks CONFIG_ANON_VMA_NAME; leave the region unnamed.
++            return Ok(());
++        }
++        Err(Error::SystemCallFailed(error))
++    }
+ }
+ 
+ /// Wraps a memory mapping in the current process and unmaps it on drop.
+@@ -899,6 +931,8 @@ pub trait MemoryMappingUnix {
+     fn mark_mergeable(&self, mem_offset: usize, count: usize) -> Result<()>;
+     /// Applies `MADV_DONTNEED` to the specified range.
+     fn madvise_dontneed(&self, mem_offset: usize, count: usize) -> Result<()>;
++    /// Names the mapping's anonymous region for host memory accounting.
++    fn set_anon_name(&self, name: &std::ffi::CStr) -> Result<()>;
+     /// Remove the specified range from the mapping.
+     fn remove_range(&self, mem_offset: usize, count: usize) -> Result<()>;
+     /// Tell the kernel to readahead the range.
+@@ -920,6 +954,9 @@ impl MemoryMappingUnix for CrateMemoryMapping {
+     fn madvise_dontneed(&self, mem_offset: usize, count: usize) -> Result<()> {
+         <dyn MappedRegion>::madvise(&self.mapping, mem_offset, count, libc::MADV_DONTNEED)
+     }
++    fn set_anon_name(&self, name: &std::ffi::CStr) -> Result<()> {
++        <dyn MappedRegion>::set_anon_name(&self.mapping, name)
++    }
+     fn remove_range(&self, mem_offset: usize, count: usize) -> Result<()> {
+         self.mapping.remove_range(mem_offset, count)
+     }
+diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
+index 1978c0ca..5846e253 100644
+--- a/src/crosvm/sys/linux.rs
++++ b/src/crosvm/sys/linux.rs
+@@ -1807,6 +1807,13 @@ fn create_guest_memory(
+         guest_mem
+             .apply_dontfork_to_private_regions()
+             .context("failed to mark private guest RAM MADV_DONTFORK")?;
++
++        // Name the private regions so host accounting recognises them as guest
++        // RAM. Best-effort: without CONFIG_ANON_VMA_NAME the request is a silent
++        // no-op and the regions stay matchable by their MADV_MERGEABLE VmFlag.
++        guest_mem
++            .apply_anon_name_to_private_regions(c"crosvm_guest_private")
++            .context("failed to name private guest RAM regions")?;
+     }
+ 
+     if cfg.unmap_guest_memory_on_fork {
+diff --git a/vm_memory/src/guest_memory/sys/linux.rs b/vm_memory/src/guest_memory/sys/linux.rs
+index 8850b7c4..52ba921b 100644
+--- a/vm_memory/src/guest_memory/sys/linux.rs
++++ b/vm_memory/src/guest_memory/sys/linux.rs
+@@ -213,6 +213,17 @@ impl GuestMemory {
+         }
+         Ok(())
+     }
++
++    /// Names descriptorless private RAM so host accounting can attribute it as
++    /// guest memory. Best-effort; see [`base::MappedRegion::set_anon_name`].
++    pub fn apply_anon_name_to_private_regions(&self, name: &std::ffi::CStr) -> anyhow::Result<()> {
++        for region in self.regions.iter() {
++            if matches!(&region.backing, BackingObject::PrivateAnonymous) {
++                region.mapping.set_anon_name(name)?;
++            }
++        }
++        Ok(())
++    }
+ }
+ 
+ impl FileBackedMappingParameters {
+-- 
+2.51.2
+

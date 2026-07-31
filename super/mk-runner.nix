@@ -1,4 +1,4 @@
-# Turn a NixOS configuration into a runnable SuperVM.
+# Turn a guest profile into a runnable SuperVM.
 #
 # `extendModules` layers the template over the caller's configuration without
 # the original having to anticipate it, so a caller brings a plain NixOS config
@@ -7,7 +7,7 @@
 {
   lib,
   templateModules,
-  defaultGuestFor,
+  defaultGuestConfigurationFor,
   guestKernelFor,
   vmPackagesModule,
 }:
@@ -27,12 +27,17 @@
 
   system ? "x86_64-linux",
 
-  # The guest defaults to the same system as its kernel, so the two cannot
-  # drift apart.
-  guest ? defaultGuestFor system,
+  # A null profile selects the built-in minimal guest for this system.
+  profile ? null,
 }:
 
 let
+  guestConfiguration =
+    if profile == null then
+      defaultGuestConfigurationFor system
+    else
+      import ../lib/guest-profile.nix profile;
+
   # `upperStoreDir` is host-side state owned by this API, not a NixOS option.
   # Reject a relative path here, before it is interpolated into microvm.volumes
   # and microvm.nix silently resolves it relative to its own state directory.
@@ -43,7 +48,7 @@ let
     else
       "a ${builtins.typeOf upperStoreDir}";
 
-  sys = guest.extendModules {
+  sys = guestConfiguration.extendModules {
     modules = [
       vmPackagesModule
     ]

@@ -9,9 +9,8 @@ usage: supervm prepare [--dax=MODE] [--profile=FLAKE#CONFIG] <upper-store-dir>
 
   --dax     DAX policy: never, inode, or always. Defaults to inode.
 
-  --profile NixOS configuration to boot, as a flake reference and
-            nixosConfigurations attribute. SuperVM merges its guest template
-            over it. Defaults to a minimal configuration.
+  --profile NixOS guest configuration to boot, as FLAKE#NAME. SuperVM merges
+            its guest template over it. Defaults to a minimal configuration.
 
   upper-store-dir
             Directory holding this VM's persistent private state. Created if
@@ -85,6 +84,7 @@ parse_arguments() {
     never | inode | always) ;;
     *) usage ;;
   esac
+  [[ -z ${profile} || ${profile} == ?*#?* ]] || usage
   ((${#positionals[@]} == 1)) || usage
   if [[ ${subcommand} == launch &&
     (${dax_set} == true || -n ${profile}) ]]; then
