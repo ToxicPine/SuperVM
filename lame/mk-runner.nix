@@ -6,21 +6,25 @@
 
 {
   microvm,
-  defaultGuestFor,
+  defaultGuestConfigurationFor,
   guestKernelFor,
 }:
 
 {
   system ? "x86_64-linux",
 
-  # As with SuperVM, callers supply a plain NixOS configuration. The
-  # microvm.nix module and baseline policy are layered over it here.
-  guest ? defaultGuestFor system,
+  # A null profile selects the built-in minimal guest for this system.
+  profile ? null,
 }:
 
 let
+  guestConfiguration =
+    if profile == null then
+      defaultGuestConfigurationFor system
+    else
+      import ../lib/guest-profile.nix profile;
   guestKernel = guestKernelFor system;
-  sys = guest.extendModules {
+  sys = guestConfiguration.extendModules {
     modules = [
       microvm.nixosModules.microvm
       (

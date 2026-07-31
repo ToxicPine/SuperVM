@@ -1,16 +1,13 @@
 # Package the small sourced modules that implement the SuperVM command.
 
 {
-  lib,
   writeText,
-  writeTextFile,
-  runtimeShell,
-  stdenv,
-  shellcheck,
+  writeShellApplication,
   nix,
   coreutils,
   util-linux,
   socat,
+  gawk,
   gnugrep,
   findutils,
   jq,
@@ -24,38 +21,25 @@ let
   prepare = writeText "supervm-prepare.sh" (builtins.readFile ./cli/prepare.sh);
   launch = writeText "supervm-launch.sh" (builtins.readFile ./cli/launch.sh);
 in
-writeTextFile {
+writeShellApplication {
   name = "supervm";
-  destination = "/bin/supervm";
-  executable = true;
-
-  checkPhase = ''
-    ${stdenv.shellDryRun} "$target"
-    ${lib.getExe shellcheck} \
-      --enable=all \
-      --external-sources \
-      --shell=bash \
-      "$target"
-  '';
-
+  runtimeInputs = [
+    nix
+    coreutils
+    util-linux
+    socat
+    gawk
+    gnugrep
+    findutils
+    jq
+    snix
+  ];
+  inheritPath = false;
+  extraShellCheckFlags = [
+    "--enable=all"
+    "--external-sources"
+  ];
   text = ''
-    #!${runtimeShell}
-    set -o errexit
-    set -o nounset
-    set -o pipefail
-
-    export PATH="${
-      lib.makeBinPath [
-        nix
-        coreutils
-        util-linux
-        socat
-        gnugrep
-        findutils
-        jq
-        snix
-      ]
-    }:''${PATH}"
     readonly SUPERVM_FLAKE=${self}
 
     source ${arguments}

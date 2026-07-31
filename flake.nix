@@ -37,22 +37,15 @@
           inherit nixpkgs system;
         };
 
-      vmPackagesOverlay =
-        _final: prev:
-        {
-          crosvm = crosvm-super.packages.${prev.stdenv.hostPlatform.system}.crosvm-super;
-        };
+      vmPackagesOverlay = _final: prev: {
+        crosvm = crosvm-super.packages.${prev.stdenv.hostPlatform.system}.crosvm-super;
+      };
 
       templateModules = import ./super/template.nix {
         overlayStoreModule = self.nixosModules.overlayStore;
         microvm = microvm-super;
       };
 
-      mkLameRunner = import ./lame/mk-runner.nix {
-        inherit defaultGuestFor;
-        guestKernelFor = system: self.packages.${system}.guest-kernel;
-        microvm = microvm-lame;
-      };
     in
     {
       packages = forAllSystems (
@@ -110,21 +103,26 @@
         };
       });
 
-      # Reachable so `supervm` can evaluate a composed guest at run time
-      # against these pinned inputs rather than an ambient nixpkgs. Its
-      # arguments are implementation detail and stay in the let above.
-      lib.mkSuperRunner = import ./super/mk-runner.nix {
-        inherit (nixpkgs) lib;
-        inherit templateModules defaultGuestFor;
-        guestKernelFor = system: self.packages.${system}.guest-kernel;
-        vmPackagesModule =
-          { lib, ... }:
-          {
-            nixpkgs.overlays = lib.mkAfter [ vmPackagesOverlay ];
-          };
-      };
+      # The prepare commands use this narrow evaluation API at run time so
+      # runner construction stays pinned to this flake's inputs.
+      lib = {
+        lamevm.mkRunner = import ./lame/mk-runner.nix {
+          defaultGuestConfigurationFor = defaultGuestFor;
+          guestKernelFor = system: self.packages.${system}.guest-kernel;
+          microvm = microvm-lame;
+        };
 
-      lib.mkLameRunner = mkLameRunner;
+        mkSuperRunner = import ./super/mk-runner.nix {
+          inherit (nixpkgs) lib;
+          inherit templateModules defaultGuestFor;
+          guestKernelFor = system: self.packages.${system}.guest-kernel;
+          vmPackagesModule =
+            { lib, ... }:
+            {
+              nixpkgs.overlays = lib.mkAfter [ vmPackagesOverlay ];
+            };
+        };
+      };
 
       devShells = forAllSystems (
         system:

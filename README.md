@@ -90,8 +90,16 @@ nix run .#supervm -- launch ./vm-a
 `lamevm` runs the same NixOS guest with mainline microvm.nix and nixpkgs crosvm:
 
 ```console
-nix run .#lamevm
-nix run .#lamevm -- --profile ./machines#web
+nix run .#lamevm -- prepare ./baseline-vm
+nix run .#lamevm -- launch ./baseline-vm
+```
+
+As with SuperVM, select a profile while preparing; `launch` reuses the prepared
+runner without evaluating it again:
+
+```console
+nix run .#lamevm -- prepare --profile ./machines#web ./baseline-web
+nix run .#lamevm -- launch ./baseline-web
 ```
 
 For a fair comparison, run multiple instances of each, since SuperVM's benefit
