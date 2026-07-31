@@ -39,7 +39,7 @@
 
       vmPackagesOverlay =
         _final: prev:
-        nixpkgs.lib.optionalAttrs (prev.stdenv.hostPlatform.system == "x86_64-linux") {
+        {
           crosvm = crosvm-super.packages.${prev.stdenv.hostPlatform.system}.crosvm-super;
         };
 
@@ -79,8 +79,7 @@
           # kernel's own `.override` with its own, and NixOS overrides kernels
           # with `features` while evaluating `microvm.kernel`.
           guest-kernel = guestKernel;
-        }
-        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+
           inherit (crosvm-super.packages.${system}) crosvm-super;
 
           guest-kernel-image-ranges = pkgs.callPackage ./super/kernel-image-ranges {
@@ -131,14 +130,22 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          crosvmSuper = crosvm-super.packages.${system}.crosvm-super;
+          crosvmSuperCli = pkgs.runCommand "crosvm-super-cli" { } ''
+            mkdir -p "$out/bin"
+            ln -s ${crosvmSuper}/bin/crosvm "$out/bin/crosvm-super"
+          '';
+          crosvmLameCli = pkgs.runCommand "crosvm-lame-cli" { } ''
+            mkdir -p "$out/bin"
+            ln -s ${pkgs.crosvm}/bin/crosvm "$out/bin/crosvm-lame"
+          '';
         in
         {
           default = pkgs.mkShell {
             packages = [
               snix.packages.${system}.snix
-            ]
-            ++ nixpkgs.lib.optionals (system == "x86_64-linux") [
-              crosvm-super.packages.${system}.crosvm-super
+              crosvmSuperCli
+              crosvmLameCli
             ];
           };
         }
