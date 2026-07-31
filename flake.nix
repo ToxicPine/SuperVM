@@ -26,12 +26,13 @@
       crosvm-super,
     }:
     let
+      sourceFlake = nixpkgs.legacyPackages.x86_64-linux.nix-gitignore.gitignoreSource [ "/bench/" ] ./.;
       systems = [
         "x86_64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
 
-      defaultGuestFor =
+      defaultGuestConfigurationFor =
         system:
         import ./super/default-guest.nix {
           inherit nixpkgs system;
@@ -61,11 +62,11 @@
 
           supervm = pkgs.callPackage ./super/supervm.nix {
             inherit (snix.packages.${system}) snix;
-            inherit self;
+            self = sourceFlake;
           };
 
           lamevm = pkgs.callPackage ./lame/lamevm.nix {
-            inherit self;
+            self = sourceFlake;
           };
 
           # Imported rather than callPackage'd: callPackage would replace the
@@ -107,14 +108,17 @@
       # runner construction stays pinned to this flake's inputs.
       lib = {
         lamevm.mkRunner = import ./lame/mk-runner.nix {
-          defaultGuestConfigurationFor = defaultGuestFor;
+          inherit defaultGuestConfigurationFor;
           guestKernelFor = system: self.packages.${system}.guest-kernel;
           microvm = microvm-lame;
         };
 
-        mkSuperRunner = import ./super/mk-runner.nix {
+        supervm.mkRunner = import ./super/mk-runner.nix {
           inherit (nixpkgs) lib;
-          inherit templateModules defaultGuestFor;
+          inherit
+            templateModules
+            defaultGuestConfigurationFor
+            ;
           guestKernelFor = system: self.packages.${system}.guest-kernel;
           vmPackagesModule =
             { lib, ... }:

@@ -23,6 +23,7 @@ let
 in
 writeShellApplication {
   name = "supervm";
+  passthru.sourceFlake = self;
   runtimeInputs = [
     nix
     coreutils

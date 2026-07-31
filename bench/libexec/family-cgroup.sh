@@ -58,9 +58,11 @@ create_family_cgroup() {
     systemctl show --property=ControlGroup --value "${FAMILY_CGROUP_SLICE}"
   )
   FAMILY_MEMORY_CURRENT_FILE="/sys/fs/cgroup${FAMILY_CGROUP_PATH}/memory.current"
+  FAMILY_MEMORY_PEAK_FILE="/sys/fs/cgroup${FAMILY_CGROUP_PATH}/memory.peak"
   FAMILY_MEMORY_PRESSURE_FILE="/sys/fs/cgroup${FAMILY_CGROUP_PATH}/memory.pressure"
   FAMILY_CPUSET_EFFECTIVE_FILE="/sys/fs/cgroup${FAMILY_CGROUP_PATH}/cpuset.cpus.effective"
   [[ -n ${FAMILY_CGROUP_PATH} && -r ${FAMILY_MEMORY_CURRENT_FILE} &&
+    -r ${FAMILY_MEMORY_PEAK_FILE} && -w ${FAMILY_MEMORY_PEAK_FILE} &&
     -r ${FAMILY_MEMORY_PRESSURE_FILE} &&
     -r ${FAMILY_CPUSET_EFFECTIVE_FILE} ]] ||
     fail "cgroup v2 memory and cpuset accounting is unavailable"
@@ -75,6 +77,7 @@ remove_family_cgroup() {
   FAMILY_CGROUP_SLICE=
   FAMILY_CGROUP_PATH=
   FAMILY_MEMORY_CURRENT_FILE=
+  FAMILY_MEMORY_PEAK_FILE=
   FAMILY_MEMORY_PRESSURE_FILE=
   FAMILY_CPUSET_EFFECTIVE_FILE=
   EFFECTIVE_CPU_IDS=

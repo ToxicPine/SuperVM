@@ -107,6 +107,14 @@ read_family_memory_current() {
   printf '%s\n' "$(<"${FAMILY_MEMORY_CURRENT_FILE}")"
 }
 
+read_family_memory_peak() {
+  printf '%s\n' "$(<"${FAMILY_MEMORY_PEAK_FILE}")"
+}
+
+reset_family_memory_peak() {
+  printf '0\n' >"${FAMILY_MEMORY_PEAK_FILE}"
+}
+
 read_host_available_memory() {
   awk '$1 == "MemAvailable:" { printf "%.0f\n", $2 * 1024 }' /proc/meminfo
 }
@@ -344,10 +352,9 @@ stop_last_instance() {
   systemctl stop "${unit}" 2>/dev/null || true
   systemctl kill --kill-whom=all --signal=KILL "${unit}" 2>/dev/null || true
   benchmark_variant_remove_instance "${INSTANCE_TAP_NAMES[${last}]}"
-  unset 'LAUNCHER_PIDS[last]' 'VMM_PIDS[last]' 'INSTANCE_IP_ADDRESSES[last]'
+  unset 'LAUNCHER_PIDS[last]' 'INSTANCE_IP_ADDRESSES[last]'
   unset 'INSTANCE_TAP_NAMES[last]' 'INSTANCE_UNIT_NAMES[last]'
   LAUNCHER_PIDS=("${LAUNCHER_PIDS[@]}")
-  VMM_PIDS=("${VMM_PIDS[@]}")
   INSTANCE_IP_ADDRESSES=("${INSTANCE_IP_ADDRESSES[@]}")
   INSTANCE_TAP_NAMES=("${INSTANCE_TAP_NAMES[@]}")
   INSTANCE_UNIT_NAMES=("${INSTANCE_UNIT_NAMES[@]}")
@@ -412,7 +419,6 @@ launch_instance() {
   local unit
   local main_pid
   local vmm
-  local runner
   local -a command=()
 
   index=$((${#LAUNCHER_PIDS[@]} + 1))
@@ -425,8 +431,11 @@ launch_instance() {
   PENDING_INSTANCE_TAP_NAME=${INSTANCE_TAP_NAME}
 
   if [[ ${family} == lamevm ]]; then
-    runner=$(readlink -f "${instance}/runner")
-    command+=("${runner}/bin/microvm-run")
+    command+=(
+      "${LAMEVM_LAUNCHER}"
+      launch
+      "${instance}"
+    )
   else
     command+=(
       "${SUPERVM_LAUNCHER}"
@@ -464,23 +473,20 @@ launch_instance() {
   PENDING_INSTANCE_UNIT=
   vmm=$(wait_for_vmm_pid "${main_pid}")
   assert_process_in_family_cgroup "${vmm}" "VMM"
-  VMM_PIDS+=("${vmm}")
   benchmark_variant_wait_ready "${INSTANCE_IP_ADDRESS}"
 }
 
 record_process_memory() {
   local count=${#LAUNCHER_PIDS[@]}
-  local position
-  local mappings
+  local cgroup_root="/sys/fs/cgroup${FAMILY_CGROUP_PATH}"
+  local dax_backing_dir="${FAMILY_OUTPUT_DIR}/state/supervm/dax-backing"
 
-  for position in "${!LAUNCHER_PIDS[@]}"; do
-    mappings=$(
-      "${PROCESS_MEMORY_REPORTER}" "${LAUNCHER_PIDS[${position}]}"
-    )
-    printf '%s\t%s\t%s\t%s\n' \
-      "${count}" "$((position + 1))" "${VMM_PIDS[${position}]}" \
-      "${mappings}" >>"${PROCESS_MEMORY_FILE}"
-  done
+  "${PROCESS_MEMORY_REPORTER}" \
+    "${cgroup_root}" \
+    "${dax_backing_dir}" \
+    "${count}" \
+    "${CGROUP_MEMORY_FILE}" \
+    "${PROCESS_MEMORY_FILE}"
 }
 
 record_checkpoint() {
@@ -525,8 +531,7 @@ record_checkpoint() {
     UNMERGED_POST_LOAD_TOTAL_BYTES=0
   ((POST_LOAD_TOTAL_BYTES >= 0)) || POST_LOAD_TOTAL_BYTES=0
 
-  unmerged_peak=${unmerged_idle}
-  ((unmerged_post <= unmerged_peak)) || unmerged_peak=${unmerged_post}
+  unmerged_peak=$(read_family_memory_peak)
   UNMERGED_PEAK_TOTAL_BYTES=$((unmerged_peak - FAMILY_CGROUP_BASELINE_BYTES))
   ((UNMERGED_PEAK_TOTAL_BYTES >= 0)) || UNMERGED_PEAK_TOTAL_BYTES=0
   TOTAL_BYTES=${POST_LOAD_TOTAL_BYTES}
@@ -559,6 +564,7 @@ record_checkpoint() {
       "${MEMORY_OOM_KILL_EVENT_COUNT}" >>"${CHECKPOINTS_FILE}"
   fi
   record_process_memory
+  reset_family_memory_peak
 }
 
 launch_instance_batch() {
@@ -598,11 +604,11 @@ run_family() {
   benchmark_objective_prepare_family
   FAMILY_OUTPUT_DIR="${OUTPUT_DIR}/${family}"
   CHECKPOINTS_FILE="${FAMILY_OUTPUT_DIR}/checkpoints.tsv"
+  CGROUP_MEMORY_FILE="${FAMILY_OUTPUT_DIR}/cgroup-memory.tsv"
   PROCESS_MEMORY_FILE="${FAMILY_OUTPUT_DIR}/process-memory.tsv"
   mkdir -p "${FAMILY_OUTPUT_DIR}"/{instances,logs,prepare-logs,runtime,state}
   create_family_runtime_path "${family}"
   LAUNCHER_PIDS=()
-  VMM_PIDS=()
   INSTANCE_IP_ADDRESSES=()
   INSTANCE_TAP_NAMES=()
   INSTANCE_UNIT_NAMES=()
@@ -617,10 +623,13 @@ run_family() {
     printf 'instance_count\tunmerged_bytes\tsettled_bytes\thost_available_bytes\thost_memory_psi_some_total_us\thost_memory_psi_full_total_us\tcgroup_memory_psi_some_total_us\tcgroup_memory_psi_full_total_us\tksm_pages_shared\tksm_pages_sharing\tksm_full_scans\tmemory_high_events\tmemory_oom_events\tmemory_oom_kill_events\n' \
       >"${CHECKPOINTS_FILE}"
   fi
-  printf 'instance_count\tinstance_index\tvmm_pid\tguest_memfd_pss_bytes\tdax_pss_bytes\tother_crosvm_pss_bytes\tcrosvm_pss_bytes\tprocess_tree_pss_bytes\n' \
+  printf 'instance_count\tcgroup_memory_current_bytes\tcgroup_memory_peak_bytes\tcgroup_anon_bytes\tcgroup_file_total_bytes\tcgroup_shmem_within_file_bytes\tcgroup_kernel_total_bytes\tcgroup_slab_within_kernel_bytes\tcgroup_pagetables_within_kernel_bytes\tcgroup_sock_within_kernel_bytes\n' \
+    >"${CGROUP_MEMORY_FILE}"
+  printf 'instance_count\tpid\tinstance_index\tscope\tprocess_role\tprocess_cgroup\texecutable\tguest_memfd_rss_bytes\tguest_memfd_pss_bytes\tdax_rss_bytes\tdax_pss_bytes\tother_rss_bytes\tother_pss_bytes\n' \
     >"${PROCESS_MEMORY_FILE}"
 
   FAMILY_CGROUP_BASELINE_BYTES=$(median_family_memory_current)
+  reset_family_memory_peak
   baseline_host_pressure_some=$(read_pressure_total /proc/pressure/memory some)
   baseline_host_pressure_full=$(read_pressure_total /proc/pressure/memory full)
   baseline_cgroup_pressure_some=$(
@@ -725,13 +734,14 @@ run_benchmark() {
     fail "benchmark objective did not set BENCHMARK_OBJECTIVE"
   local libexec_dir
   local benchmark_dir
-  local supervm_package
   local command
   local family
   local -a families=()
 
   libexec_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
   benchmark_dir=$(cd -- "${libexec_dir}/.." && pwd)
+  SUPERVM_LAUNCHER=${SUPERVM_LAUNCHER:-supervm}
+  LAMEVM_LAUNCHER=${LAMEVM_LAUNCHER:-lamevm}
   TARGET_CPU_IDS=
   OUTPUT_DIR=
   SELECTED_FAMILY=both
@@ -752,10 +762,12 @@ run_benchmark() {
   esac
 
   for command in \
-    awk env fadvise find flock ln nix pgrep readlink realpath sed sha256sum sort \
+    awk env fadvise find flock ln pgrep readlink realpath sed sha256sum sort \
     sync systemctl systemd-run tr uname unlink; do
     require_command "${command}"
   done
+  require_command "${SUPERVM_LAUNCHER}"
+  require_command "${LAMEVM_LAUNCHER}"
   [[ -r /proc/pressure/memory ]] ||
     fail "kernel memory pressure accounting is unavailable"
   benchmark_variant_requirements
@@ -770,27 +782,15 @@ run_benchmark() {
   mkdir -p "${OUTPUT_DIR}"
   [[ ! -e ${OUTPUT_DIR}/lamevm && ! -e ${OUTPUT_DIR}/supervm ]] ||
     fail "output already contains benchmark data"
-  BENCHMARK_FLAKE="path:${benchmark_dir}"
-  SUPERVM_SOURCE_FLAKE="path:${benchmark_dir}/.."
+  [[ -n ${BENCHMARK_PROFILE_FLAKE:-} ]] ||
+    fail "benchmark profile flake is not configured; run through a packaged benchmark app"
   PROCESS_MEMORY_REPORTER="${libexec_dir}/process-memory-report.sh"
   HOST_RESERVE_BYTES=$((2 * 1024 * 1024 * 1024))
   KSM_SYSFS_DIR=/sys/kernel/mm/ksm
   KSM_TIMEOUT_SECONDS=600
   MEMORY_STABILITY_TIMEOUT_SECONDS=180
 
-  supervm_package=$(
-    nix build \
-      --override-input supervm "${SUPERVM_SOURCE_FLAKE}" \
-      --no-write-lock-file \
-      --no-link \
-      --print-out-paths \
-      "${benchmark_dir}#supervm"
-  )
-  SUPERVM_LAUNCHER="${supervm_package}/bin/supervm"
-  [[ -x ${SUPERVM_LAUNCHER} ]] || fail "SuperVM launcher build failed"
-
   declare -ga LAUNCHER_PIDS=()
-  declare -ga VMM_PIDS=()
   declare -ga INSTANCE_IP_ADDRESSES=()
   declare -ga INSTANCE_TAP_NAMES=()
   declare -ga INSTANCE_UNIT_NAMES=()
@@ -802,6 +802,7 @@ run_benchmark() {
   FAMILY_OUTPUT_DIR=
   FAMILY_RUNTIME_DIR=
   CHECKPOINTS_FILE=
+  CGROUP_MEMORY_FILE=
   PROCESS_MEMORY_FILE=
   FAMILY_CGROUP_BASELINE_BYTES=0
   TOTAL_BYTES=0
@@ -830,6 +831,7 @@ run_benchmark() {
   FAMILY_CGROUP_SLICE=
   FAMILY_CGROUP_PATH=
   FAMILY_MEMORY_CURRENT_FILE=
+  FAMILY_MEMORY_PEAK_FILE=
   FAMILY_MEMORY_PRESSURE_FILE=
   FAMILY_CPUSET_EFFECTIVE_FILE=
   EFFECTIVE_CPU_IDS=
@@ -870,6 +872,7 @@ run_benchmark() {
         "$(< /sys/kernel/mm/transparent_hugepage/enabled)"
     fi
     printf 'supervm=%s\n' "${SUPERVM_LAUNCHER}"
+    printf 'lamevm=%s\n' "${LAMEVM_LAUNCHER}"
   } >"${OUTPUT_DIR}/environment.txt"
 
   benchmark_objective_prepare_output

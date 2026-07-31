@@ -4,6 +4,16 @@ load_prepared_runner() {
   runner=$(readlink -f "${prepared_runner_root}")
 }
 
+warn_if_ksm_disabled() {
+  local run_file=/sys/kernel/mm/ksm/run
+
+  if [[ ! -r ${run_file} ]]; then
+    echo "supervm: warning: KSM is unavailable; some guest memory will not be deduplicated" >&2
+  elif [[ $(<"${run_file}") != 1 ]]; then
+    echo "supervm: warning: KSM is disabled; some guest memory will not be deduplicated" >&2
+  fi
+}
+
 reap_orphaned_runtime() {
   local process_dir
   local pid
@@ -81,6 +91,7 @@ run_launch() {
   local status
 
   load_prepared_runner
+  warn_if_ksm_disabled
   start_shared_services true
 
   echo "supervm: vm ${vm_id} (cid ${vsock_cid})"
