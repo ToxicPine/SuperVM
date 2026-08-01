@@ -13,9 +13,11 @@ from matplotlib.ticker import MultipleLocator
 
 VM_LABELS = ("SuperVM", "LameVM")
 Y_POSITIONS = (1, 0)
-COLORS = ("#4c78a8", "#dbe5ef", "#c56f32", "#f1d6c2", "#72a57a")
-EDGE_COLORS = ("#355878", "#5d7f9f", "#82451f", "#a56335", "#47704e")
-HATCHES = (None, "////", "\\\\\\\\", "....", "xxxx")
+BAR_HUE = 245.0
+BAR_COLOR_START_OKLCH = (0.78, 0.08, BAR_HUE)
+BAR_COLOR_END_OKLCH = (0.50, 0.12, BAR_HUE)
+BAR_EDGE_LIGHTNESS_OFFSET = 0.12
+BAR_EDGE_CHROMA_SCALE = 0.75
 
 
 def non_negative_number(value: str) -> float:
@@ -51,10 +53,19 @@ def parse_args() -> argparse.Namespace:
         help="plot cumulative totals or marginal memory per added VM",
     )
     parser.add_argument(
+        "--results",
+        type=Path,
+        nargs="+",
+        metavar="DIR",
+        help=(
+            "benchmark output directories; totals are read from each "
+            "directory's summary.tsv instead of being typed by hand"
+        ),
+    )
+    parser.add_argument(
         "--vm-counts",
         type=positive_integer,
         nargs="+",
-        required=True,
         metavar="COUNT",
         help="strictly increasing VM counts, in result order",
     )
@@ -62,7 +73,6 @@ def parse_args() -> argparse.Namespace:
         "--supervm",
         type=non_negative_number,
         nargs="+",
-        required=True,
         metavar="MIB",
         help="cumulative SuperVM deployment MiB matching --vm-counts",
     )
@@ -70,7 +80,6 @@ def parse_args() -> argparse.Namespace:
         "--lamevm",
         type=non_negative_number,
         nargs="+",
-        required=True,
         metavar="MIB",
         help="cumulative LameVM deployment MiB matching --vm-counts",
     )
@@ -91,7 +100,72 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+FAMILY_COLUMNS = ("family", "arm")
+COUNT_COLUMNS = ("instance_count", "instances")
+
+
+def read_summary(path: Path, totals: dict[str, dict[int, float]]) -> None:
+    """Accumulate one summary.tsv's per-family cumulative totals, in MiB."""
+    lines = path.read_text().splitlines()
+    if not lines:
+        raise SystemExit(f"{path}: empty summary")
+    header = lines[0].split("\t")
+    try:
+        family_field = next(i for i, n in enumerate(header) if n in FAMILY_COLUMNS)
+        count_field = next(i for i, n in enumerate(header) if n in COUNT_COLUMNS)
+        total_field = header.index("total_bytes")
+    except (StopIteration, ValueError):
+        raise SystemExit(f"{path}: unrecognized summary header: {lines[0]}") from None
+    for line in lines[1:]:
+        row = line.split("\t")
+        family = row[family_field]
+        if family not in totals:
+            raise SystemExit(f"{path}: unknown family {family!r}")
+        count = int(row[count_field])
+        total_mib = float(row[total_field]) / (1024 * 1024)
+        recorded = totals[family].setdefault(count, total_mib)
+        if recorded != total_mib:
+            raise SystemExit(
+                f"{path}: conflicting totals for {family} at {count} VMs: "
+                f"{recorded:.1f} vs {total_mib:.1f} MiB"
+            )
+
+
+def load_results(args: argparse.Namespace) -> None:
+    """Fill the measurement arguments from summary.tsv files."""
+    totals: dict[str, dict[int, float]] = {"supervm": {}, "lamevm": {}}
+    for directory in args.results:
+        summary = directory / "summary.tsv"
+        if not summary.is_file():
+            raise SystemExit(f"{directory}: no summary.tsv")
+        read_summary(summary, totals)
+    counts = sorted(set(totals["supervm"]) & set(totals["lamevm"]))
+    if not counts:
+        raise SystemExit(
+            "the summaries hold no VM count measured for both families"
+        )
+    unpaired = sorted(set(totals["supervm"]) ^ set(totals["lamevm"]))
+    if unpaired:
+        print(
+            "note: ignoring counts measured for only one family: "
+            + ", ".join(str(count) for count in unpaired)
+        )
+    args.vm_counts = counts
+    args.supervm = [totals["supervm"][count] for count in counts]
+    args.lamevm = [totals["lamevm"][count] for count in counts]
+
+
 def validate_inputs(args: argparse.Namespace) -> None:
+    if args.results is not None:
+        if args.vm_counts or args.supervm or args.lamevm:
+            raise SystemExit(
+                "--results replaces --vm-counts, --supervm, and --lamevm"
+            )
+        load_results(args)
+    elif not (args.vm_counts and args.supervm and args.lamevm):
+        raise SystemExit(
+            "provide --results, or all of --vm-counts, --supervm, and --lamevm"
+        )
     result_count = len(args.vm_counts)
     if any(
         current <= previous
@@ -130,9 +204,109 @@ def tick_spacing(extent: float) -> float:
     return multiplier * magnitude
 
 
+def normalize_oklch(
+    color: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Validate OKLCH components and normalize hue to [0, 360)."""
+    lightness, chroma, hue = color
+    if not all(math.isfinite(component) for component in color):
+        raise ValueError("OKLCH components must be finite")
+    if not 0 <= lightness <= 1:
+        raise ValueError("OKLCH lightness must be between 0 and 1")
+    if chroma < 0:
+        raise ValueError("OKLCH chroma must be non-negative")
+    return lightness, chroma, hue % 360
+
+
+def interpolate_oklch(
+    start: tuple[float, float, float],
+    end: tuple[float, float, float],
+    position: float,
+) -> tuple[float, float, float]:
+    """Interpolate OKLCH components using the shorter hue arc."""
+    start_lightness, start_chroma, start_hue = normalize_oklch(start)
+    end_lightness, end_chroma, end_hue = normalize_oklch(end)
+    hue_delta = (end_hue - start_hue + 180) % 360 - 180
+    return normalize_oklch(
+        (
+            start_lightness + (end_lightness - start_lightness) * position,
+            start_chroma + (end_chroma - start_chroma) * position,
+            start_hue + hue_delta * position,
+        )
+    )
+
+
+def oklch_to_srgb(color: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Convert OKLCH to sRGB using the Oklab reference matrices."""
+    lightness, chroma, hue = normalize_oklch(color)
+    hue_radians = math.radians(hue)
+    lab_a = chroma * math.cos(hue_radians)
+    lab_b = chroma * math.sin(hue_radians)
+
+    light = lightness + 0.3963377774 * lab_a + 0.2158037573 * lab_b
+    medium = lightness - 0.1055613458 * lab_a - 0.0638541728 * lab_b
+    short = lightness - 0.0894841775 * lab_a - 1.2914855480 * lab_b
+
+    light = light**3
+    medium = medium**3
+    short = short**3
+    linear_rgb = (
+        4.0767416621 * light - 3.3077115913 * medium + 0.2309699292 * short,
+        -1.2684380046 * light + 2.6097574011 * medium - 0.3413193965 * short,
+        -0.0041960863 * light - 0.7034186147 * medium + 1.7076147010 * short,
+    )
+    if not all(0 <= channel <= 1 for channel in linear_rgb):
+        raise ValueError(f"OKLCH color {color!r} is outside the sRGB gamut")
+
+    def encode(channel: float) -> float:
+        magnitude = abs(channel)
+        encoded = (
+            12.92 * channel
+            if magnitude <= 0.0031308
+            else math.copysign(
+                1.055 * magnitude ** (1 / 2.4) - 0.055,
+                channel,
+            )
+        )
+        return encoded
+
+    return tuple(encode(channel) for channel in linear_rgb)
+
+
+def series_colors(
+    series_count: int,
+) -> list[
+    tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ]
+]:
+    """Return coordinated fill and edge colors for each VM-count series."""
+    if series_count == 1:
+        positions = (0.5,)
+    else:
+        positions = tuple(index / (series_count - 1) for index in range(series_count))
+
+    palette = []
+    for position in positions:
+        fill = interpolate_oklch(
+            BAR_COLOR_START_OKLCH,
+            BAR_COLOR_END_OKLCH,
+            position,
+        )
+        lightness, chroma, hue = fill
+        edge = (
+            lightness - BAR_EDGE_LIGHTNESS_OFFSET,
+            chroma * BAR_EDGE_CHROMA_SCALE,
+            hue,
+        )
+        palette.append((oklch_to_srgb(fill), oklch_to_srgb(edge)))
+    return palette
+
+
 def mode_settings(args: argparse.Namespace) -> tuple[str, str, Path]:
     if args.mode == "cumulative":
-        title = "Total Cumulative Memory Consumption"
+        title = "Aggregate Memory Usage by VM Count"
         x_label = "Cumulative Memory (MiB)"
     else:
         title = "Marginal Memory Consumption per VM"
@@ -190,20 +364,27 @@ def main() -> None:
     figure.subplots_adjust(left=0.18, right=0.78, top=0.82, bottom=0.20)
 
     result_count = len(args.vm_counts)
-    bar_height = min(0.30, 0.72 / result_count)
+    group_span = 0.72
+    bar_gap = min(0.035, group_span / (result_count * 5))
+    bar_height = min(
+        0.30,
+        (group_span - bar_gap * (result_count - 1)) / result_count,
+    )
+    bar_step = bar_height + bar_gap
+    palette = series_colors(result_count)
     bar_groups = []
     for index, vm_count in enumerate(args.vm_counts):
-        offset = ((result_count - 1) / 2 - index) * bar_height
+        offset = ((result_count - 1) / 2 - index) * bar_step
         values = (supervm_values[index], lamevm_values[index])
+        fill_color, edge_color = palette[index]
         bars = axis.barh(
             [position + offset for position in Y_POSITIONS],
             values,
             height=bar_height,
             label=f"{vm_count} {'VM' if vm_count == 1 else 'VMs'}",
-            color=COLORS[index % len(COLORS)],
-            edgecolor=EDGE_COLORS[index % len(EDGE_COLORS)],
-            linewidth=0.7,
-            hatch=HATCHES[index % len(HATCHES)],
+            color=fill_color,
+            edgecolor=edge_color,
+            linewidth=0.4,
             zorder=3,
         )
         bar_groups.append((bars, values))

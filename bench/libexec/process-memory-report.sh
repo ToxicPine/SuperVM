@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (($# != 5)); then
-  printf 'usage: %s CGROUP_ROOT DAX_BACKING_DIR INSTANCE_COUNT CGROUP_OUTPUT PROCESS_OUTPUT\n' \
+if (($# != 6)); then
+  printf 'usage: %s CGROUP_ROOT DAX_BACKING_DIR METADATA_INDEX INSTANCE_COUNT CGROUP_OUTPUT PROCESS_OUTPUT\n' \
     "$0" >&2
   exit 2
 fi
@@ -87,7 +87,9 @@ read_cgroup_memory_stat() {
 read_mapping_memory() {
   local smaps=$1
 
-  awk -v dax_backing_dir="${DAX_BACKING_DIR}" '
+  awk \
+    -v dax_backing_dir="${DAX_BACKING_DIR}" \
+    -v metadata_index="${METADATA_INDEX}" '
     function commit_mapping() {
       if (!mapping_open) {
         return
@@ -124,6 +126,8 @@ read_mapping_memory() {
         mapping_kind = "guest"
       } else if (dax_backing_dir != "" && index($0, dax_backing_dir) != 0) {
         mapping_kind = "dax"
+      } else if (metadata_index != "" && index($0, metadata_index) != 0) {
+        mapping_kind = "metadata-index"
       }
       # A named private range carries the pathname [anon:crosvm_guest_private]
       # (so it is not pathless); the mg fallback covers unnamed ranges. A
@@ -148,10 +152,11 @@ read_mapping_memory() {
     }
     END {
       commit_mapping()
-      printf "%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\n",
+      printf "%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\n",
         rss["guest"], pss["guest"],
         rss["guest-private"], pss["guest-private"],
         rss["dax"], pss["dax"],
+        rss["metadata-index"], pss["metadata-index"],
         rss["other"], pss["other"]
     }
   ' "${smaps}"
@@ -163,13 +168,16 @@ classify_process() {
 
   if [[ ${executable} == */crosvm ]]; then
     PROCESS_ROLE=vmm
-  elif [[ ${command_line} == *"snix store virtiofs"* ]]; then
+  elif [[ ${command_line} == *"snix store virtiofs"* ||
+    ${command_line} == *"snix-store virtiofs"* ]]; then
     PROCESS_ROLE=virtiofs
-  elif [[ ${command_line} == *"snix store daemon"* ]]; then
+  elif [[ ${command_line} == *"snix store daemon"* ||
+    ${command_line} == *"snix-store daemon"* ]]; then
     PROCESS_ROLE=shared-store-daemon
-  elif [[ ${command_line} == *"snix nix-daemon"* ]]; then
+  elif [[ ${command_line} == *"snix nix-daemon"* ||
+    ${command_line} == *"snix-nix-daemon"* ]]; then
     PROCESS_ROLE=shared-nix-daemon
-  elif [[ ${executable} == */socat ]]; then
+  elif [[ ${executable} == */socat || ${executable} == */socat1 ]]; then
     PROCESS_ROLE=shared-metadata-bridge
   elif [[ ${command_line} == *"/bin/supervm"* ||
     ${command_line} == *"/bin/lamevm"* ]]; then
@@ -199,9 +207,10 @@ classify_scope() {
 
 CGROUP_ROOT=$1
 DAX_BACKING_DIR=$2
-INSTANCE_COUNT=$3
-CGROUP_MEMORY_FILE=$4
-PROCESS_MEMORY_FILE=$5
+METADATA_INDEX=$3
+INSTANCE_COUNT=$4
+CGROUP_MEMORY_FILE=$5
+PROCESS_MEMORY_FILE=$6
 CGROUP_IS_FROZEN=false
 PROCESS_ROLE=
 PROCESS_SCOPE=
@@ -253,16 +262,18 @@ while read -r pid; do
     guest_rss_bytes guest_pss_bytes \
     guest_private_rss_bytes guest_private_pss_bytes \
     dax_rss_bytes dax_pss_bytes \
+    metadata_index_rss_bytes metadata_index_pss_bytes \
     other_rss_bytes other_pss_bytes <<<"${row}"
 
   printf -v process_row \
-    '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "${INSTANCE_COUNT}" "${pid}" "${INSTANCE_INDEX}" \
     "${PROCESS_SCOPE}" "${PROCESS_ROLE}" \
     "${process_cgroup}" "${executable}" \
     "${guest_rss_bytes}" "${guest_pss_bytes}" \
     "${guest_private_rss_bytes}" "${guest_private_pss_bytes}" \
     "${dax_rss_bytes}" "${dax_pss_bytes}" \
+    "${metadata_index_rss_bytes}" "${metadata_index_pss_bytes}" \
     "${other_rss_bytes}" "${other_pss_bytes}"
   process_rows+=("${process_row}")
 done <<<"${pids}"

@@ -69,8 +69,13 @@ start_vm_filesystem() {
   echo "supervm: starting lower-store filesystem (tag ${lower_store_tag})"
   # This daemon runs once per VM, so its idle footprint multiplies. Two
   # runtime workers are plenty for one guest's request stream, and immediate
-  # purging stops the allocator from retaining boot-burst memory.
-  MIMALLOC_PURGE_DELAY=0 TOKIO_WORKER_THREADS=2 \
+  # purging stops the allocator from retaining boot-burst memory. Purging
+  # only works if the allocator's arena stays on ordinary pages: left to
+  # advise MADV_HUGEPAGE, mimalloc treats the arena as hugepage-backed and
+  # never purges it, so whenever the kernel obliges with 2 MiB pages the
+  # boot-burst peak (~16 MiB) stays resident for the life of the VM.
+  MIMALLOC_ALLOW_LARGE_OS_PAGES=0 MIMALLOC_PURGE_DELAY=0 \
+    TOKIO_WORKER_THREADS=2 \
     snix store virtiofs \
     --dax-backing-dir "${state_dir}/dax-backing" \
     --tag "${lower_store_tag}" \

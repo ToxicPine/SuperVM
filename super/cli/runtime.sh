@@ -117,10 +117,12 @@ ensure_castore() {
 
   stop_service store "${store_socket}"
   echo "supervm: starting shared castore daemon"
-  # Immediate purging returns memory retained after boot bursts. Worker
-  # threads stay unrestricted: this daemon is shared, so throughput matters
-  # more than one instance's thread cost.
-  MIMALLOC_PURGE_DELAY=0 \
+  # Immediate purging returns memory retained after boot bursts, and only
+  # works on ordinary pages: a MADV_HUGEPAGE arena is exempted from purging
+  # by mimalloc, so hugepages are declined. Worker threads stay
+  # unrestricted: this daemon is shared, so throughput matters more than
+  # one instance's thread cost.
+  MIMALLOC_ALLOW_LARGE_OS_PAGES=0 MIMALLOC_PURGE_DELAY=0 \
     snix store daemon -l "${store_socket}" --unix-listen-unlink \
     --blob-service-addr "objectstore+file:${castore}/blobs" \
     --directory-service-addr "redb:${castore}/directories.redb" \
@@ -130,12 +132,87 @@ ensure_castore() {
   wait_for_service store "${identity}" "${store_socket}"
 }
 
+build_metadata_index() {
+  echo "supervm: building shared metadata index"
+  : >"${metadata_index_dirty}"
+  flock 7
+  if ! snix store index "${metadata_index}"; then
+    flock -u 7
+    return 1
+  fi
+  if ! refresh_metadata_index_closures; then
+    flock -u 7
+    return 1
+  fi
+  flock -u 7
+  rm -f "${metadata_index_dirty}"
+}
+
+refresh_metadata_index_closures() {
+  local temporary="${metadata_index_closures}.tmp.$$"
+
+  find "${imported_closures_dir}" -mindepth 1 -maxdepth 1 \
+    -type f -name '*.closure' -printf '%f\n' |
+    sort >"${temporary}" || return 1
+  mv -f "${temporary}" "${metadata_index_closures}"
+}
+
+metadata_index_covers_closure() {
+  local closure_id=$1
+
+  metadata_index_covers_closure_result=false
+  [[ -s ${metadata_index} && ! -e ${metadata_index_dirty} &&
+    -r ${metadata_index_closures} ]] || return 0
+  if grep -Fxq "${closure_id}.closure" "${metadata_index_closures}"; then
+    metadata_index_covers_closure_result=true
+  fi
+}
+
+metadata_index_has_other_lease() {
+  local candidate
+
+  metadata_index_has_other_lease_result=false
+  for candidate in "${leases_dir}"/*; do
+    [[ -e ${candidate} ]] || continue
+    if [[ ${candidate} != "${lease}" ]]; then
+      metadata_index_has_other_lease_result=true
+      return
+    fi
+  done
+}
+
+ensure_metadata_index() {
+  metadata_index_has_other_lease
+  if [[ ! -s ${metadata_index} ]] ||
+    [[ -e ${metadata_index_dirty} &&
+      ${metadata_index_has_other_lease_result} == false ]]; then
+    build_metadata_index
+  fi
+}
+
+update_metadata_index_after_prepare() {
+  flock 8
+  prune_leases
+  metadata_index_has_other_lease
+  if [[ ${metadata_index_has_other_lease_result} == true ]]; then
+    # Replacing the file while daemons map it would pin one immutable tmpfs
+    # generation per cohort. Keep their generation stable; new roots use the
+    # inode overlay until the next operation can rebuild the index exclusively.
+    : >"${metadata_index_dirty}"
+    echo "supervm: deferring metadata index rebuild while VMs are running"
+  elif ! build_metadata_index; then
+    flock -u 8
+    fail "could not build the shared metadata index"
+  fi
+  flock -u 8
+}
+
 ensure_lower_store() {
   service_healthy lower "${lower_meta_socket}" "${lower_meta_socket}"
   if [[ ${service_healthy_result} != true ]]; then
     stop_service lower "${lower_meta_socket}"
     echo "supervm: starting shared lower-store daemon"
-    MIMALLOC_PURGE_DELAY=0 \
+    MIMALLOC_ALLOW_LARGE_OS_PAGES=0 MIMALLOC_PURGE_DELAY=0 \
       snix nix-daemon -l "${lower_meta_socket}" --unix-listen-unlink \
       --unix-listen-chmod everybody >"${runtime_dir}/lower.log" 2>&1 &
     write_pid_file lower "$!"
@@ -219,6 +296,10 @@ bind_runtime_state() {
     stop_shared_services_if_idle
   fi
   if [[ ${active_state} != "${state_dir}" ]]; then
+    rm -f "${metadata_index}" "${metadata_index_dirty}" \
+      "${metadata_index_closures}"
+    find "${imported_closures_dir}" -mindepth 1 -maxdepth 1 \
+      -type f -name '*.closure' -delete
     temporary="${runtime_state_file}.tmp.$$"
     printf '%s\n' "${state_dir}" >"${temporary}"
     mv -f "${temporary}" "${runtime_state_file}"
@@ -259,6 +340,8 @@ cleanup() {
     rm -f "${lower_store_fs_socket}" "${crosvm_control_socket}"
   fi
   [[ -z ${refs} ]] || rm -f "${refs}"
+  [[ -z ${pending_closure_marker} ]] ||
+    rm -f "${pending_closure_marker}"
   rm -f "${temporary_runner_root}"
   if [[ ${lease_active} == true ]]; then
     flock 8
@@ -271,16 +354,40 @@ cleanup() {
 }
 
 initialize() {
+  local runtime_fs_type
+
   upper_store_dir=$(realpath -m "${positionals[0]}")
-  runtime_dir=${XDG_RUNTIME_DIR:-/tmp}/supervm
+  if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+    runtime_dir=${XDG_RUNTIME_DIR}/supervm
+  elif [[ -d /dev/shm && -w /dev/shm ]]; then
+    runtime_dir=/dev/shm/supervm-${UID}
+  else
+    fail "XDG_RUNTIME_DIR is unset and no writable /dev/shm tmpfs is available"
+  fi
+  mkdir -p "${runtime_dir}"
+  [[ -d ${runtime_dir} && ! -L ${runtime_dir} && -O ${runtime_dir} ]] ||
+    fail "the SuperVM runtime must be a directory owned by the current user: ${runtime_dir}"
+  chmod 700 "${runtime_dir}"
+  runtime_fs_type=$(findmnt -n -o FSTYPE -T "${runtime_dir}" 2>/dev/null) ||
+    fail "could not identify the filesystem backing ${runtime_dir}"
+  [[ ${runtime_fs_type} == tmpfs ]] ||
+    fail "the SuperVM runtime must be on tmpfs, but ${runtime_dir} is ${runtime_fs_type}"
+
   state_dir=${XDG_STATE_HOME:-${HOME}/.local/state}/supervm
   castore="${state_dir}/castore"
   leases_dir="${runtime_dir}/leases"
   store_socket="${runtime_dir}/store.sock"
   lower_meta_socket="${runtime_dir}/lower.sock"
   services_lock="${runtime_dir}/services.lock"
+  metadata_index_lock="${runtime_dir}/metadata-index.lock"
+  # Keep the format generation in the filename so a future incompatible Snix
+  # index cannot be mistaken for the current SNIXMIX1 layout.
+  metadata_index="${runtime_dir}/metadata.v1.index"
+  metadata_index_dirty="${runtime_dir}/metadata.v1.index.dirty"
+  metadata_index_closures="${runtime_dir}/metadata.v1.index.closures"
+  imported_closures_dir="${runtime_dir}/imported-closures"
   runtime_state_file="${runtime_dir}/state-dir"
-  mkdir -p "${leases_dir}" "${castore}/blobs" \
+  mkdir -p "${leases_dir}" "${imported_closures_dir}" "${castore}/blobs" \
     "${state_dir}/store" "${state_dir}/dax-backing" "${upper_store_dir}"
 
   exec 9>"${upper_store_dir}/.supervm.lock"
@@ -314,27 +421,33 @@ initialize() {
   fs_pid=
   fs_started=
   refs=
+  pending_closure_marker=
 
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  exec 7>"${metadata_index_lock}"
   exec 8>"${services_lock}"
 }
 
 start_shared_services() {
-  local include_lower=$1
+  local include_guest_services=$1
 
   flock 8
   prune_leases
   bind_runtime_state
   create_lease
   ensure_castore
-  if [[ ${include_lower} == true ]]; then
-    ensure_lower_store
-  fi
-  flock -u 8
-
   export BLOB_SERVICE_ADDR="grpc+unix:${store_socket}"
   export DIRECTORY_SERVICE_ADDR="grpc+unix:${store_socket}"
   export PATH_INFO_SERVICE_ADDR="grpc+unix:${store_socket}"
+  export SNIX_METADATA_INDEX="${metadata_index}"
+  if [[ ${include_guest_services} == true ]]; then
+    if ! ensure_metadata_index; then
+      flock -u 8
+      fail "could not build the shared metadata index"
+    fi
+    ensure_lower_store
+  fi
+  flock -u 8
 }

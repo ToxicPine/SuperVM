@@ -46,11 +46,11 @@
         "spectrum": "spectrum_2"
       },
       "locked": {
-        "lastModified": 1785356201,
+        "lastModified": 1785541299,
         "narHash": "sha256-O5oWcQWxFOaUs022RDzTDwI5fGns2WhyRVD0jzhKA3U=",
         "owner": "ToxicPine",
         "repo": "microvm.nix",
-        "rev": "a5b7fd67c7ad2674ff6dbd18d4aca6e17df644f3",
+        "rev": "7c1dbf70e5549b818d501317b0e0cbd94737922f",
         "type": "github"
       },
       "original": {

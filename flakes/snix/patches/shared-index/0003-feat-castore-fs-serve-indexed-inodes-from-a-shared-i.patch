@@ -1,0 +1,1090 @@
+From 00b3f83e051b2837c9b47c7d2ad77e10190e627a Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Fri, 31 Jul 2026 17:11:56 +0100
+Subject: [PATCH 3/4] feat(castore/fs): serve indexed inodes from a shared
+ index
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Teach SnixStoreFs to serve the inodes a shared index covers straight from
+the mapping. `with_index` attaches one; `getattr`, `lookup`, `readdir`,
+`readdirplus`, `open`, `readlink`, the extended attributes, the per-inode
+DAX flag and the DAX `setupmapping` resolution all consult it first,
+answering from the record — never the directory service — for an indexed
+inode, and falling through to the existing tracker path otherwise.
+
+The tracker stays, as an overlay for anything the index does not cover: a
+root looked up that was not indexed, and its subtree. It is rebased to
+allocate above the index's fixed inode range, so the two inode spaces
+never collide, and it keeps the full forget/evict machinery for overlay
+inodes.
+
+Indexed inodes need none of that machinery, and keep no per-inode state
+at all. Their metadata is immutable and shared between every daemon over
+the one file, so there is nothing to evict and nothing a FORGET must draw
+down: a FORGET for an indexed inode is a no-op, and the inode stays
+resolvable however many times it is forgotten. Keeping no state is not
+just an optimisation but the point — it is what lets the metadata be
+read-only and shared. The mount root's listing, when an index is present,
+is the index's roots table, so root readdir and lookup-by-basename hit the
+mapping too; a basename the index does not cover still falls through to
+the provider.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ snix/castore/src/fs/index_tests.rs   | 379 +++++++++++++++++++++
+ snix/castore/src/fs/inode_tracker.rs |  13 +
+ snix/castore/src/fs/mod.rs           | 479 +++++++++++++++++++++++----
+ 3 files changed, 807 insertions(+), 64 deletions(-)
+ create mode 100644 snix/castore/src/fs/index_tests.rs
+
+diff --git a/snix/castore/src/fs/index_tests.rs b/snix/castore/src/fs/index_tests.rs
+new file mode 100644
+index 0000000..ae5bece
+--- /dev/null
++++ b/snix/castore/src/fs/index_tests.rs
+@@ -0,0 +1,379 @@
++//! Serving a filesystem from a shared metadata index.
++//!
++//! These drive the [FileSystem] trait directly, as the FUSE and virtio-fs
++//! daemons do, over a filesystem whose inodes come from an index built offline.
++//! The directory service handed to the serving filesystem is a mock that must
++//! never be called: proving the index answers metadata on its own is the whole
++//! point.
++
++use std::{collections::BTreeMap, ffi::CString, io::Cursor, sync::Arc};
++
++use fuse_backend_rs::api::filesystem::{Context, FileSystem, ROOT_ID};
++
++use crate::{
++    Directory, Node, PathComponent,
++    attrs::AttrTree,
++    blobservice::{BlobService, MemoryBlobService},
++    directoryservice::{DirectoryService, MockDirectoryService},
++    fs::{
++        FSSettings, SnixStoreFs,
++        index::{SharedIndex, build_from_roots},
++    },
++};
++
++const ROOT: &str = "00000000000000000000000000000000-root";
++
++type Fs = SnixStoreFs<
++    Arc<dyn BlobService>,
++    Arc<dyn DirectoryService>,
++    Arc<BTreeMap<PathComponent, Node>>,
++>;
++
++fn pc(s: &str) -> PathComponent {
++    s.try_into().unwrap()
++}
++
++/// Builds a tree — `bin/hello`, `share/doc` (both one blob) and a symlink — with
++/// the given declaration applying to it, and returns the serialized index plus
++/// the blob service backing the file contents.
++async fn sample_index(declaration: &str) -> (Vec<u8>, Arc<dyn BlobService>) {
++    let blob_service = Arc::new(MemoryBlobService::default()) as Arc<dyn BlobService>;
++    let directory_service = crate::utils::gen_test_directory_service();
++
++    let mut w = blob_service.open_write().await;
++    tokio::io::copy(&mut Cursor::new(crate::fixtures::BLOB_A.to_vec()), &mut w)
++        .await
++        .unwrap();
++    w.close().await.unwrap();
++
++    let blob_a = Node::File {
++        digest: *crate::fixtures::BLOB_A_DIGEST,
++        size: crate::fixtures::BLOB_A.len() as u64,
++        executable: false,
++    };
++
++    let mk_dir = async |name: &str, node: Node| -> Node {
++        let d = Directory::try_from_iter([(pc(name), node)]).unwrap();
++        directory_service.put(d.clone()).await.unwrap();
++        Node::Directory {
++            digest: d.digest(),
++            size: d.size(),
++        }
++    };
++
++    let bin = mk_dir("hello", blob_a.clone()).await;
++    let share = mk_dir("doc", blob_a).await;
++
++    let root = Directory::try_from_iter([
++        (pc("bin"), bin),
++        (
++            pc("link"),
++            Node::Symlink {
++                target: "somewhere".try_into().unwrap(),
++            },
++        ),
++        (pc("share"), share),
++    ])
++    .unwrap();
++    directory_service.put(root.clone()).await.unwrap();
++
++    let root_node = Node::Directory {
++        digest: root.digest(),
++        size: root.size(),
++    };
++    let declared = AttrTree::parse(declaration.as_bytes()).unwrap();
++    let bytes = build_from_roots(&directory_service, [(pc(ROOT), root_node, declared)])
++        .await
++        .expect("build index");
++
++    (bytes, blob_service)
++}
++
++/// A serving filesystem over `bytes`, whose directory service must never be
++/// consulted: everything the index covers is answered from the mapping.
++fn indexed_fs(bytes: Vec<u8>, blob_service: Arc<dyn BlobService>) -> Arc<Fs> {
++    let mut directory_service = MockDirectoryService::new();
++    directory_service.expect_get().times(0);
++
++    let fs = SnixStoreFs::new(
++        blob_service,
++        Arc::new(directory_service) as Arc<dyn DirectoryService>,
++        Arc::new(BTreeMap::new()),
++        FSSettings {
++            list_root: true,
++            show_xattr: true,
++            ..Default::default()
++        },
++        tokio::runtime::Handle::current(),
++    )
++    .with_index(SharedIndex::from_bytes(bytes).expect("valid index"));
++
++    Arc::new(fs)
++}
++
++/// Filesystem calls block on the tokio handle, so they must run off the runtime
++/// thread, exactly as the daemons run them.
++async fn on_fs<T: Send + 'static>(fs: &Arc<Fs>, f: impl FnOnce(&Fs) -> T + Send + 'static) -> T {
++    let fs = fs.clone();
++    tokio::task::spawn_blocking(move || f(&fs)).await.unwrap()
++}
++
++async fn lookup_path(fs: &Arc<Fs>, path: &[&str]) -> fuse_backend_rs::api::filesystem::Entry {
++    let path: Vec<CString> = path.iter().map(|p| CString::new(*p).unwrap()).collect();
++    on_fs(fs, move |fs| {
++        let mut ino = ROOT_ID;
++        let mut entry = None;
++        for name in &path {
++            let e = fs.lookup(&Context::default(), ino, name).expect("lookup");
++            ino = e.inode;
++            entry = Some(e);
++        }
++        entry.expect("at least one component")
++    })
++    .await
++}
++
++/// The point of a *shared* index: two filesystems over the same file report the
++/// same inode for the same path, with no coordination beyond the artifact.
++#[tokio::test]
++async fn two_filesystems_agree_on_every_inode() {
++    let (bytes, blobs) = sample_index("# nothing\n").await;
++    let a = indexed_fs(bytes.clone(), blobs.clone());
++    let b = indexed_fs(bytes, blobs);
++
++    for path in [
++        &[ROOT][..],
++        &[ROOT, "bin"],
++        &[ROOT, "bin", "hello"],
++        &[ROOT, "share", "doc"],
++        &[ROOT, "link"],
++    ] {
++        assert_eq!(
++            lookup_path(&a, path).await.inode,
++            lookup_path(&b, path).await.inode,
++            "path {path:?} must resolve to the same inode",
++        );
++    }
++}
++
++/// Metadata for indexed content is answered entirely from the index: lookup,
++/// getattr, readdir, readlink and xattr all succeed against a directory service
++/// that panics if touched.
++#[tokio::test]
++async fn indexed_metadata_needs_no_directory_service() {
++    let (bytes, blobs) = sample_index("# nothing\n").await;
++    let fs = indexed_fs(bytes, blobs);
++
++    let root = lookup_path(&fs, &[ROOT]).await.inode;
++    let bin = lookup_path(&fs, &[ROOT, "bin"]).await.inode;
++    let hello = lookup_path(&fs, &[ROOT, "bin", "hello"]).await.inode;
++    let link = lookup_path(&fs, &[ROOT, "link"]).await.inode;
++
++    on_fs(&fs, move |fs| {
++        let ctx = Context::default();
++
++        // getattr on each kind.
++        for ino in [root, bin, hello, link] {
++            fs.getattr(&ctx, ino, None).expect("getattr");
++        }
++
++        // readdir of the mount root and of an indexed directory.
++        let mut names = Vec::new();
++        fs.readdir(&ctx, ROOT_ID, 0, 4096, 0, &mut |e| {
++            names.push(String::from_utf8_lossy(e.name).into_owned());
++            Ok(1)
++        })
++        .expect("readdir root");
++        assert_eq!(names, vec![ROOT.to_string()]);
++
++        let mut names = Vec::new();
++        fs.readdir(&ctx, bin, 0, 4096, 0, &mut |e| {
++            names.push(String::from_utf8_lossy(e.name).into_owned());
++            Ok(1)
++        })
++        .expect("readdir bin");
++        assert_eq!(names, vec!["hello".to_string()]);
++
++        // readlink of the symlink.
++        assert_eq!(fs.readlink(&ctx, link).expect("readlink"), b"somewhere");
++    })
++    .await;
++}
++
++/// Declared attributes — a served `user.` xattr — resolved into the index are
++/// answered from it and match what the tree declared.
++#[tokio::test]
++async fn declared_xattrs_are_served_from_the_index() {
++    let (bytes, blobs) = sample_index("user.mime=dGV4dC9wbGFpbg== bin/hello\n").await;
++    let fs = indexed_fs(bytes, blobs);
++
++    let hello = lookup_path(&fs, &[ROOT, "bin", "hello"]).await.inode;
++    let doc = lookup_path(&fs, &[ROOT, "share", "doc"]).await.inode;
++
++    on_fs(&fs, move |fs| {
++        use fuse_backend_rs::api::filesystem::GetxattrReply;
++        let ctx = Context::default();
++        let name = CString::new("user.mime").unwrap();
++
++        assert!(matches!(
++            fs.getxattr(&ctx, hello, &name, 64).unwrap(),
++            GetxattrReply::Value(v) if v == b"text/plain",
++        ));
++        // share/doc is the same blob but carries no declaration, so it must be a
++        // different inode and must not answer the attribute.
++        assert_ne!(hello, doc);
++        assert_eq!(
++            fs.getxattr(&ctx, doc, &name, 64)
++                .err()
++                .unwrap()
++                .raw_os_error(),
++            Some(libc::ENODATA),
++        );
++    })
++    .await;
++}
++
++/// A FORGET for an indexed inode is a no-op: its metadata is shared and
++/// immutable, so it stays resolvable however many times it is forgotten.
++#[tokio::test]
++async fn forgetting_an_indexed_inode_is_a_noop() {
++    let (bytes, blobs) = sample_index("# nothing\n").await;
++    let fs = indexed_fs(bytes, blobs);
++
++    let hello = lookup_path(&fs, &[ROOT, "bin", "hello"]).await.inode;
++
++    on_fs(&fs, move |fs| {
++        let ctx = Context::default();
++        fs.forget(&ctx, hello, u64::MAX);
++        fs.batch_forget(&ctx, vec![(hello, u64::MAX)]);
++        fs.getattr(&ctx, hello, None)
++            .expect("an indexed inode survives being forgotten");
++    })
++    .await;
++}
++
++/// A root the index does not cover falls back to the tracker, is allocated an
++/// inode strictly above the index's range, and is evicted by a FORGET as
++/// before — while an indexed root in the same filesystem is not.
++#[tokio::test]
++async fn a_non_indexed_root_uses_the_overlay_and_still_evicts() {
++    let (bytes, blobs) = sample_index("# nothing\n").await;
++    let overlay_base = SharedIndex::from_bytes(bytes.clone())
++        .unwrap()
++        .overlay_base();
++
++    // A real directory service, since the overlay path resolves through it, plus
++    // a provider carrying one extra root the index does not cover.
++    let directory_service =
++        Arc::new(crate::utils::gen_test_directory_service()) as Arc<dyn DirectoryService>;
++    let other = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-other";
++    let provider: BTreeMap<PathComponent, Node> = BTreeMap::from([(
++        pc(other),
++        Node::File {
++            digest: *crate::fixtures::BLOB_B_DIGEST,
++            size: crate::fixtures::BLOB_B.len() as u64,
++            executable: false,
++        },
++    )]);
++
++    let fs = Arc::new(
++        SnixStoreFs::new(
++            blobs,
++            directory_service,
++            Arc::new(provider),
++            FSSettings {
++                list_root: true,
++                show_xattr: true,
++                ..Default::default()
++            },
++            tokio::runtime::Handle::current(),
++        )
++        .with_index(SharedIndex::from_bytes(bytes).unwrap()),
++    );
++
++    let indexed_root = lookup_path(&fs, &[ROOT]).await.inode;
++    let overlay_root = lookup_path(&fs, &[other]).await.inode;
++
++    assert!(
++        indexed_root < overlay_base,
++        "the indexed root is in the index range"
++    );
++    assert!(
++        overlay_root >= overlay_base,
++        "an overlay inode must be allocated above the index range",
++    );
++
++    on_fs(&fs, move |fs| {
++        let ctx = Context::default();
++
++        // Forgetting the overlay inode evicts it, as without an index.
++        fs.forget(&ctx, overlay_root, 1);
++        assert_eq!(
++            fs.getattr(&ctx, overlay_root, None)
++                .err()
++                .unwrap()
++                .raw_os_error(),
++            Some(libc::ESTALE),
++            "a forgotten overlay inode is stale",
++        );
++
++        // Forgetting the indexed root does nothing.
++        fs.forget(&ctx, indexed_root, u64::MAX);
++        fs.getattr(&ctx, indexed_root, None)
++            .expect("the indexed root survives being forgotten");
++    })
++    .await;
++}
++
++/// The per-inode DAX hint the tree declares is resolved into the index and
++/// answered from it: exactly the marked file is flagged, and a guest deciding
++/// per inode sees the mark in the lookup reply.
++#[cfg(feature = "virtiofs")]
++#[tokio::test]
++async fn declared_dax_is_served_from_the_index() {
++    use fuse_backend_rs::{abi::fuse_abi::FUSE_ATTR_DAX, api::filesystem::FsOptions};
++
++    let (bytes, blobs) = sample_index(&format!("{} bin/hello\n", crate::attrs::ATTR_DAX)).await;
++
++    let dir = tempfile::TempDir::new().unwrap();
++    let mut directory_service = MockDirectoryService::new();
++    directory_service.expect_get().times(0);
++    let fs = Arc::new(
++        SnixStoreFs::new(
++            blobs,
++            Arc::new(directory_service) as Arc<dyn DirectoryService>,
++            Arc::new(BTreeMap::new()),
++            FSSettings {
++                list_root: true,
++                show_xattr: true,
++                ..Default::default()
++            },
++            tokio::runtime::Handle::current(),
++        )
++        .with_index(SharedIndex::from_bytes(bytes).unwrap())
++        .with_dax_cache(crate::fs::dax::DaxCache::new(dir.path()).unwrap()),
++    );
++
++    on_fs(&fs, |fs| {
++        assert!(
++            fs.init(FsOptions::INIT_EXT | FsOptions::PERFILE_DAX)
++                .unwrap()
++                .contains(FsOptions::PERFILE_DAX)
++        );
++    })
++    .await;
++
++    let hello = lookup_path(&fs, &[ROOT, "bin", "hello"]).await;
++    let doc = lookup_path(&fs, &[ROOT, "share", "doc"]).await;
++
++    assert_eq!(
++        FUSE_ATTR_DAX,
++        hello.attr_flags & FUSE_ATTR_DAX,
++        "bin/hello is marked"
++    );
++    assert_eq!(0, doc.attr_flags & FUSE_ATTR_DAX, "share/doc is not");
++    assert_ne!(
++        hello.inode, doc.inode,
++        "the same blob, split by its declaration"
++    );
++}
+diff --git a/snix/castore/src/fs/inode_tracker.rs b/snix/castore/src/fs/inode_tracker.rs
+index 9bc80ec..350742d 100644
+--- a/snix/castore/src/fs/inode_tracker.rs
++++ b/snix/castore/src/fs/inode_tracker.rs
+@@ -133,6 +133,19 @@ impl InodeData {
+ }
+ 
+ impl InodeTracker {
++    /// Moves the next inode to allocate up to `next_inode`, so overlay inodes
++    /// begin above a shared index's range rather than colliding with it.
++    ///
++    /// Only valid before any inode has been handed out, which is the only time
++    /// [`super::SnixStoreFs::with_index`] calls it.
++    pub fn rebase(&mut self, next_inode: u64) {
++        debug_assert!(
++            self.data.is_empty() && self.next_inode == 2,
++            "the inode tracker must be rebased before any allocation"
++        );
++        self.next_inode = next_inode;
++    }
++
+     // Retrieves data for a given inode, if it exists.
+     pub fn get(&self, ino: u64) -> Option<Arc<InodeData>> {
+         self.data.get(&ino).cloned()
+diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
+index 54ec66e..c4a980c 100644
+--- a/snix/castore/src/fs/mod.rs
++++ b/snix/castore/src/fs/mod.rs
+@@ -7,6 +7,9 @@ pub mod root_nodes;
+ #[cfg(all(test, target_os = "linux"))]
+ mod attrs_tests;
+ 
++#[cfg(all(test, target_os = "linux"))]
++mod index_tests;
++
+ #[cfg(feature = "fuse")]
+ pub mod fuse;
+ 
+@@ -22,6 +25,7 @@ pub mod virtiofs;
+ pub use self::root_nodes::RootNodes;
+ use self::{
+     file_attr::ROOT_FILE_ATTR,
++    index::{Record, SharedIndex},
+     inode_tracker::InodeTracker,
+     inodes::{DirectoryInodeData, InodeData},
+ };
+@@ -102,6 +106,17 @@ pub struct SnixStoreFs<BS, DS, RN: RootNodes> {
+     /// This maps a given basename in the root to the inode we allocated for the node.
+     root_nodes: RwLock<HashMap<PathComponent, u64>>,
+ 
++    /// An optional shared metadata index.
++    ///
++    /// When present, every inode it covers is served straight from the mapping:
++    /// its metadata is immutable and shared between all daemons over one file,
++    /// so it never enters the inode tracker below and needs no per-inode
++    /// bookkeeping. The tracker remains, as an overlay for anything the index
++    /// does not cover — roots looked up that were not indexed, and their
++    /// subtrees — allocating from a range strictly above the index's so the two
++    /// inode spaces never collide.
++    index: Option<SharedIndex>,
++
+     /// This keeps track of inodes and data alongside them.
+     inode_tracker: RwLock<InodeTracker>,
+ 
+@@ -190,6 +205,20 @@ where
+         self
+     }
+ 
++    /// Serve the inodes covered by `index` straight from it.
++    ///
++    /// The index owns a fixed, dense inode range starting at
++    /// [index::INODE_BASE]; the inode tracker is rebased to allocate overlay
++    /// inodes strictly above it, so a root the index does not cover, or content
++    /// fetched past the index, never collides with an indexed inode. Attaching
++    /// an index before anything has been looked up is the only supported order,
++    /// which is how the daemons build the filesystem.
++    pub fn with_index(mut self, index: SharedIndex) -> Self {
++        self.inode_tracker.get_mut().rebase(index.overlay_base());
++        self.index = Some(index);
++        self
++    }
++
+     pub fn new(
+         blob_service: BS,
+         directory_service: DS,
+@@ -206,6 +235,7 @@ where
+             settings,
+ 
+             root_nodes: RwLock::new(HashMap::default()),
++            index: None,
+             inode_tracker: RwLock::new(Default::default()),
+ 
+             dir_handles: RwLock::new(Default::default()),
+@@ -513,18 +543,26 @@ where
+         // libc::S_IFREG, libc::S_IFLNK & libc::S_IFDIR are u32 on Linux and u16 on MacOS
+         #[cfg(target_os = "macos")]
+         let mode = mode as u32;
++        let size = match inode_data {
++            InodeData::Regular(_, size, ..) => *size,
++            InodeData::Symlink(target) => target.len() as u64,
++            InodeData::Directory(DirectoryInodeData::Sparse(_, size, _)) => *size,
++            InodeData::Directory(DirectoryInodeData::Populated(_, _, children)) => {
++                children.len() as u64
++            }
++        };
++        self.make_attr(ino, mode, size)
++    }
++
++    /// Assembles the [Attr] common to every inode, applying the uid/gid
++    /// override. `mode` already carries the type bits; `size` is the value the
++    /// kind reports. Shared by the inode-tracker and shared-index paths.
++    fn make_attr(&self, ino: u64, mode: u32, size: u64) -> Attr {
+         let mut attr = Attr {
+             ino,
+             // FUTUREWORK: play with this numbers, as it affects read sizes for client applications.
+             blocks: 1024,
+-            size: match inode_data {
+-                InodeData::Regular(_, size, ..) => *size,
+-                InodeData::Symlink(target) => target.len() as u64,
+-                InodeData::Directory(DirectoryInodeData::Sparse(_, size, _)) => *size,
+-                InodeData::Directory(DirectoryInodeData::Populated(_, _, children)) => {
+-                    children.len() as u64
+-                }
+-            },
++            size,
+             mode,
+             nlink: 1, // 0 would prevent lndir from recursing into directories.
+             mtime: 1, // Everything in /nix/store must have timestamp "1".
+@@ -539,6 +577,159 @@ where
+         attr
+     }
+ 
++    /// The index, if one is attached.
++    fn index(&self) -> Option<&SharedIndex> {
++        self.index.as_ref()
++    }
++
++    /// Whether `ino` is served from the shared index rather than the tracker.
++    fn is_index_inode(&self, ino: u64) -> bool {
++        self.index().is_some_and(|index| index.is_index_inode(ino))
++    }
++
++    /// The [Attr] for an indexed inode, built straight from its record.
++    fn index_attr(&self, ino: u64) -> Option<Attr> {
++        let record = self.index()?.record(ino)?;
++        let (mode, size) = match record {
++            Record::Directory { size, .. } => (libc::S_IFDIR | 0o555, size),
++            Record::File {
++                size,
++                executable: true,
++                ..
++            } => (libc::S_IFREG | 0o555, size),
++            Record::File { size, .. } => (libc::S_IFREG | 0o444, size),
++            Record::Symlink { target } => (libc::S_IFLNK | 0o444, target.len() as u64),
++        };
++        // libc::S_IFREG, libc::S_IFLNK & libc::S_IFDIR are u32 on Linux and u16 on MacOS
++        #[cfg(target_os = "macos")]
++        let mode = mode as u32;
++        Some(self.make_attr(ino, mode, size))
++    }
++
++    /// The lookup/readdirplus [Entry] for an indexed inode, marking it for DAX
++    /// exactly when its record says the tree asked for it and a guest that
++    /// decides per inode is being served.
++    fn index_entry(&self, ino: u64) -> Option<Entry> {
++        #[allow(unused_mut)]
++        let mut entry = attr_to_fuse_entry(self.index_attr(ino)?);
++
++        #[cfg(all(feature = "virtiofs", target_os = "linux"))]
++        if self.index_dax_eligible(ino) {
++            entry.attr_flags |= fuse_backend_rs::abi::fuse_abi::FUSE_ATTR_DAX;
++            debug!(ino, "marking indexed inode to be mapped rather than read");
++        }
++
++        Some(entry)
++    }
++
++    /// Whether the guest should map this indexed inode rather than read it. The
++    /// same four conditions as [Self::dax_eligible], with the DAX hint read from
++    /// the record the index resolved at build time.
++    #[cfg(all(feature = "virtiofs", target_os = "linux"))]
++    fn index_dax_eligible(&self, ino: u64) -> bool {
++        use std::sync::atomic::Ordering;
++
++        self.perfile_dax.load(Ordering::Relaxed)
++            && self.dax_cache.is_some()
++            && matches!(
++                self.index().and_then(|i| i.record(ino)),
++                Some(Record::File { dax: true, .. })
++            )
++    }
++
++    /// The FUSE directory-entry type of an indexed inode.
++    fn index_fuse_type(&self, ino: u64) -> u32 {
++        #[allow(clippy::let_and_return)]
++        let ty = match self.index().and_then(|index| index.record(ino)) {
++            Some(Record::Directory { .. }) => libc::S_IFDIR,
++            Some(Record::File { .. }) => libc::S_IFREG,
++            Some(Record::Symlink { .. }) | None => libc::S_IFLNK,
++        };
++        // libc::S_IFDIR is u32 on Linux and u16 on MacOS
++        #[cfg(target_os = "macos")]
++        let ty = ty as u32;
++        ty
++    }
++
++    /// Answers a getxattr for an indexed inode: the extended attributes the tree
++    /// declared, resolved into the index at build time, plus the synthetic
++    /// digest attributes when those are enabled.
++    fn index_getxattr(&self, inode: u64, name: &CStr, size: u32) -> io::Result<GetxattrReply> {
++        let index = self.index().expect("indexed inode implies an index");
++        let record = index
++            .record(inode)
++            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
++
++        // A declared attribute is an attribute of the file whether or not the
++        // synthetic digest attributes are enabled.
++        if let Some(value) = record
++            .attrs_ref()
++            .and_then(|attrs_ref| index.xattr_get(attrs_ref, name.to_bytes()))
++        {
++            return reply_xattr(value, size);
++        }
++
++        if !self.settings.show_xattr {
++            return Err(io::Error::from_raw_os_error(libc::ENODATA));
++        }
++
++        let digest_str = match record {
++            Record::Directory { digest, .. } if name.to_bytes() == XATTR_NAME_DIRECTORY_DIGEST => {
++                digest.to_string()
++            }
++            Record::File { digest, .. } if name.to_bytes() == XATTR_NAME_BLOB_DIGEST => {
++                digest.to_string()
++            }
++            _ => return Err(io::Error::from_raw_os_error(libc::ENODATA)),
++        };
++        reply_xattr(digest_str.as_bytes(), size)
++    }
++
++    /// Answers a listxattr for an indexed inode, mirroring [Self::index_getxattr]:
++    /// the declared attribute names, then the synthetic digest name.
++    fn index_listxattr(&self, inode: u64, size: u32) -> io::Result<ListxattrReply> {
++        let index = self.index().expect("indexed inode implies an index");
++        let record = index
++            .record(inode)
++            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
++
++        let mut out = Vec::new();
++        if let Some(attrs_ref) = record.attrs_ref() {
++            for (name, _value) in index.xattrs(attrs_ref) {
++                out.extend_from_slice(name);
++                out.push_byte(b'\x00');
++            }
++        }
++
++        if self.settings.show_xattr {
++            match record {
++                Record::Directory { .. } => {
++                    out.extend_from_slice(XATTR_NAME_DIRECTORY_DIGEST);
++                    out.push_byte(b'\x00');
++                }
++                Record::File { .. } => {
++                    out.extend_from_slice(XATTR_NAME_BLOB_DIGEST);
++                    out.push_byte(b'\x00');
++                }
++                Record::Symlink { .. } => {}
++            }
++        }
++
++        reply_names(out, size)
++    }
++
++    /// The blob digest an indexed inode maps to, for the DAX setupmapping path,
++    /// resolved through the index exactly as reads resolve it.
++    #[cfg(feature = "virtiofs")]
++    fn index_blob_digest(&self, inode: u64) -> Option<io::Result<B3Digest>> {
++        let record = self.index()?.record(inode)?;
++        Some(match record {
++            Record::File { digest, .. } => Ok(digest),
++            Record::Directory { .. } => Err(io::Error::from_raw_os_error(libc::EISDIR)),
++            Record::Symlink { .. } => Err(io::Error::from_raw_os_error(libc::EINVAL)),
++        })
++    }
++
+     /// Builds the [Entry] answering a lookup or readdirplus for `ino`.
+     ///
+     /// Everything the kernel learns about an inode beyond its [Attr] is
+@@ -677,7 +868,10 @@ where
+     /// reference has been forgotten.
+     #[tracing::instrument(skip_all, fields(rq.inode = inode, rq.count = count))]
+     fn forget(&self, _ctx: &Context, inode: Self::Inode, count: u64) {
+-        if inode == ROOT_ID {
++        // The root inode is permanent, and an indexed inode holds no per-inode
++        // state to release: its metadata is immutable and shared, so a FORGET
++        // for it is a no-op. Everything else is deferred to the tracker.
++        if inode == ROOT_ID || self.is_index_inode(inode) {
+             return;
+         }
+         self.inode_tracker.write().forget(inode, count);
+@@ -688,7 +882,7 @@ where
+     fn batch_forget(&self, _ctx: &Context, requests: Vec<(Self::Inode, u64)>) {
+         let mut inode_tracker = self.inode_tracker.write();
+         for (inode, count) in requests {
+-            if inode == ROOT_ID {
++            if inode == ROOT_ID || self.is_index_inode(inode) {
+                 continue;
+             }
+             inode_tracker.forget(inode, count);
+@@ -704,6 +898,8 @@ where
+     ) -> io::Result<(stat64, Duration)> {
+         let attr = if inode == ROOT_ID {
+             ROOT_FILE_ATTR
++        } else if let Some(attr) = self.index_attr(inode) {
++            attr
+         } else {
+             self.inode_data_to_attr(
+                 self.inode_tracker
+@@ -731,6 +927,31 @@ where
+         // If it can't be converted, we definitely don't have anything here.
+         let name: PathComponent = name.try_into().map_err(|_| std::io::ErrorKind::NotFound)?;
+ 
++        // Serve inodes the index covers straight from it, taking no lookup
++        // count: an indexed inode's metadata is immutable and shared, so there
++        // is nothing per inode to evict and a later FORGET names nothing here. A
++        // root the index does not cover falls through to the tracker; a name
++        // missing from an indexed directory is simply absent, as the whole of an
++        // indexed directory's subtree is in the index.
++        if parent == ROOT_ID {
++            if let Some(child) = self
++                .index()
++                .and_then(|index| index.lookup_root(name.as_ref()))
++            {
++                return self
++                    .index_entry(child)
++                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE));
++            }
++        } else if self.is_index_inode(parent) {
++            let child = self
++                .index()
++                .and_then(|index| index.lookup_child(parent, name.as_ref()))
++                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
++            return self
++                .index_entry(child)
++                .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE));
++        }
++
+         // This goes from a parent inode to a node.
+         let ino = if parent == ROOT_ID {
+             // If the parent is [ROOT_ID], we need to check [self.root_nodes] (fetching from a [RootNode] provider if needed)
+@@ -782,14 +1003,22 @@ where
+         // In case opendir on the root is called, we provide the handle, as re-entering that listing is expensive.
+         // For all other directory inodes we just let readdir take care of it.
+         if inode == ROOT_ID {
+-            if !self.settings.list_root {
++            // A shared index carries the root listing itself, so the root is
++            // enumerable whenever one is attached, even if the underlying
++            // provider does not support listing.
++            if !self.settings.list_root && self.index.is_none() {
+                 return Err(io::Error::from_raw_os_error(libc::EPERM)); // same error code as ipfs/kubo
+             }
+ 
++            // With an index, the root listing is served from it (see `readdir`),
++            // so no provider stream is needed; store an empty one for the handle.
+             let root_nodes_provider = self.root_nodes_provider.clone();
+-            let stream = self
+-                .tokio_handle
+-                .block_on(async move { root_nodes_provider.list().enumerate().boxed() });
++            let stream = if self.index.is_some() {
++                futures::stream::empty().boxed()
++            } else {
++                self.tokio_handle
++                    .block_on(async move { root_nodes_provider.list().enumerate().boxed() })
++            };
+ 
+             // Put the stream into [self.dir_handles].
+             // TODO: this will overflow after 2**64 operations,
+@@ -829,6 +1058,25 @@ where
+         debug!("readdir");
+ 
+         if inode == ROOT_ID {
++            // The index, when present, is the authoritative root listing: it was
++            // built over the roots being served and enumerates them from a
++            // stable sorted array, so it is walked by offset rather than through
++            // a provider stream.
++            if let Some(index) = self.index() {
++                for (i, (name, ino)) in index.roots().enumerate().skip(offset as usize) {
++                    let written = add_entry(fuse_backend_rs::api::filesystem::DirEntry {
++                        ino,
++                        offset: i as u64 + 1,
++                        type_: self.index_fuse_type(ino),
++                        name,
++                    })?;
++                    if written == 0 {
++                        break;
++                    }
++                }
++                return Ok(());
++            }
++
+             if !self.settings.list_root {
+                 return Err(io::Error::from_raw_os_error(libc::EPERM)); // same error code as ipfs/kubo
+             }
+@@ -877,6 +1125,22 @@ where
+             return Ok(());
+         }
+ 
++        // Indexed directory: enumerate its children straight from the index.
++        if let Some(index) = self.index().filter(|index| index.is_index_inode(inode)) {
++            for (i, (name, ino)) in index.children(inode).enumerate().skip(offset as usize) {
++                let written = add_entry(fuse_backend_rs::api::filesystem::DirEntry {
++                    ino,
++                    offset: i as u64 + 1,
++                    type_: self.index_fuse_type(ino),
++                    name,
++                })?;
++                if written == 0 {
++                    break;
++                }
++            }
++            return Ok(());
++        }
++
+         // Non root-node case: lookup the children, or return an error if it's not a directory.
+         let (parent_digest, children) = self.get_directory_children(inode)?;
+         Span::current().record("directory.digest", parent_digest.to_string());
+@@ -916,6 +1180,30 @@ where
+         debug!("readdirplus");
+ 
+         if inode == ROOT_ID {
++            // As in `readdir`, the index is the authoritative root listing. Each
++            // returned inode takes no lookup count: an indexed inode is never
++            // evicted, so nothing draws it back down.
++            if let Some(index) = self.index() {
++                for (i, (name, ino)) in index.roots().enumerate().skip(offset as usize) {
++                    let Some(entry) = self.index_entry(ino) else {
++                        continue;
++                    };
++                    let written = add_entry(
++                        fuse_backend_rs::api::filesystem::DirEntry {
++                            ino,
++                            offset: i as u64 + 1,
++                            type_: self.index_fuse_type(ino),
++                            name,
++                        },
++                        entry,
++                    )?;
++                    if written == 0 {
++                        break;
++                    }
++                }
++                return Ok(());
++            }
++
+             if !self.settings.list_root {
+                 return Err(io::Error::from_raw_os_error(libc::EPERM)); // same error code as ipfs/kubo
+             }
+@@ -979,6 +1267,29 @@ where
+             return Ok(());
+         }
+ 
++        // Indexed directory: enumerate its children straight from the index,
++        // handing out an Entry for each without taking a lookup count.
++        if let Some(index) = self.index().filter(|index| index.is_index_inode(inode)) {
++            for (i, (name, ino)) in index.children(inode).enumerate().skip(offset as usize) {
++                let Some(entry) = self.index_entry(ino) else {
++                    continue;
++                };
++                let written = add_entry(
++                    fuse_backend_rs::api::filesystem::DirEntry {
++                        ino,
++                        offset: i as u64 + 1,
++                        type_: self.index_fuse_type(ino),
++                        name,
++                    },
++                    entry,
++                )?;
++                if written == 0 {
++                    break;
++                }
++            }
++            return Ok(());
++        }
++
+         // Non root-node case: lookup the children, or return an error if it's not a directory.
+         let (parent_digest, children) = self.get_directory_children(inode)?;
+         Span::current().record("directory.digest", parent_digest.to_string());
+@@ -1048,47 +1359,59 @@ where
+             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+         }
+ 
+-        // lookup the inode; a request for an inode we no longer track is stale.
+-        let inode_data = self
+-            .inode_tracker
+-            .read()
+-            .get(inode)
+-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
+-        match *inode_data {
+-            // read is invalid on non-files.
+-            InodeData::Directory(..) | InodeData::Symlink(_) => {
+-                warn!("is directory");
+-                Err(io::Error::from_raw_os_error(libc::EISDIR))
++        // An indexed inode's blob digest comes from its record; only a regular
++        // file can be opened for reading.
++        let blob_digest = if let Some(record) = self.index().and_then(|index| index.record(inode)) {
++            match record {
++                Record::File { digest, .. } => digest,
++                Record::Directory { .. } | Record::Symlink { .. } => {
++                    warn!("is directory");
++                    return Err(io::Error::from_raw_os_error(libc::EISDIR));
++                }
+             }
+-            InodeData::Regular(ref blob_digest, _blob_size, ..) => {
+-                Span::current().record("blob.digest", blob_digest.to_string());
+-
+-                // get a new file handle
+-                // TODO: this will overflow after 2**64 operations,
+-                // which is fine for now.
+-                // See https://cl.tvl.fyi/c/depot/+/8834/comment/a6684ce0_d72469d1
+-                // for the discussion on alternatives.
+-                let fh = self.next_file_handle.fetch_add(1, Ordering::SeqCst);
+-
+-                self.file_handles.write().insert(
+-                    fh,
+-                    (
+-                        Span::current(),
+-                        Arc::new(Mutex::new(FileHandle {
+-                            digest: *blob_digest,
+-                            reader: None,
+-                        })),
+-                    ),
+-                );
+-
+-                Ok((
+-                    Some(fh),
+-                    // Don't invalidate the data cache on open.
+-                    OpenOptions::KEEP_CACHE,
+-                    None,
+-                ))
++        } else {
++            // lookup the inode; a request for an inode we no longer track is stale.
++            let inode_data = self
++                .inode_tracker
++                .read()
++                .get(inode)
++                .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
++            match *inode_data {
++                // read is invalid on non-files.
++                InodeData::Directory(..) | InodeData::Symlink(_) => {
++                    warn!("is directory");
++                    return Err(io::Error::from_raw_os_error(libc::EISDIR));
++                }
++                InodeData::Regular(ref blob_digest, _blob_size, ..) => *blob_digest,
+             }
+-        }
++        };
++
++        Span::current().record("blob.digest", blob_digest.to_string());
++
++        // get a new file handle
++        // TODO: this will overflow after 2**64 operations,
++        // which is fine for now.
++        // See https://cl.tvl.fyi/c/depot/+/8834/comment/a6684ce0_d72469d1
++        // for the discussion on alternatives.
++        let fh = self.next_file_handle.fetch_add(1, Ordering::SeqCst);
++
++        self.file_handles.write().insert(
++            fh,
++            (
++                Span::current(),
++                Arc::new(Mutex::new(FileHandle {
++                    digest: blob_digest,
++                    reader: None,
++                })),
++            ),
++        );
++
++        Ok((
++            Some(fh),
++            // Don't invalidate the data cache on open.
++            OpenOptions::KEEP_CACHE,
++            None,
++        ))
+     }
+ 
+     #[tracing::instrument(skip_all, fields(rq.inode = inode, rq.handle = handle), parent = self.file_handles.read().get(&handle).and_then(|x| x.0.id()))]
+@@ -1244,17 +1567,23 @@ where
+             return Err(io::Error::from_raw_os_error(libc::EROFS));
+         }
+ 
+-        let blob_digest = match *self.inode_tracker.read().get(inode).ok_or_else(|| {
+-            // A mapping request for an inode we no longer track is stale, just
+-            // like any other access to an evicted inode: the guest is expected
+-            // to remove a mapping before forgetting the inode, but a buggy or
+-            // malicious one need not, and the tracker is free of it either way.
+-            warn!("inode not found");
+-            io::Error::from_raw_os_error(libc::ESTALE)
+-        })? {
+-            InodeData::Regular(ref blob_digest, ..) => *blob_digest,
+-            InodeData::Directory(..) => return Err(io::Error::from_raw_os_error(libc::EISDIR)),
+-            InodeData::Symlink(_) => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
++        // An indexed inode resolves to its blob through the index, exactly as
++        // the read path does; otherwise the tracker is consulted.
++        let blob_digest = match self.index_blob_digest(inode) {
++            Some(result) => result?,
++            None => match *self.inode_tracker.read().get(inode).ok_or_else(|| {
++                // A mapping request for an inode we no longer track is stale,
++                // just like any other access to an evicted inode: the guest is
++                // expected to remove a mapping before forgetting the inode, but
++                // a buggy or malicious one need not, and the tracker is free of
++                // it either way.
++                warn!("inode not found");
++                io::Error::from_raw_os_error(libc::ESTALE)
++            })? {
++                InodeData::Regular(ref blob_digest, ..) => *blob_digest,
++                InodeData::Directory(..) => return Err(io::Error::from_raw_os_error(libc::EISDIR)),
++                InodeData::Symlink(_) => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
++            },
+         };
+ 
+         Span::current().record("blob.digest", blob_digest.to_string());
+@@ -1292,6 +1621,16 @@ where
+             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+         }
+ 
++        // An indexed symlink's target comes straight from its record.
++        if let Some(record) = self.index().and_then(|index| index.record(inode)) {
++            return match record {
++                Record::Symlink { target } => Ok(target.to_vec()),
++                Record::Directory { .. } | Record::File { .. } => {
++                    Err(io::Error::from_raw_os_error(libc::EINVAL))
++                }
++            };
++        }
++
+         // lookup the inode; a request for an inode we no longer track is stale.
+         let inode_data = self
+             .inode_tracker
+@@ -1319,6 +1658,13 @@ where
+         // declaration path is configured we must keep answering, since a
+         // later inode may carry a declared attribute even if this one does
+         // not.
++        // Indexed inodes carry their declared attributes in the index, so they
++        // are served whether or not a declaration path is configured for the
++        // overlay.
++        if self.is_index_inode(inode) {
++            return self.index_getxattr(inode, name, size);
++        }
++
+         if !self.settings.show_xattr && self.settings.fsmeta_path.is_none() {
+             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+         }
+@@ -1373,6 +1719,11 @@ where
+         inode: Self::Inode,
+         size: u32,
+     ) -> io::Result<ListxattrReply> {
++        // Indexed inodes carry their declared attributes in the index.
++        if self.is_index_inode(inode) {
++            return self.index_listxattr(inode, size);
++        }
++
+         if !self.settings.show_xattr && self.settings.fsmeta_path.is_none() {
+             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+         }

@@ -93,13 +93,14 @@ create_family_runtime_path() {
   FAMILY_RUNTIME_DIR="/run/svbench-${BENCHMARK_RUN_ID}-${1}"
   [[ ! -e ${FAMILY_RUNTIME_DIR} && ! -L ${FAMILY_RUNTIME_DIR} ]] ||
     fail "runtime path already exists: ${FAMILY_RUNTIME_DIR}"
-  ln -s "${FAMILY_OUTPUT_DIR}/runtime" "${FAMILY_RUNTIME_DIR}"
+  mkdir -m 700 "${FAMILY_RUNTIME_DIR}"
 }
 
 remove_family_runtime_path() {
   [[ -n ${FAMILY_RUNTIME_DIR:-} ]] || return 0
-  [[ -L ${FAMILY_RUNTIME_DIR} ]] &&
-    unlink "${FAMILY_RUNTIME_DIR}"
+  if [[ -d ${FAMILY_RUNTIME_DIR} && ! -L ${FAMILY_RUNTIME_DIR} ]]; then
+    find "${FAMILY_RUNTIME_DIR}" -xdev -depth -delete
+  fi
   FAMILY_RUNTIME_DIR=
 }
 
@@ -162,6 +163,7 @@ settled_family_memory_current() {
   local current_deployment
   local difference
   local scale
+  local stable_intervals=0
   local deadline=$((SECONDS + MEMORY_STABILITY_TIMEOUT_SECONDS))
 
   previous=$(median_family_memory_current)
@@ -180,8 +182,13 @@ settled_family_memory_current() {
     ((previous_deployment <= scale)) || scale=${previous_deployment}
     ((scale > 0)) || scale=1
     if ((difference * 100 < scale)); then
-      printf '%s\n' "${current}"
-      return
+      stable_intervals=$((stable_intervals + 1))
+      if ((stable_intervals >= 3)); then
+        printf '%s\n' "${current}"
+        return
+      fi
+    else
+      stable_intervals=0
     fi
     previous=${current}
   done
@@ -278,19 +285,47 @@ prepare_ksm_control() {
   local file
 
   [[ -d ${KSM_SYSFS_DIR} ]] || fail "KSM is unavailable"
-  for file in run pages_shared pages_sharing full_scans; do
+  for file in run pages_shared pages_sharing full_scans pages_to_scan \
+    sleep_millisecs; do
     [[ -r ${KSM_SYSFS_DIR}/${file} ]] || fail "cannot read KSM ${file}"
   done
-  [[ -w ${KSM_SYSFS_DIR}/run ]] ||
-    fail "KSM control requires write access to ${KSM_SYSFS_DIR}/run; run with sudo"
+  for file in run pages_to_scan sleep_millisecs; do
+    [[ -w ${KSM_SYSFS_DIR}/${file} ]] ||
+      fail "KSM control requires write access to ${KSM_SYSFS_DIR}/${file}; run with sudo"
+  done
 
   KSM_ORIGINAL_RUN_STATE=$(<"${KSM_SYSFS_DIR}/run")
   case ${KSM_ORIGINAL_RUN_STATE} in
     0 | 1) ;;
     *) fail "KSM run state ${KSM_ORIGINAL_RUN_STATE} is not safe to take over" ;;
   esac
+  KSM_ORIGINAL_PAGES_TO_SCAN=$(<"${KSM_SYSFS_DIR}/pages_to_scan")
+  KSM_ORIGINAL_SLEEP_MILLISECONDS=$(<"${KSM_SYSFS_DIR}/sleep_millisecs")
+  KSM_ORIGINAL_ADVISOR_MODE=
+  if [[ -r ${KSM_SYSFS_DIR}/advisor_mode ]]; then
+    [[ -w ${KSM_SYSFS_DIR}/advisor_mode ]] ||
+      fail "KSM advisor mode is readable but not writable"
+    KSM_ORIGINAL_ADVISOR_MODE=$(
+      sed -n 's/.*\[\([^]]*\)\].*/\1/p' "${KSM_SYSFS_DIR}/advisor_mode"
+    )
+    [[ -n ${KSM_ORIGINAL_ADVISOR_MODE} ]] ||
+      fail "could not identify the active KSM advisor mode"
+  fi
+  KSM_ORIGINAL_SMART_SCAN=
+  if [[ -r ${KSM_SYSFS_DIR}/smart_scan ]]; then
+    [[ -w ${KSM_SYSFS_DIR}/smart_scan ]] ||
+      fail "KSM smart-scan control is readable but not writable"
+    KSM_ORIGINAL_SMART_SCAN=$(<"${KSM_SYSFS_DIR}/smart_scan")
+  fi
   KSM_CONTROL_ACTIVE=true
   printf '0\n' >"${KSM_SYSFS_DIR}/run"
+  [[ -z ${KSM_ORIGINAL_ADVISOR_MODE} ]] ||
+    printf 'none\n' >"${KSM_SYSFS_DIR}/advisor_mode"
+  [[ -z ${KSM_ORIGINAL_SMART_SCAN} ]] ||
+    printf '0\n' >"${KSM_SYSFS_DIR}/smart_scan"
+  printf '%s\n' "${KSM_BENCHMARK_PAGES_TO_SCAN}" \
+    >"${KSM_SYSFS_DIR}/pages_to_scan"
+  printf '0\n' >"${KSM_SYSFS_DIR}/sleep_millisecs"
   snapshot_ksm
 }
 
@@ -301,42 +336,44 @@ ksm_pause() {
 
 ksm_restore() {
   [[ ${KSM_CONTROL_ACTIVE} == true ]] || return 0
+  printf '0\n' >"${KSM_SYSFS_DIR}/run"
+  printf '%s\n' "${KSM_ORIGINAL_PAGES_TO_SCAN}" \
+    >"${KSM_SYSFS_DIR}/pages_to_scan"
+  printf '%s\n' "${KSM_ORIGINAL_SLEEP_MILLISECONDS}" \
+    >"${KSM_SYSFS_DIR}/sleep_millisecs"
+  [[ -z ${KSM_ORIGINAL_ADVISOR_MODE} ]] ||
+    printf '%s\n' "${KSM_ORIGINAL_ADVISOR_MODE}" \
+      >"${KSM_SYSFS_DIR}/advisor_mode"
+  [[ -z ${KSM_ORIGINAL_SMART_SCAN} ]] ||
+    printf '%s\n' "${KSM_ORIGINAL_SMART_SCAN}" \
+      >"${KSM_SYSFS_DIR}/smart_scan"
   printf '%s\n' "${KSM_ORIGINAL_RUN_STATE}" >"${KSM_SYSFS_DIR}/run"
   KSM_CONTROL_ACTIVE=false
 }
 
-ksm_merge_until_stable() {
+ksm_merge_two_full_scans() {
   local family=$1
   local initial_scans
-  local previous
-  local current
   local scans
-  local difference
-  local scale
   local deadline
 
   [[ ${family} == supervm ]] || return 0
   initial_scans=$(<"${KSM_SYSFS_DIR}/full_scans")
-  previous=$(<"${KSM_SYSFS_DIR}/pages_sharing")
   deadline=$((SECONDS + KSM_TIMEOUT_SECONDS))
-  printf 'supervm-bench: running KSM after settle\n' >&2
+  printf 'supervm-bench: running two accelerated full KSM scans\n' >&2
   printf '1\n' >"${KSM_SYSFS_DIR}/run"
 
   while ((SECONDS < deadline)); do
-    sleep 30
-    current=$(<"${KSM_SYSFS_DIR}/pages_sharing")
+    sleep 1
     scans=$(<"${KSM_SYSFS_DIR}/full_scans")
-    difference=$((current - previous))
-    ((difference >= 0)) || difference=$((-difference))
-    scale=${current}
-    ((previous <= scale)) || scale=${previous}
-    if ((scans > initial_scans)) &&
-      ((difference == 0 || (scale > 0 && difference * 100 < scale))); then
+    # The first increment after restarting KSM can finish a scan whose cursor
+    # predates VMAs added while scanning was paused. Require another wrap so
+    # every current mergeable range has participated before taking the result.
+    if ((scans >= initial_scans + 2)); then
       ksm_pause
       snapshot_ksm
       return
     fi
-    previous=${current}
   done
 
   ksm_pause
@@ -354,10 +391,45 @@ stop_last_instance() {
   benchmark_variant_remove_instance "${INSTANCE_TAP_NAMES[${last}]}"
   unset 'LAUNCHER_PIDS[last]' 'INSTANCE_IP_ADDRESSES[last]'
   unset 'INSTANCE_TAP_NAMES[last]' 'INSTANCE_UNIT_NAMES[last]'
+  unset 'INSTANCE_VMM_PIDS[last]'
   LAUNCHER_PIDS=("${LAUNCHER_PIDS[@]}")
   INSTANCE_IP_ADDRESSES=("${INSTANCE_IP_ADDRESSES[@]}")
   INSTANCE_TAP_NAMES=("${INSTANCE_TAP_NAMES[@]}")
   INSTANCE_UNIT_NAMES=("${INSTANCE_UNIT_NAMES[@]}")
+  INSTANCE_VMM_PIDS=("${INSTANCE_VMM_PIDS[@]}")
+}
+
+reclaim_guest_caches() {
+  local vmm
+  local executable
+  local runtime_cwd
+  local control_socket
+
+  # Idle checkpoints compare memory floors, and an idle guest's residency
+  # otherwise depends on how much boot-time page cache it happened to keep.
+  # Inflating the balloon forces each guest to shed reclaimable memory and
+  # deflating returns the space; freed pages then leave guest RAM through
+  # page reporting, so both families settle to comparable residency instead
+  # of one arm's cache-warmth luck deciding the comparison.
+  [[ ${BENCHMARK_HAS_LOAD} == false ]] || return 0
+  for vmm in "${INSTANCE_VMM_PIDS[@]}"; do
+    executable=$(readlink "/proc/${vmm}/exe" 2>/dev/null) || continue
+    runtime_cwd=$(readlink "/proc/${vmm}/cwd" 2>/dev/null) || continue
+    control_socket="${runtime_cwd}/crosvm.sock"
+    [[ -S ${control_socket} ]] || continue
+    timeout 60 "${executable}" balloon $((192 * 1024 * 1024)) \
+      "${control_socket}" --wait ||
+      printf 'supervm-bench: balloon inflate failed for VMM %s\n' \
+        "${vmm}" >&2
+    timeout 60 "${executable}" balloon 0 "${control_socket}" --wait ||
+      printf 'supervm-bench: balloon deflate failed for VMM %s\n' \
+        "${vmm}" >&2
+  done
+
+  # First boot streams blobs out of the shared objectstore to materialize
+  # the DAX extents. Those source pages are pure cache duplicating content
+  # the extents already hold, so drop them before measuring the floor.
+  evict_tree_cache "${FAMILY_OUTPUT_DIR}/state/supervm/castore/blobs"
 }
 
 stop_all_instances() {
@@ -473,6 +545,7 @@ launch_instance() {
   PENDING_INSTANCE_UNIT=
   vmm=$(wait_for_vmm_pid "${main_pid}")
   assert_process_in_family_cgroup "${vmm}" "VMM"
+  INSTANCE_VMM_PIDS+=("${vmm}")
   benchmark_variant_wait_ready "${INSTANCE_IP_ADDRESS}"
 }
 
@@ -480,13 +553,26 @@ record_process_memory() {
   local count=${#LAUNCHER_PIDS[@]}
   local cgroup_root="/sys/fs/cgroup${FAMILY_CGROUP_PATH}"
   local dax_backing_dir="${FAMILY_OUTPUT_DIR}/state/supervm/dax-backing"
+  local metadata_index="${FAMILY_RUNTIME_DIR}/supervm/metadata.v1.index"
 
   "${PROCESS_MEMORY_REPORTER}" \
     "${cgroup_root}" \
     "${dax_backing_dir}" \
+    "${metadata_index}" \
     "${count}" \
     "${CGROUP_MEMORY_FILE}" \
     "${PROCESS_MEMORY_FILE}"
+}
+
+prepare_shared_index_accounting() {
+  local family=$1
+  local metadata_index="${FAMILY_RUNTIME_DIR}/supervm/metadata.v1.index"
+
+  [[ ${family} == supervm ]] || return 0
+  # Preparation runs outside the measured family cgroup. Drop its derived
+  # index so the first launcher rebuilds it inside the family cgroup and the
+  # shared tmpfs pages are included exactly once in memory.current.
+  rm -f "${metadata_index}" "${metadata_index}.dirty"
 }
 
 record_checkpoint() {
@@ -502,11 +588,21 @@ record_checkpoint() {
   local cgroup_pressure_some
   local cgroup_pressure_full
 
+  reclaim_guest_caches
   unmerged_idle=$(settled_family_memory_current)
   idle=${unmerged_idle}
   if [[ ${family} == supervm ]]; then
-    ksm_merge_until_stable "${family}"
-    idle=$(settled_family_memory_current)
+    ksm_merge_two_full_scans "${family}"
+    # The fleet was settled before KSM started, and KSM is paused after two
+    # complete scans. A median snapshot avoids another artificial 90-second
+    # stability window after deterministic page merging.
+    idle=$(median_family_memory_current)
+  else
+    # KSM is deliberately paused for the baseline family. Do not report
+    # host-global counters left by an earlier SuperVM fleet as LameVM results.
+    KSM_PAGES_SHARED=0
+    KSM_PAGES_SHARING=0
+    KSM_FULL_SCANS=0
   fi
 
   unmerged_post=${idle}
@@ -516,8 +612,8 @@ record_checkpoint() {
     unmerged_post=$(settled_family_memory_current)
     post=${unmerged_post}
     if [[ ${family} == supervm ]]; then
-      ksm_merge_until_stable "${family}"
-      post=$(settled_family_memory_current)
+      ksm_merge_two_full_scans "${family}"
+      post=$(median_family_memory_current)
     fi
   fi
 
@@ -612,10 +708,12 @@ run_family() {
   INSTANCE_IP_ADDRESSES=()
   INSTANCE_TAP_NAMES=()
   INSTANCE_UNIT_NAMES=()
+  INSTANCE_VMM_PIDS=()
   INSTANCE_IS_PREPARED=()
   benchmark_objective_prepare_instances "${family}"
   create_family_cgroup "${family}"
   benchmark_objective_prepare_accounting
+  prepare_shared_index_accounting "${family}"
   if [[ ${BENCHMARK_HAS_LOAD} == true ]]; then
     printf 'instance_count\tunmerged_idle_bytes\tidle_bytes\tunmerged_post_load_bytes\tpost_load_bytes\tpeak_unmerged_bytes\thost_available_bytes\thost_memory_psi_some_total_us\thost_memory_psi_full_total_us\tcgroup_memory_psi_some_total_us\tcgroup_memory_psi_full_total_us\tksm_pages_shared\tksm_pages_sharing\tksm_full_scans\tmemory_high_events\tmemory_oom_events\tmemory_oom_kill_events\n' \
       >"${CHECKPOINTS_FILE}"
@@ -625,7 +723,7 @@ run_family() {
   fi
   printf 'instance_count\tcgroup_memory_current_bytes\tcgroup_memory_peak_bytes\tcgroup_anon_bytes\tcgroup_file_total_bytes\tcgroup_shmem_within_file_bytes\tcgroup_kernel_total_bytes\tcgroup_slab_within_kernel_bytes\tcgroup_pagetables_within_kernel_bytes\tcgroup_sock_within_kernel_bytes\n' \
     >"${CGROUP_MEMORY_FILE}"
-  printf 'instance_count\tpid\tinstance_index\tscope\tprocess_role\tprocess_cgroup\texecutable\tguest_memfd_rss_bytes\tguest_memfd_pss_bytes\tguest_private_rss_bytes\tguest_private_pss_bytes\tdax_rss_bytes\tdax_pss_bytes\tother_rss_bytes\tother_pss_bytes\n' \
+  printf 'instance_count\tpid\tinstance_index\tscope\tprocess_role\tprocess_cgroup\texecutable\tguest_memfd_rss_bytes\tguest_memfd_pss_bytes\tguest_private_rss_bytes\tguest_private_pss_bytes\tdax_rss_bytes\tdax_pss_bytes\tmetadata_index_rss_bytes\tmetadata_index_pss_bytes\tother_rss_bytes\tother_pss_bytes\n' \
     >"${PROCESS_MEMORY_FILE}"
 
   FAMILY_CGROUP_BASELINE_BYTES=$(median_family_memory_current)
@@ -762,8 +860,8 @@ run_benchmark() {
   esac
 
   for command in \
-    awk env fadvise find flock ln pgrep readlink realpath sed sha256sum sort \
-    sync systemctl systemd-run tr uname unlink; do
+    awk env fadvise find flock grep ln nix-store pgrep readlink realpath sed \
+    sha256sum sort sync systemctl systemd-run timeout tr uname; do
     require_command "${command}"
   done
   require_command "${SUPERVM_LAUNCHER}"
@@ -787,13 +885,15 @@ run_benchmark() {
   PROCESS_MEMORY_REPORTER="${libexec_dir}/process-memory-report.sh"
   HOST_RESERVE_BYTES=$((2 * 1024 * 1024 * 1024))
   KSM_SYSFS_DIR=/sys/kernel/mm/ksm
-  KSM_TIMEOUT_SECONDS=600
-  MEMORY_STABILITY_TIMEOUT_SECONDS=180
+  KSM_TIMEOUT_SECONDS=120
+  KSM_BENCHMARK_PAGES_TO_SCAN=65536
+  MEMORY_STABILITY_TIMEOUT_SECONDS=600
 
   declare -ga LAUNCHER_PIDS=()
   declare -ga INSTANCE_IP_ADDRESSES=()
   declare -ga INSTANCE_TAP_NAMES=()
   declare -ga INSTANCE_UNIT_NAMES=()
+  declare -ga INSTANCE_VMM_PIDS=()
   declare -ga INSTANCE_IS_PREPARED=()
   INSTANCE_TAP_NAME=
   INSTANCE_IP_ADDRESS=
@@ -818,6 +918,10 @@ run_benchmark() {
   LAUNCH_BLOCKED_BY_HOST_RESERVE=false
   KSM_CONTROL_ACTIVE=false
   KSM_ORIGINAL_RUN_STATE=
+  KSM_ORIGINAL_PAGES_TO_SCAN=
+  KSM_ORIGINAL_SLEEP_MILLISECONDS=
+  KSM_ORIGINAL_ADVISOR_MODE=
+  KSM_ORIGINAL_SMART_SCAN=
   KSM_PAGES_SHARED=0
   KSM_PAGES_SHARING=0
   KSM_FULL_SCANS=0
@@ -839,6 +943,13 @@ run_benchmark() {
   trap cleanup_benchmark EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  if [[ -e /run/lock/supervm-bench-ksm.lock ]]; then
+    [[ -w /run/lock/supervm-bench-ksm.lock ]] ||
+      fail "cannot open the benchmark KSM lock; run with sudo"
+  else
+    [[ -w /run/lock ]] ||
+      fail "cannot create the benchmark KSM lock; run with sudo"
+  fi
   exec 9>/run/lock/supervm-bench-ksm.lock
   flock --nonblock 9 || fail "another benchmark owns host KSM control"
   prepare_ksm_control
@@ -858,6 +969,19 @@ run_benchmark() {
         "$(< /sys/devices/system/cpu/nohz_full)"
     fi
     printf 'ksm_original_run=%s\n' "${KSM_ORIGINAL_RUN_STATE}"
+    printf 'ksm_original_pages_to_scan=%s\n' \
+      "${KSM_ORIGINAL_PAGES_TO_SCAN}"
+    printf 'ksm_original_sleep_millisecs=%s\n' \
+      "${KSM_ORIGINAL_SLEEP_MILLISECONDS}"
+    [[ -z ${KSM_ORIGINAL_ADVISOR_MODE} ]] ||
+      printf 'ksm_original_advisor_mode=%s\n' \
+        "${KSM_ORIGINAL_ADVISOR_MODE}"
+    [[ -z ${KSM_ORIGINAL_SMART_SCAN} ]] ||
+      printf 'ksm_original_smart_scan=%s\n' \
+        "${KSM_ORIGINAL_SMART_SCAN}"
+    printf 'ksm_benchmark_pages_to_scan=%s\n' \
+      "${KSM_BENCHMARK_PAGES_TO_SCAN}"
+    printf 'ksm_benchmark_sleep_millisecs=0\n'
     for command in pages_to_scan sleep_millisecs advisor_mode smart_scan; do
       if [[ -r ${KSM_SYSFS_DIR}/${command} ]]; then
         printf 'ksm_%s=%s\n' "${command}" "$(<"${KSM_SYSFS_DIR}/${command}")"

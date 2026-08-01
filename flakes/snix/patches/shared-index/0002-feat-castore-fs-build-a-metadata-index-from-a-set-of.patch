@@ -1,0 +1,523 @@
+From 763dbf41fc6ed2e5c0a10d86e115029798e73ba5 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Fri, 31 Jul 2026 17:11:42 +0100
+Subject: [PATCH 2/4] feat(castore/fs): build a metadata index from a set of
+ roots
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add the offline half of the shared index: a walk that resolves the whole
+closure of a set of roots through the directory service — every directory
+fetched, every `nix-support/fsmeta` declaration evaluated — and turns it
+into the flat format.
+
+Inode numbers are assigned here, once, densely and deterministically. The
+walk keys each node on exactly what the inode tracker keys on — a file's
+(digest, executable, declared-subtree) identity, a directory's (digest,
+declared-subtree) identity, a symlink's target — so the index and a live
+tracker agree on which nodes share an inode, including the attribute-aware
+splits the fsmeta series introduced. Roots are visited in basename order
+and each directory's children in stored (sorted) order, first-encounter
+assignment counting up from a fixed base, so the walk and the bytes it
+produces are a deterministic function of the store's contents.
+
+`build_from_root_nodes` wraps the walk with the declaration-reading the
+serving filesystem does, so a caller only supplies the roots and the
+convention; a missing or malformed declaration yields the empty one, just
+as when serving. Building resolves every directory exactly once, which is
+what frees a serving daemon from ever fetching one.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ snix/castore/src/fs/index/builder.rs | 443 +++++++++++++++++++++++++++
+ snix/castore/src/fs/index/mod.rs     |  21 +-
+ 2 files changed, 458 insertions(+), 6 deletions(-)
+ create mode 100644 snix/castore/src/fs/index/builder.rs
+
+diff --git a/snix/castore/src/fs/index/builder.rs b/snix/castore/src/fs/index/builder.rs
+new file mode 100644
+index 0000000..ebca218
+--- /dev/null
++++ b/snix/castore/src/fs/index/builder.rs
+@@ -0,0 +1,443 @@
++//! Building an index by walking a set of roots through the directory service.
++//!
++//! This is the offline half of the shared index: it resolves the whole closure
++//! of the given roots once — every directory fetched, every declaration
++//! evaluated — assigns each distinct identity a dense inode number, and hands
++//! the result to [format::write]. Assigning inodes here, at build time, is what
++//! frees a serving daemon from ever fetching a directory or replicating this
++//! metadata on its heap.
++
++use std::{collections::HashMap, sync::Arc};
++
++use crate::{B3Digest, Node, attrs::AttrTree, directoryservice::DirectoryService};
++
++use super::format::{self, INODE_BASE, RecordAttrs, RecordSpec};
++
++/// A root to index: its basename, its node, and what the tree declares about
++/// itself (the attribute subtree applying at and below it).
++pub type Root = (crate::path::PathComponent, Node, Arc<AttrTree>);
++
++#[derive(Debug, thiserror::Error)]
++pub enum BuildError {
++    #[error("resolving directory {digest}: {source}")]
++    DirectoryService {
++        digest: B3Digest,
++        #[source]
++        source: crate::directoryservice::Error,
++    },
++    #[error("directory {0} is referenced but not in the store; the index would be incomplete")]
++    Incomplete(B3Digest),
++    #[error("the index would hold {0} inodes, more than can be addressed")]
++    TooManyInodes(usize),
++}
++
++/// What distinguishes one inode from another: exactly the keys the inode tracker
++/// uses, so the index and a live tracker agree on which nodes share an inode.
++#[derive(PartialEq, Eq, Hash)]
++enum Identity {
++    /// digest, executable, declared-subtree identity
++    File(B3Digest, bool, B3Digest),
++    /// digest, declared-subtree identity
++    Directory(B3Digest, B3Digest),
++    /// target
++    Symlink(bytes::Bytes),
++}
++
++/// Resolves the given attributes at a node into what the format stores: the DAX
++/// hint and the served extended attributes, sorted by name.
++fn record_attrs(attrs: &AttrTree) -> RecordAttrs {
++    let na = attrs.attrs();
++    RecordAttrs {
++        dax: na.dax,
++        xattrs: na
++            .xattrs
++            .iter()
++            .map(|(name, value)| (name.as_bytes().to_vec(), value.to_vec()))
++            .collect(),
++    }
++}
++
++/// A directory awaiting expansion: the record it will populate, and the digest
++/// and declared subtree to expand it with.
++struct Pending {
++    record: usize,
++    digest: B3Digest,
++    attrs: Arc<AttrTree>,
++}
++
++#[derive(Default)]
++struct Builder {
++    records: Vec<RecordSpec>,
++    identities: HashMap<Identity, usize>,
++    queue: std::collections::VecDeque<Pending>,
++}
++
++impl Builder {
++    /// Assigns `node` its inode, allocating a fresh one the first time an
++    /// identity is seen and returning the existing one otherwise. A newly
++    /// allocated directory is queued for expansion.
++    fn intern(&mut self, node: &Node, attrs: Arc<AttrTree>) -> u64 {
++        let identity = match node {
++            Node::File {
++                digest, executable, ..
++            } => Identity::File(*digest, *executable, *attrs.id()),
++            Node::Directory { digest, .. } => Identity::Directory(*digest, *attrs.id()),
++            Node::Symlink { target } => Identity::Symlink(target.clone().into()),
++        };
++
++        if let Some(&record) = self.identities.get(&identity) {
++            return INODE_BASE + record as u64;
++        }
++
++        let record = self.records.len();
++        let spec = match node {
++            Node::File {
++                digest,
++                size,
++                executable,
++            } => RecordSpec::File {
++                digest: *digest,
++                size: *size,
++                executable: *executable,
++                attrs: record_attrs(&attrs),
++            },
++            Node::Directory { digest, size } => {
++                self.queue.push_back(Pending {
++                    record,
++                    digest: *digest,
++                    attrs: attrs.clone(),
++                });
++                RecordSpec::Directory {
++                    digest: *digest,
++                    size: *size,
++                    attrs: record_attrs(&attrs),
++                    children: Vec::new(),
++                }
++            }
++            Node::Symlink { target } => RecordSpec::Symlink {
++                target: target.as_ref().to_vec(),
++            },
++        };
++
++        self.records.push(spec);
++        self.identities.insert(identity, record);
++        INODE_BASE + record as u64
++    }
++}
++
++/// Builds an index over `roots`, resolving their whole closure through
++/// `directory_service`, and returns the serialized bytes.
++///
++/// Roots are indexed in basename order and each directory's children in their
++/// stored (sorted) order, so the walk — and therefore the output — is a
++/// deterministic function of the store's contents.
++pub async fn build_from_roots<DS>(
++    directory_service: &DS,
++    roots: impl IntoIterator<Item = Root>,
++) -> Result<Vec<u8>, BuildError>
++where
++    DS: DirectoryService + ?Sized,
++{
++    let mut roots: Vec<Root> = roots.into_iter().collect();
++    roots.sort_by(|a, b| a.0.cmp(&b.0));
++
++    let mut builder = Builder::default();
++
++    let root_entries: Vec<(Vec<u8>, u64)> = roots
++        .iter()
++        .map(|(name, node, attrs)| {
++            let ino = builder.intern(node, attrs.clone());
++            (name.as_ref().to_vec(), ino)
++        })
++        .collect();
++
++    // Expand queued directories in first-encounter (FIFO) order.
++    while let Some(pending) = builder.queue.pop_front() {
++        let directory = directory_service
++            .get(&pending.digest)
++            .await
++            .map_err(|source| BuildError::DirectoryService {
++                digest: pending.digest,
++                source,
++            })?
++            .ok_or(BuildError::Incomplete(pending.digest))?;
++
++        let mut children = Vec::new();
++        for (name, node) in directory.into_nodes() {
++            let child_attrs = pending.attrs.child(&name);
++            let ino = builder.intern(&node, child_attrs);
++            children.push((name.as_ref().to_vec(), ino));
++        }
++
++        if let RecordSpec::Directory { children: slot, .. } = &mut builder.records[pending.record] {
++            *slot = children;
++        }
++    }
++
++    if u32::try_from(builder.records.len()).is_err() {
++        return Err(BuildError::TooManyInodes(builder.records.len()));
++    }
++
++    Ok(format::write(&builder.records, &root_entries))
++}
++
++/// Builds an index over `roots`, resolving what each root declares about itself
++/// from the file named by `fsmeta_path` inside it, exactly as the serving
++/// filesystem would.
++///
++/// This is the convenience the index builders reach for: the caller supplies the
++/// roots (from a `PathInfoService`, or the children of a directory) and the
++/// declaration convention, and this reads and evaluates each declaration through
++/// the blob and directory services before walking. A declaration that is
++/// missing, unreadable or malformed yields the empty declaration, just as it
++/// does when serving.
++pub async fn build_from_root_nodes<BS, DS>(
++    blob_service: &BS,
++    directory_service: &DS,
++    roots: impl IntoIterator<Item = (crate::path::PathComponent, Node)>,
++    fsmeta_path: Option<&crate::Path>,
++) -> Result<Vec<u8>, BuildError>
++where
++    BS: crate::blobservice::BlobService + ?Sized,
++    DS: DirectoryService + ?Sized,
++{
++    let mut resolved = Vec::new();
++    for (name, node) in roots {
++        let attrs = resolve_declaration(blob_service, directory_service, &node, fsmeta_path).await;
++        resolved.push((name, node, attrs));
++    }
++    build_from_roots(directory_service, resolved).await
++}
++
++/// Reads what `root_node` declares about itself, from `fsmeta_path` inside it.
++///
++/// Everything about it is a hint, so every failure — no path configured, no such
++/// file, unreadable, oversized, unparseable — yields the empty declaration.
++async fn resolve_declaration<BS, DS>(
++    blob_service: &BS,
++    directory_service: &DS,
++    root_node: &Node,
++    fsmeta_path: Option<&crate::Path>,
++) -> Arc<AttrTree>
++where
++    BS: crate::blobservice::BlobService + ?Sized,
++    DS: DirectoryService + ?Sized,
++{
++    let Some(fsmeta_path) = fsmeta_path else {
++        return AttrTree::empty();
++    };
++    match read_declaration(blob_service, directory_service, root_node, fsmeta_path).await {
++        Ok(Some(tree)) => tree,
++        Ok(None) => AttrTree::empty(),
++        Err(err) => {
++            tracing::debug!(%err, "ignoring filesystem attribute declaration");
++            AttrTree::empty()
++        }
++    }
++}
++
++async fn read_declaration<BS, DS>(
++    blob_service: &BS,
++    directory_service: &DS,
++    root_node: &Node,
++    fsmeta_path: &crate::Path,
++) -> std::io::Result<Option<Arc<AttrTree>>>
++where
++    BS: crate::blobservice::BlobService + ?Sized,
++    DS: DirectoryService + ?Sized,
++{
++    use std::io;
++    use tokio::io::AsyncReadExt;
++
++    let Node::Directory { digest, .. } = root_node else {
++        // A root which is a single file or symlink has nowhere to put one.
++        return Ok(None);
++    };
++
++    let mut digest = *digest;
++    let mut components = fsmeta_path.components().peekable();
++
++    let file = loop {
++        let Some(name) = components.next() else {
++            return Ok(None);
++        };
++
++        let Some(directory) = directory_service
++            .get(&digest)
++            .await
++            .map_err(io::Error::other)?
++        else {
++            return Ok(None);
++        };
++
++        let Some((_, node)) = directory.nodes().find(|(n, _)| **n == name) else {
++            return Ok(None);
++        };
++
++        match (node, components.peek()) {
++            (Node::Directory { digest: child, .. }, Some(_)) => digest = *child,
++            (node @ Node::File { .. }, None) => break node.clone(),
++            _ => return Ok(None),
++        }
++    };
++
++    let Node::File { digest, size, .. } = &file else {
++        return Ok(None);
++    };
++
++    if *size > crate::attrs::MAX_SIZE as u64 {
++        return Err(io::Error::other(format!(
++            "declaration is {size} bytes, larger than the limit"
++        )));
++    }
++
++    let reader = blob_service
++        .open_read(digest)
++        .await
++        .map_err(io::Error::other)?
++        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "blob not found"))?;
++    // Do not trust a service to return exactly the recorded size; read at most
++    // one byte past the parser's limit, enough for it to reject the input.
++    let mut reader = reader.take((crate::attrs::MAX_SIZE + 1) as u64);
++    let mut buf = Vec::with_capacity(*size as usize);
++    reader.read_to_end(&mut buf).await?;
++
++    AttrTree::parse(&buf).map(Some).map_err(io::Error::other)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::fs::index::{Record, SharedIndex};
++    use crate::{Directory, Node, attrs::ATTR_DAX, path::PathComponent};
++
++    fn blob(n: u8) -> B3Digest {
++        B3Digest::try_from(&[n; 32][..]).unwrap()
++    }
++
++    fn file(digest: B3Digest, executable: bool) -> Node {
++        Node::File {
++            digest,
++            size: 1,
++            executable,
++        }
++    }
++
++    fn dir_node(d: &Directory) -> Node {
++        Node::Directory {
++            digest: d.digest(),
++            size: d.size(),
++        }
++    }
++
++    fn pc(s: &str) -> PathComponent {
++        s.try_into().unwrap()
++    }
++
++    async fn service_with(dirs: Vec<Directory>) -> impl DirectoryService {
++        let ds = crate::utils::gen_test_directory_service();
++        for d in dirs {
++            ds.put(d).await.unwrap();
++        }
++        ds
++    }
++
++    #[tokio::test]
++    async fn walks_a_tree_and_dedups_by_identity() {
++        // sub/ holds a symlink; root holds a file and sub. The same blob appears
++        // as root/f and sub/f, so the two must share one inode.
++        let sub = Directory::try_from_iter([
++            (
++                pc("s"),
++                Node::Symlink {
++                    target: "elsewhere".try_into().unwrap(),
++                },
++            ),
++            (pc("f"), file(blob(7), false)),
++        ])
++        .unwrap();
++        let root = Directory::try_from_iter([
++            (pc("f"), file(blob(7), false)),
++            (pc("sub"), dir_node(&sub)),
++        ])
++        .unwrap();
++
++        let ds = service_with(vec![sub.clone(), root.clone()]).await;
++        let roots = vec![(pc("r"), dir_node(&root), AttrTree::empty())];
++        let bytes = build_from_roots(&ds, roots).await.expect("build");
++        let idx = SharedIndex::from_bytes(bytes).expect("valid");
++
++        let r = idx.lookup_root(b"r").expect("root present");
++        let f = idx.lookup_child(r, b"f").expect("root/f");
++        let sub_ino = idx.lookup_child(r, b"sub").expect("root/sub");
++        let f2 = idx.lookup_child(sub_ino, b"f").expect("sub/f");
++        assert_eq!(f, f2, "identical files must share an inode");
++
++        assert!(matches!(idx.record(f), Some(Record::File { .. })));
++        let s = idx.lookup_child(sub_ino, b"s").expect("sub/s");
++        assert!(matches!(
++            idx.record(s),
++            Some(Record::Symlink { target }) if target == b"elsewhere",
++        ));
++    }
++
++    #[tokio::test]
++    async fn the_same_store_builds_byte_identically() {
++        let d = Directory::try_from_iter([(pc("a"), file(blob(1), false))]).unwrap();
++        let roots = || vec![(pc("p"), dir_node(&d), AttrTree::empty())];
++
++        let ds = service_with(vec![d.clone()]).await;
++        let a = build_from_roots(&ds, roots()).await.unwrap();
++        let b = build_from_roots(&ds, roots()).await.unwrap();
++        assert_eq!(a, b, "the same store must produce the same bytes");
++    }
++
++    #[tokio::test]
++    async fn declared_attributes_split_an_inode() {
++        // Two directories a/ and b/ both hold the same blob as `f`, but the
++        // declaration marks only a/f for DAX. They must not share an inode.
++        let a = Directory::try_from_iter([(pc("f"), file(blob(3), false))]).unwrap();
++        let b = Directory::try_from_iter([(pc("f"), file(blob(3), false))]).unwrap();
++        let root =
++            Directory::try_from_iter([(pc("a"), dir_node(&a)), (pc("b"), dir_node(&b))]).unwrap();
++
++        let ds = service_with(vec![a.clone(), b.clone(), root.clone()]).await;
++        let declared = AttrTree::parse(format!("{ATTR_DAX} a/f\n").as_bytes()).unwrap();
++        let roots = vec![(pc("r"), dir_node(&root), declared)];
++        let idx = SharedIndex::from_bytes(build_from_roots(&ds, roots).await.unwrap()).unwrap();
++
++        let r = idx.lookup_root(b"r").unwrap();
++        let a_ino = idx.lookup_child(r, b"a").unwrap();
++        let b_ino = idx.lookup_child(r, b"b").unwrap();
++        let a_f = idx.lookup_child(a_ino, b"f").unwrap();
++        let b_f = idx.lookup_child(b_ino, b"f").unwrap();
++
++        assert_ne!(a_f, b_f, "different declarations must not share an inode");
++        assert!(matches!(
++            idx.record(a_f),
++            Some(Record::File { dax: true, .. })
++        ));
++        assert!(matches!(
++            idx.record(b_f),
++            Some(Record::File { dax: false, .. })
++        ));
++    }
++
++    #[tokio::test]
++    async fn a_missing_directory_is_an_error() {
++        // A root pointing at a directory that was never persisted.
++        let ds = crate::utils::gen_test_directory_service();
++        let roots = vec![(
++            pc("r"),
++            Node::Directory {
++                digest: blob(9),
++                size: 1,
++            },
++            AttrTree::empty(),
++        )];
++        assert!(matches!(
++            build_from_roots(&ds, roots).await,
++            Err(BuildError::Incomplete(_)),
++        ));
++    }
++}
+diff --git a/snix/castore/src/fs/index/mod.rs b/snix/castore/src/fs/index/mod.rs
+index 471121f..1fdb9aa 100644
+--- a/snix/castore/src/fs/index/mod.rs
++++ b/snix/castore/src/fs/index/mod.rs
+@@ -12,17 +12,26 @@
+ //! the extended attributes and the per-inode DAX hint straight from the mapping,
+ //! touching neither its heap nor the directory service.
+ //!
+-//! # Determinism
++//! # Identity and determinism
+ //!
+-//! The [writer][format::write] is a pure function of the records handed to it,
+-//! so the same input always produces byte-identical output and every daemon
+-//! mapping one file agrees on every inode by construction, without any hashing
+-//! or coordination. The [builder][mod@self] that turns a store into those
+-//! records is added on top of this format.
++//! Inode numbers are assigned once, when the index is [built][build_from_roots]:
++//! the builder walks the roots through the directory service exactly as the
++//! filesystem would, evaluating the same attribute declarations, and gives every
++//! distinct identity — the same [FileKey]/[DirKey]/symlink-target the inode
++//! tracker keys on — one dense inode number counting up from [format::INODE_BASE].
++//! The walk is deterministic (roots and children in sorted order, no timestamps,
++//! no randomness), so the same input always produces byte-identical output and
++//! every daemon mapping one file agrees on every inode by construction, without
++//! any hashing or coordination.
++//!
++//! [FileKey]: super::inode_tracker
++//! [DirKey]: super::inode_tracker
+ 
++mod builder;
+ mod format;
+ mod mmap;
+ 
++pub use builder::{BuildError, build_from_root_nodes, build_from_roots};
+ pub use format::{
+     DIRENT_SIZE, HEADER_SIZE, INODE_BASE, Index, IndexError, Kind, RECORD_SIZE, Record,
+     RecordAttrs, RecordSpec, VERSION, write,

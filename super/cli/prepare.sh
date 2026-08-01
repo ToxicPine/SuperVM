@@ -33,16 +33,41 @@ build_prepared_runner() {
 }
 
 run_prepare() {
+  local closure_id
+  local closure_marker
+
   build_prepared_runner
   start_shared_services false
 
-  echo "supervm: ingesting system closure"
-  refs="${runtime_dir}/${vm_id}-refs.json"
-  nix path-info --json --recursive "${system}" |
-    jq '[to_entries[] | .value + {path: .key}]' >"${refs}"
-  snix store copy "${refs}" >/dev/null
-  rm -f "${refs}"
-  refs=
+  closure_id=$(printf '%s' "${system}" | sha256sum)
+  closure_id=${closure_id%% *}
+  closure_marker="${imported_closures_dir}/${closure_id}.closure"
+  if [[ -r ${closure_marker} && $(<"${closure_marker}") == "${system}" ]]; then
+    echo "supervm: system closure is already in the shared store"
+  else
+    echo "supervm: ingesting system closure"
+    refs="${runtime_dir}/${vm_id}-refs.json"
+    nix path-info --json --recursive "${system}" |
+      jq '[to_entries[] | .value + {path: .key}]' >"${refs}"
+    snix store copy "${refs}" >/dev/null
+    rm -f "${refs}"
+    refs=
+    pending_closure_marker="${closure_marker}.tmp.$$"
+    printf '%s\n' "${system}" >"${pending_closure_marker}"
+    mv -f "${pending_closure_marker}" "${closure_marker}"
+    pending_closure_marker=
+  fi
+
+  # The index is derived state and lives on the runtime tmpfs. Rebuild it only
+  # after the imported closure is visible, so newly launched daemons map a
+  # complete snapshot. Daemons already running retain their previous mapping
+  # and use the inode-tracker overlay for roots that snapshot did not cover.
+  metadata_index_covers_closure "${closure_id}"
+  if [[ ${metadata_index_covers_closure_result} == true ]]; then
+    echo "supervm: shared metadata index already covers the system closure"
+  else
+    update_metadata_index_after_prepare
+  fi
 
   # The GC root is also the preparation record. Publish it only after the
   # exact runner's system closure has reached the shared store.

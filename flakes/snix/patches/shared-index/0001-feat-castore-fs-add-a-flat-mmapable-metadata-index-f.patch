@@ -1,0 +1,1173 @@
+From ace58649bd1d3513d05c8e3d319bca8599264f53 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Fri, 31 Jul 2026 17:11:17 +0100
+Subject: [PATCH 1/4] feat(castore/fs): add a flat, mmapable metadata index
+ format
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Serving a store over virtio-fs, the castore filesystem assigns an inode
+to every distinct identity it meets and keeps that node's digest, size,
+declared attributes and directory listing on its heap. For a large
+immutable tree that is a few megabytes, and every daemon serving the
+same content builds its own private replica of it.
+
+Add the artifact that lets N daemons share one copy instead: a flat,
+explicitly-laid-out, little-endian file they map read-only, so the
+metadata lives once in the host page cache rather than N times on the
+heap. A fixed header points at a dense per-inode record table, the
+mount-root and per-directory child tables (sorted by name for binary
+search), a name/byte pool and a deduplicated extended-attribute section.
+
+Reading it deserializes nothing into owned structures: `Index::parse`
+validates the whole file once — every offset, count and cross-reference,
+treating it as untrusted input so a truncated or corrupt file is a clean
+error rather than undefined behaviour — and the accessors then return
+small copies of individual fields or `&[u8]` views into the mapping. The
+writer is a pure function of its input, laying sections out in a fixed
+order and interning the pool and attrs in first-encounter order, so
+identical input yields byte-identical output; that determinism is what
+lets every consumer of one file agree on every inode by construction.
+
+The mapping is a few lines of `libc` rather than a dependency: the crate
+already links it for the filesystem layer, the map is created once and
+never changed, and a read-only file mapping is exactly what shares
+page-cache pages between processes.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ snix/castore/src/fs/index/format.rs | 934 ++++++++++++++++++++++++++++
+ snix/castore/src/fs/index/mmap.rs   |  88 +++
+ snix/castore/src/fs/index/mod.rs    |  75 +++
+ snix/castore/src/fs/mod.rs          |   1 +
+ 4 files changed, 1098 insertions(+)
+ create mode 100644 snix/castore/src/fs/index/format.rs
+ create mode 100644 snix/castore/src/fs/index/mmap.rs
+ create mode 100644 snix/castore/src/fs/index/mod.rs
+
+diff --git a/snix/castore/src/fs/index/format.rs b/snix/castore/src/fs/index/format.rs
+new file mode 100644
+index 0000000..2d578f7
+--- /dev/null
++++ b/snix/castore/src/fs/index/format.rs
+@@ -0,0 +1,934 @@
++//! The on-disk layout of a shared metadata index, and the code that writes and
++//! reads it.
++//!
++//! # Shape
++//!
++//! Everything is little-endian and explicitly sized. The file is a fixed
++//! header followed by five sections, each 8-byte aligned:
++//!
++//! ```text
++//! header      fixed 128 bytes: magic, version, the inode base and count, and
++//!             the offset and length of every section below.
++//! records     a dense array of fixed [RECORD_SIZE]-byte records, one per
++//!             index inode, indexed by `ino - inode_base`.
++//! roots       the mount root's listing: [DIRENT_SIZE]-byte entries sorted by
++//!             name, mapping a root basename to its index inode.
++//! dirents     every directory's children, each a contiguous run of
++//!             [DIRENT_SIZE]-byte entries sorted by name; a directory record
++//!             points at its run.
++//! pool        a flat byte pool holding names, symlink targets, and extended
++//!             attribute names and values, addressed by (offset, length).
++//! attrs       serialized extended attributes, one entry per distinct set,
++//!             deduplicated; a record points at its entry by byte offset.
++//! ```
++//!
++//! # Reading
++//!
++//! Nothing is deserialized into owned structures. [Index::parse] validates the
++//! whole file once — every offset, count and cross-reference — so that a
++//! truncated or corrupt file is a clean error rather than undefined behaviour,
++//! and the accessors that run afterwards return small copies of individual
++//! fields (or borrowed `&[u8]` into the mapping) on demand.
++//!
++//! # Determinism
++//!
++//! The writer is a pure function of the records handed to it: sections are laid
++//! out in a fixed order, the pool and the attrs section intern their contents
++//! in first-encounter order, and no timestamp or padding byte is ever left
++//! uninitialized. Identical input therefore produces byte-identical output,
++//! which is what lets every consumer of one index file agree on every inode by
++//! construction.
++
++use std::collections::HashMap;
++
++use crate::B3Digest;
++
++/// Identifies the format. Bumped on any incompatible layout change.
++pub const MAGIC: [u8; 8] = *b"SNIXMIX1";
++
++/// The layout version. [Index::parse] refuses anything else.
++pub const VERSION: u32 = 1;
++
++/// The fixed size of the header, in bytes. The records section starts here.
++pub const HEADER_SIZE: usize = 128;
++
++/// The size of one inode record.
++pub const RECORD_SIZE: usize = 56;
++
++/// The size of one directory entry, in the roots and dirents sections.
++pub const DIRENT_SIZE: usize = 16;
++
++/// The first inode the index hands out. Inode 1 is the permanent FUSE root and
++/// belongs to no store path, so the index starts one above it. Overlay inodes,
++/// allocated by the inode tracker for anything the index does not cover, begin
++/// strictly above the index's range so the two never collide.
++pub const INODE_BASE: u64 = 2;
++
++/// A record's `attrs_ref` when the node declares no served attributes, which is
++/// the overwhelmingly common case.
++const NO_ATTRS: u32 = u32::MAX;
++
++/// The kind of a node, as stored in a record's first byte.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++#[repr(u8)]
++pub enum Kind {
++    Directory = 0,
++    File = 1,
++    Symlink = 2,
++}
++
++impl Kind {
++    fn from_u8(v: u8) -> Option<Self> {
++        match v {
++            0 => Some(Self::Directory),
++            1 => Some(Self::File),
++            2 => Some(Self::Symlink),
++            _ => None,
++        }
++    }
++}
++
++/// Errors from validating an index on open. Every one describes an index that
++/// is malformed or truncated; none can arise from a well-formed file.
++#[derive(Debug, thiserror::Error)]
++pub enum IndexError {
++    #[error("index is shorter than a header")]
++    TooShort,
++    #[error("not a metadata index (bad magic)")]
++    BadMagic,
++    #[error("unsupported index version {0}, expected {VERSION}")]
++    BadVersion(u32),
++    #[error("index inode base {0} overlaps the reserved root inode")]
++    BadInodeBase(u64),
++    #[error("index declares a length of {declared} but is {actual} bytes")]
++    BadLength { declared: u64, actual: usize },
++    #[error("section '{0}' lies outside the file or is misaligned")]
++    BadSection(&'static str),
++    #[error("a {0} reference points outside its section")]
++    OutOfBounds(&'static str),
++    #[error("a directory's children are not sorted by name")]
++    Unsorted,
++    #[error("a child inode {0} is not a valid index inode")]
++    BadChildInode(u64),
++    #[error("a record has an unknown node kind {0}")]
++    BadKind(u8),
++}
++
++fn read_u32(bytes: &[u8], at: usize) -> u32 {
++    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
++}
++
++fn read_u64(bytes: &[u8], at: usize) -> u64 {
++    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
++}
++
++/// What a tree declares about one node, as served over the filesystem: the
++/// per-inode DAX hint and the extended attributes to hand out verbatim.
++///
++/// This is the resolved [NodeAttrs](crate::attrs::NodeAttrs) *at* a node, not
++/// the subtree below it: the index has already descended the declaration and
++/// pinned each inode's own attributes.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct RecordAttrs {
++    pub dax: bool,
++    /// Extended attributes, sorted by name, as (name, value) byte pairs.
++    pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
++}
++
++/// One node, as handed to the writer. The writer assigns nothing: inode numbers
++/// are the position of each record in this list, offset by [INODE_BASE], so the
++/// caller is what makes them dense and deterministic.
++#[derive(Clone, Debug)]
++pub enum RecordSpec {
++    Directory {
++        digest: B3Digest,
++        size: u64,
++        attrs: RecordAttrs,
++        /// Child (name, inode) pairs. Sorted by the writer.
++        children: Vec<(Vec<u8>, u64)>,
++    },
++    File {
++        digest: B3Digest,
++        size: u64,
++        executable: bool,
++        attrs: RecordAttrs,
++    },
++    Symlink {
++        target: Vec<u8>,
++    },
++}
++
++/// Serializes a set of records and the mount root's listing into the index
++/// format.
++///
++/// `records[i]` describes the inode `INODE_BASE + i`; every child inode named
++/// in a directory, and every root inode, must be one of those. The output is a
++/// pure function of the arguments.
++pub fn write(records: &[RecordSpec], roots: &[(Vec<u8>, u64)]) -> Vec<u8> {
++    let mut pool = Pool::default();
++    let mut attrs = AttrsSection::default();
++
++    // Records, in order. Directory children are flattened into one dirents
++    // section; each record records the run that is its own.
++    let mut record_bytes = vec![0u8; records.len() * RECORD_SIZE];
++    let mut dirents: Vec<(u32, u32, u64)> = Vec::new();
++
++    for (i, spec) in records.iter().enumerate() {
++        let rec = &mut record_bytes[i * RECORD_SIZE..(i + 1) * RECORD_SIZE];
++        match spec {
++            RecordSpec::Directory {
++                digest,
++                size,
++                attrs: node_attrs,
++                children,
++            } => {
++                let first = dirents.len() as u32;
++                let mut sorted = children.clone();
++                sorted.sort_by(|a, b| a.0.cmp(&b.0));
++                for (name, ino) in &sorted {
++                    let (off, len) = pool.intern(name);
++                    dirents.push((off, len, *ino));
++                }
++                rec[0] = Kind::Directory as u8;
++                rec[4..8].copy_from_slice(&attrs.intern(node_attrs, &mut pool).to_le_bytes());
++                rec[8..16].copy_from_slice(&size.to_le_bytes());
++                rec[16..48].copy_from_slice(digest.as_ref());
++                rec[48..52].copy_from_slice(&first.to_le_bytes());
++                rec[52..56].copy_from_slice(&(sorted.len() as u32).to_le_bytes());
++            }
++            RecordSpec::File {
++                digest,
++                size,
++                executable,
++                attrs: node_attrs,
++            } => {
++                rec[0] = Kind::File as u8;
++                rec[1] = u8::from(*executable);
++                rec[2] = u8::from(node_attrs.dax);
++                rec[4..8].copy_from_slice(&attrs.intern(node_attrs, &mut pool).to_le_bytes());
++                rec[8..16].copy_from_slice(&size.to_le_bytes());
++                rec[16..48].copy_from_slice(digest.as_ref());
++            }
++            RecordSpec::Symlink { target } => {
++                let (off, len) = pool.intern(target);
++                rec[0] = Kind::Symlink as u8;
++                rec[4..8].copy_from_slice(&NO_ATTRS.to_le_bytes());
++                rec[8..16].copy_from_slice(&(len as u64).to_le_bytes());
++                rec[48..52].copy_from_slice(&off.to_le_bytes());
++            }
++        }
++    }
++
++    // The roots listing, sorted by name.
++    let mut roots_sorted = roots.to_vec();
++    roots_sorted.sort_by(|a, b| a.0.cmp(&b.0));
++    let mut root_bytes = vec![0u8; roots_sorted.len() * DIRENT_SIZE];
++    for (i, (name, ino)) in roots_sorted.iter().enumerate() {
++        let (off, len) = pool.intern(name);
++        let e = &mut root_bytes[i * DIRENT_SIZE..(i + 1) * DIRENT_SIZE];
++        e[0..4].copy_from_slice(&off.to_le_bytes());
++        e[4..8].copy_from_slice(&len.to_le_bytes());
++        e[8..16].copy_from_slice(ino.to_le_bytes().as_ref());
++    }
++
++    let mut dirent_bytes = vec![0u8; dirents.len() * DIRENT_SIZE];
++    for (i, (off, len, ino)) in dirents.iter().enumerate() {
++        let e = &mut dirent_bytes[i * DIRENT_SIZE..(i + 1) * DIRENT_SIZE];
++        e[0..4].copy_from_slice(&off.to_le_bytes());
++        e[4..8].copy_from_slice(&len.to_le_bytes());
++        e[8..16].copy_from_slice(&ino.to_le_bytes());
++    }
++
++    // Lay the sections out one after another, each 8-byte aligned.
++    let mut out = vec![0u8; HEADER_SIZE];
++    let records_off = out.len();
++    out.extend_from_slice(&record_bytes);
++    align(&mut out);
++    let roots_off = out.len();
++    out.extend_from_slice(&root_bytes);
++    align(&mut out);
++    let dirents_off = out.len();
++    out.extend_from_slice(&dirent_bytes);
++    align(&mut out);
++    let pool_off = out.len();
++    out.extend_from_slice(&pool.bytes);
++    align(&mut out);
++    let attrs_off = out.len();
++    out.extend_from_slice(&attrs.bytes);
++
++    let file_len = out.len() as u64;
++
++    let h = &mut out[..HEADER_SIZE];
++    h[0..8].copy_from_slice(&MAGIC);
++    h[8..12].copy_from_slice(&VERSION.to_le_bytes());
++    // 12..16 flags, left zero.
++    h[16..24].copy_from_slice(&INODE_BASE.to_le_bytes());
++    h[24..32].copy_from_slice(&(records.len() as u64).to_le_bytes());
++    h[32..40].copy_from_slice(&(records_off as u64).to_le_bytes());
++    h[40..48].copy_from_slice(&(roots_off as u64).to_le_bytes());
++    h[48..56].copy_from_slice(&(roots_sorted.len() as u64).to_le_bytes());
++    h[56..64].copy_from_slice(&(dirents_off as u64).to_le_bytes());
++    h[64..72].copy_from_slice(&(dirents.len() as u64).to_le_bytes());
++    h[72..80].copy_from_slice(&(pool_off as u64).to_le_bytes());
++    h[80..88].copy_from_slice(&(pool.bytes.len() as u64).to_le_bytes());
++    h[88..96].copy_from_slice(&(attrs_off as u64).to_le_bytes());
++    h[96..104].copy_from_slice(&(attrs.bytes.len() as u64).to_le_bytes());
++    h[104..112].copy_from_slice(&file_len.to_le_bytes());
++
++    out
++}
++
++fn align(out: &mut Vec<u8>) {
++    while out.len() % 8 != 0 {
++        out.push(0);
++    }
++}
++
++/// The byte pool, interning identical byte strings in first-encounter order.
++#[derive(Default)]
++struct Pool {
++    bytes: Vec<u8>,
++    seen: HashMap<Vec<u8>, u32>,
++}
++
++impl Pool {
++    fn intern(&mut self, s: &[u8]) -> (u32, u32) {
++        let len = s.len() as u32;
++        if let Some(&off) = self.seen.get(s) {
++            return (off, len);
++        }
++        let off = self.bytes.len() as u32;
++        self.bytes.extend_from_slice(s);
++        self.seen.insert(s.to_vec(), off);
++        (off, len)
++    }
++}
++
++/// The attrs section, interning identical serialized entries in first-encounter
++/// order. A node declaring nothing gets [NO_ATTRS] rather than an entry.
++#[derive(Default)]
++struct AttrsSection {
++    bytes: Vec<u8>,
++    seen: HashMap<Vec<u8>, u32>,
++}
++
++impl AttrsSection {
++    fn intern(&mut self, attrs: &RecordAttrs, pool: &mut Pool) -> u32 {
++        if attrs.xattrs.is_empty() {
++            return NO_ATTRS;
++        }
++
++        // Serialize into the pool references first, then dedup by the serialized
++        // bytes so two nodes declaring the same attributes share one entry.
++        let mut entry = Vec::with_capacity(4 + attrs.xattrs.len() * 16);
++        entry.extend_from_slice(&(attrs.xattrs.len() as u32).to_le_bytes());
++        for (name, value) in &attrs.xattrs {
++            let (noff, nlen) = pool.intern(name);
++            let (voff, vlen) = pool.intern(value);
++            entry.extend_from_slice(&noff.to_le_bytes());
++            entry.extend_from_slice(&nlen.to_le_bytes());
++            entry.extend_from_slice(&voff.to_le_bytes());
++            entry.extend_from_slice(&vlen.to_le_bytes());
++        }
++
++        if let Some(&off) = self.seen.get(&entry) {
++            return off;
++        }
++        let off = self.bytes.len() as u32;
++        self.bytes.extend_from_slice(&entry);
++        self.seen.insert(entry, off);
++        off
++    }
++}
++
++/// A validated, read-only view over the bytes of an index.
++///
++/// Constructed by [Index::parse], which checks the entire file. Every accessor
++/// afterwards is total and cheap: it copies out small fixed fields or borrows a
++/// `&[u8]` into the backing bytes, and never allocates an owned replica of the
++/// tree.
++pub struct Index<B> {
++    bytes: B,
++    inode_base: u64,
++    inode_count: u64,
++    records_off: usize,
++    roots_off: usize,
++    roots_count: usize,
++    dirents_off: usize,
++    dirents_count: usize,
++    pool_off: usize,
++    pool_len: usize,
++    attrs_off: usize,
++    attrs_len: usize,
++}
++
++/// A borrowed view of one record, resolved against the backing bytes on demand.
++pub enum Record<'a> {
++    Directory {
++        digest: B3Digest,
++        size: u64,
++        attrs_ref: u32,
++        first_child: usize,
++        child_count: usize,
++    },
++    File {
++        digest: B3Digest,
++        size: u64,
++        executable: bool,
++        dax: bool,
++        attrs_ref: u32,
++    },
++    Symlink {
++        target: &'a [u8],
++    },
++}
++
++impl Record<'_> {
++    /// The reference to this record's served extended attributes. A symlink has
++    /// none; a directory or file with no declared attributes references the
++    /// empty set, over which the attribute accessors yield nothing.
++    pub fn attrs_ref(&self) -> Option<u32> {
++        match self {
++            Record::Directory { attrs_ref, .. } | Record::File { attrs_ref, .. } => {
++                Some(*attrs_ref)
++            }
++            Record::Symlink { .. } => None,
++        }
++    }
++}
++
++impl<B: AsRef<[u8]>> Index<B> {
++    /// Validates `bytes` in full and returns a view over them, or an error
++    /// describing how the index is malformed. The index is treated as untrusted
++    /// input: after this returns `Ok`, no accessor can index out of bounds.
++    pub fn parse(bytes: B) -> Result<Self, IndexError> {
++        let b = bytes.as_ref();
++        if b.len() < HEADER_SIZE {
++            return Err(IndexError::TooShort);
++        }
++        if b[0..8] != MAGIC {
++            return Err(IndexError::BadMagic);
++        }
++        let version = read_u32(b, 8);
++        if version != VERSION {
++            return Err(IndexError::BadVersion(version));
++        }
++        let inode_base = read_u64(b, 16);
++        if inode_base <= fuse_root_id() {
++            return Err(IndexError::BadInodeBase(inode_base));
++        }
++        let inode_count = read_u64(b, 24);
++        let records_off = read_u64(b, 32);
++        let roots_off = read_u64(b, 40);
++        let roots_count = read_u64(b, 48);
++        let dirents_off = read_u64(b, 56);
++        let dirents_count = read_u64(b, 64);
++        let pool_off = read_u64(b, 72);
++        let pool_len = read_u64(b, 80);
++        let attrs_off = read_u64(b, 88);
++        let attrs_len = read_u64(b, 96);
++        let file_len = read_u64(b, 104);
++
++        if file_len as usize != b.len() {
++            return Err(IndexError::BadLength {
++                declared: file_len,
++                actual: b.len(),
++            });
++        }
++
++        // Inode base plus count must not overflow, so the inode range is a
++        // well-defined half-open interval.
++        inode_base
++            .checked_add(inode_count)
++            .ok_or(IndexError::BadInodeBase(inode_base))?;
++
++        let section = |off: u64, count: u64, size: usize, name: &'static str| {
++            let bytes = count
++                .checked_mul(size as u64)
++                .ok_or(IndexError::BadSection(name))?;
++            let end = off.checked_add(bytes).ok_or(IndexError::BadSection(name))?;
++            if off % 8 != 0 || end > file_len {
++                return Err(IndexError::BadSection(name));
++            }
++            Ok(())
++        };
++        section(records_off, inode_count, RECORD_SIZE, "records")?;
++        section(roots_off, roots_count, DIRENT_SIZE, "roots")?;
++        section(dirents_off, dirents_count, DIRENT_SIZE, "dirents")?;
++        section(pool_off, pool_len, 1, "pool")?;
++        section(attrs_off, attrs_len, 1, "attrs")?;
++
++        let index = Index {
++            bytes,
++            inode_base,
++            inode_count,
++            records_off: records_off as usize,
++            roots_off: roots_off as usize,
++            roots_count: roots_count as usize,
++            dirents_off: dirents_off as usize,
++            dirents_count: dirents_count as usize,
++            pool_off: pool_off as usize,
++            pool_len: pool_len as usize,
++            attrs_off: attrs_off as usize,
++            attrs_len: attrs_len as usize,
++        };
++        index.validate_contents()?;
++        Ok(index)
++    }
++
++    /// Checks every cross-reference the accessors will later trust: dirent name
++    /// and inode references, per-record fields, attribute entries, and the
++    /// sortedness the binary searches rely on.
++    fn validate_contents(&self) -> Result<(), IndexError> {
++        // Roots and every directory's children must be sorted by name and point
++        // at valid index inodes.
++        self.validate_dirent_run(0, self.roots_count, self.roots_off, "root")?;
++
++        for i in 0..self.inode_count as usize {
++            match self.record_at(i)? {
++                Record::Directory {
++                    attrs_ref,
++                    first_child,
++                    child_count,
++                    ..
++                } => {
++                    if first_child
++                        .checked_add(child_count)
++                        .is_none_or(|end| end > self.dirents_count)
++                    {
++                        return Err(IndexError::OutOfBounds("directory children"));
++                    }
++                    self.validate_dirent_run(
++                        first_child,
++                        child_count,
++                        self.dirents_off,
++                        "directory child",
++                    )?;
++                    self.validate_attrs_ref(attrs_ref)?;
++                }
++                Record::File { attrs_ref, .. } => self.validate_attrs_ref(attrs_ref)?,
++                Record::Symlink { .. } => {}
++            }
++        }
++        Ok(())
++    }
++
++    fn validate_dirent_run(
++        &self,
++        start: usize,
++        count: usize,
++        base: usize,
++        what: &'static str,
++    ) -> Result<(), IndexError> {
++        let mut prev: Option<&[u8]> = None;
++        for i in start..start + count {
++            let at = base + i * DIRENT_SIZE;
++            let name_off = read_u32(self.bytes.as_ref(), at) as usize;
++            let name_len = read_u32(self.bytes.as_ref(), at + 4) as usize;
++            let ino = read_u64(self.bytes.as_ref(), at + 8);
++            let name = self
++                .pool_slice(name_off, name_len)
++                .ok_or(IndexError::OutOfBounds(what))?;
++            if !self.is_index_inode(ino) {
++                return Err(IndexError::BadChildInode(ino));
++            }
++            if let Some(prev) = prev
++                && prev >= name
++            {
++                return Err(IndexError::Unsorted);
++            }
++            prev = Some(name);
++        }
++        Ok(())
++    }
++
++    fn validate_attrs_ref(&self, attrs_ref: u32) -> Result<(), IndexError> {
++        if attrs_ref == NO_ATTRS {
++            return Ok(());
++        }
++        let at = attrs_ref as usize;
++        // The entry is `count` then `count` 16-byte (name, value) reference
++        // quads, all within the attrs section, all pointing into the pool.
++        let read = |off: usize| -> Result<u32, IndexError> {
++            let abs = self
++                .attrs_off
++                .checked_add(off)
++                .filter(|end| {
++                    end.checked_add(4)
++                        .is_some_and(|e| e <= self.attrs_off + self.attrs_len)
++                })
++                .ok_or(IndexError::OutOfBounds("attrs"))?;
++            Ok(read_u32(self.bytes.as_ref(), abs))
++        };
++        let count = read(at)? as usize;
++        for j in 0..count {
++            let q = at + 4 + j * 16;
++            let noff = read(q)? as usize;
++            let nlen = read(q + 4)? as usize;
++            let voff = read(q + 8)? as usize;
++            let vlen = read(q + 12)? as usize;
++            self.pool_slice(noff, nlen)
++                .ok_or(IndexError::OutOfBounds("attr name"))?;
++            self.pool_slice(voff, vlen)
++                .ok_or(IndexError::OutOfBounds("attr value"))?;
++        }
++        Ok(())
++    }
++
++    /// The first inode the index owns.
++    pub fn inode_base(&self) -> u64 {
++        self.inode_base
++    }
++
++    /// The number of inodes the index owns; the range is
++    /// `[inode_base, inode_base + inode_count)`.
++    pub fn inode_count(&self) -> u64 {
++        self.inode_count
++    }
++
++    /// The first inode above the index's range, where overlay inodes begin.
++    pub fn overlay_base(&self) -> u64 {
++        self.inode_base + self.inode_count
++    }
++
++    /// Whether `ino` is one of the index's inodes.
++    pub fn is_index_inode(&self, ino: u64) -> bool {
++        ino >= self.inode_base && ino < self.inode_base + self.inode_count
++    }
++
++    fn pool_slice(&self, off: usize, len: usize) -> Option<&[u8]> {
++        let end = off.checked_add(len)?;
++        if end > self.pool_len {
++            return None;
++        }
++        Some(&self.bytes.as_ref()[self.pool_off + off..self.pool_off + off + len])
++    }
++
++    fn record_at(&self, i: usize) -> Result<Record<'_>, IndexError> {
++        let b = self.bytes.as_ref();
++        let at = self.records_off + i * RECORD_SIZE;
++        let kind = Kind::from_u8(b[at]).ok_or(IndexError::BadKind(b[at]))?;
++        let size = read_u64(b, at + 8);
++        let attrs_ref = read_u32(b, at + 4);
++        Ok(match kind {
++            Kind::Directory => {
++                let digest = B3Digest::try_from(&b[at + 16..at + 48]).unwrap();
++                Record::Directory {
++                    digest,
++                    size,
++                    attrs_ref,
++                    first_child: read_u32(b, at + 48) as usize,
++                    child_count: read_u32(b, at + 52) as usize,
++                }
++            }
++            Kind::File => {
++                let digest = B3Digest::try_from(&b[at + 16..at + 48]).unwrap();
++                Record::File {
++                    digest,
++                    size,
++                    executable: b[at + 1] != 0,
++                    dax: b[at + 2] != 0,
++                    attrs_ref,
++                }
++            }
++            Kind::Symlink => {
++                let off = read_u32(b, at + 48) as usize;
++                let target = self
++                    .pool_slice(off, size as usize)
++                    .ok_or(IndexError::OutOfBounds("symlink target"))?;
++                Record::Symlink { target }
++            }
++        })
++    }
++
++    /// The record for `ino`, if it is an index inode.
++    pub fn record(&self, ino: u64) -> Option<Record<'_>> {
++        if !self.is_index_inode(ino) {
++            return None;
++        }
++        // Validated on open, so this cannot fail; treat any residual error as a
++        // miss rather than panicking on a would-be-impossible state.
++        self.record_at((ino - self.inode_base) as usize).ok()
++    }
++
++    /// Looks up a child of a directory inode by name, returning its inode.
++    ///
++    /// The directory's children are sorted by name, so this is a binary search.
++    pub fn lookup_child(&self, parent: u64, name: &[u8]) -> Option<u64> {
++        let Some(Record::Directory {
++            first_child,
++            child_count,
++            ..
++        }) = self.record(parent)
++        else {
++            return None;
++        };
++        self.search_dirents(first_child, child_count, self.dirents_off, name)
++    }
++
++    /// Looks up a root by basename, returning its inode.
++    pub fn lookup_root(&self, name: &[u8]) -> Option<u64> {
++        self.search_dirents(0, self.roots_count, self.roots_off, name)
++    }
++
++    fn search_dirents(&self, start: usize, count: usize, base: usize, name: &[u8]) -> Option<u64> {
++        let b = self.bytes.as_ref();
++        let (mut lo, mut hi) = (start, start + count);
++        while lo < hi {
++            let mid = lo + (hi - lo) / 2;
++            let at = base + mid * DIRENT_SIZE;
++            let noff = read_u32(b, at) as usize;
++            let nlen = read_u32(b, at + 4) as usize;
++            let entry = self.pool_slice(noff, nlen)?;
++            match entry.cmp(name) {
++                std::cmp::Ordering::Less => lo = mid + 1,
++                std::cmp::Ordering::Greater => hi = mid,
++                std::cmp::Ordering::Equal => return Some(read_u64(b, at + 8)),
++            }
++        }
++        None
++    }
++
++    /// Iterates a directory inode's children as (name, inode), in stored (name)
++    /// order. Empty for a non-directory.
++    pub fn children(&self, ino: u64) -> impl Iterator<Item = (&[u8], u64)> + '_ {
++        let (start, count) = match self.record(ino) {
++            Some(Record::Directory {
++                first_child,
++                child_count,
++                ..
++            }) => (first_child, child_count),
++            _ => (0, 0),
++        };
++        self.dirent_run(start, count, self.dirents_off)
++    }
++
++    /// Iterates the mount root's listing as (name, inode), in name order.
++    pub fn roots(&self) -> impl Iterator<Item = (&[u8], u64)> + '_ {
++        self.dirent_run(0, self.roots_count, self.roots_off)
++    }
++
++    fn dirent_run(
++        &self,
++        start: usize,
++        count: usize,
++        base: usize,
++    ) -> impl Iterator<Item = (&[u8], u64)> + '_ {
++        let b = self.bytes.as_ref();
++        (start..start + count).map(move |i| {
++            let at = base + i * DIRENT_SIZE;
++            let noff = read_u32(b, at) as usize;
++            let nlen = read_u32(b, at + 4) as usize;
++            let name = &b[self.pool_off + noff..self.pool_off + noff + nlen];
++            (name, read_u64(b, at + 8))
++        })
++    }
++
++    /// Looks up one served extended attribute of a record by name.
++    pub fn xattr_get(&self, attrs_ref: u32, name: &[u8]) -> Option<&[u8]> {
++        self.xattrs(attrs_ref)
++            .find(|(n, _)| *n == name)
++            .map(|(_, v)| v)
++    }
++
++    /// Iterates a record's served extended attributes as (name, value), in the
++    /// stored (name) order.
++    pub fn xattrs(&self, attrs_ref: u32) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
++        let b = self.bytes.as_ref();
++        let (base, count) = if attrs_ref == NO_ATTRS {
++            (0, 0)
++        } else {
++            let at = self.attrs_off + attrs_ref as usize;
++            (at, read_u32(b, at) as usize)
++        };
++        (0..count).map(move |j| {
++            let q = base + 4 + j * 16;
++            let noff = read_u32(b, q) as usize;
++            let nlen = read_u32(b, q + 4) as usize;
++            let voff = read_u32(b, q + 8) as usize;
++            let vlen = read_u32(b, q + 12) as usize;
++            let name = &b[self.pool_off + noff..self.pool_off + noff + nlen];
++            let value = &b[self.pool_off + voff..self.pool_off + voff + vlen];
++            (name, value)
++        })
++    }
++}
++
++/// The FUSE root inode, without pulling in `fuse-backend-rs` here.
++fn fuse_root_id() -> u64 {
++    1
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::fs::index::SharedIndex;
++
++    fn digest(n: u8) -> B3Digest {
++        B3Digest::try_from(&[n; 32][..]).unwrap()
++    }
++
++    /// A directory with a file and a symlink child, the file carrying a DAX
++    /// hint and one served extended attribute.
++    fn sample() -> Vec<u8> {
++        let records = vec![
++            RecordSpec::Directory {
++                digest: digest(1),
++                size: 3,
++                attrs: RecordAttrs::default(),
++                // Deliberately out of order, to prove the writer sorts.
++                children: vec![
++                    (b"link".to_vec(), INODE_BASE + 2),
++                    (b"file".to_vec(), INODE_BASE + 1),
++                ],
++            },
++            RecordSpec::File {
++                digest: digest(2),
++                size: 10,
++                executable: true,
++                attrs: RecordAttrs {
++                    dax: true,
++                    xattrs: vec![(b"user.a".to_vec(), b"x".to_vec())],
++                },
++            },
++            RecordSpec::Symlink {
++                target: b"somewhere".to_vec(),
++            },
++        ];
++        write(&records, &[(b"root".to_vec(), INODE_BASE)])
++    }
++
++    #[test]
++    fn build_open_roundtrip() {
++        let idx = SharedIndex::from_bytes(sample()).expect("valid index");
++
++        assert_eq!(idx.inode_base(), 2);
++        assert_eq!(idx.inode_count(), 3);
++        assert_eq!(idx.overlay_base(), 5);
++        assert!(idx.is_index_inode(2));
++        assert!(idx.is_index_inode(4));
++        assert!(!idx.is_index_inode(1));
++        assert!(!idx.is_index_inode(5));
++
++        // The directory and its listing.
++        assert!(matches!(
++            idx.record(2),
++            Some(Record::Directory { size: 3, .. })
++        ));
++        assert_eq!(idx.lookup_root(b"root"), Some(2));
++        assert_eq!(idx.lookup_root(b"nope"), None);
++        assert_eq!(idx.lookup_child(2, b"file"), Some(3));
++        assert_eq!(idx.lookup_child(2, b"link"), Some(4));
++        assert_eq!(idx.lookup_child(2, b"nope"), None);
++        assert_eq!(
++            idx.children(2).collect::<Vec<_>>(),
++            vec![(&b"file"[..], 3), (&b"link"[..], 4)],
++        );
++
++        // The file, its declared attributes and DAX hint.
++        let Some(Record::File {
++            digest: d,
++            executable,
++            dax,
++            attrs_ref,
++            ..
++        }) = idx.record(3)
++        else {
++            panic!("inode 3 must be a file");
++        };
++        assert_eq!(d, digest(2));
++        assert!(executable);
++        assert!(dax);
++        assert_eq!(idx.xattr_get(attrs_ref, b"user.a"), Some(&b"x"[..]));
++        assert_eq!(idx.xattr_get(attrs_ref, b"user.missing"), None);
++        assert_eq!(
++            idx.xattrs(attrs_ref).collect::<Vec<_>>(),
++            vec![(&b"user.a"[..], &b"x"[..])],
++        );
++
++        // The symlink.
++        assert!(matches!(
++            idx.record(4),
++            Some(Record::Symlink { target }) if target == b"somewhere",
++        ));
++    }
++
++    /// The same input must produce byte-identical output, whatever order the
++    /// children are given in — this is the property the whole design rests on.
++    #[test]
++    fn rebuild_is_byte_identical() {
++        assert_eq!(sample(), sample());
++
++        let a = write(
++            &[RecordSpec::Directory {
++                digest: digest(9),
++                size: 2,
++                attrs: RecordAttrs::default(),
++                children: vec![(b"b".to_vec(), INODE_BASE), (b"a".to_vec(), INODE_BASE)],
++            }],
++            &[],
++        );
++        let b = write(
++            &[RecordSpec::Directory {
++                digest: digest(9),
++                size: 2,
++                attrs: RecordAttrs::default(),
++                children: vec![(b"a".to_vec(), INODE_BASE), (b"b".to_vec(), INODE_BASE)],
++            }],
++            &[],
++        );
++        assert_eq!(a, b, "child order must not affect the bytes");
++    }
++
++    #[test]
++    fn a_truncated_index_is_rejected() {
++        let bytes = sample();
++        for len in [0, 1, HEADER_SIZE - 1, HEADER_SIZE, bytes.len() - 1] {
++            assert!(
++                SharedIndex::from_bytes(bytes[..len].to_vec()).is_err(),
++                "a {len}-byte prefix must be rejected",
++            );
++        }
++    }
++
++    #[test]
++    fn a_bad_magic_or_version_is_rejected() {
++        let mut bytes = sample();
++        bytes[0] ^= 0xff;
++        assert!(matches!(
++            SharedIndex::from_bytes(bytes),
++            Err(IndexError::BadMagic),
++        ));
++
++        let mut bytes = sample();
++        bytes[8] = 0xff;
++        assert!(matches!(
++            SharedIndex::from_bytes(bytes),
++            Err(IndexError::BadVersion(_)),
++        ));
++    }
++
++    /// Flipping any single byte must be caught cleanly or tolerated — never a
++    /// panic or out-of-bounds access. The index is untrusted input.
++    #[test]
++    fn flipping_any_byte_never_panics() {
++        let bytes = sample();
++        for pos in 0..bytes.len() {
++            for bit in [0x01u8, 0x80] {
++                let mut corrupt = bytes.clone();
++                corrupt[pos] ^= bit;
++                // Whatever the outcome, opening must return, and any accessor on
++                // a successfully-opened index must stay in bounds.
++                if let Ok(idx) = SharedIndex::from_bytes(corrupt) {
++                    for ino in idx.inode_base()..idx.overlay_base() {
++                        let _ = idx.record(ino);
++                        let _ = idx.children(ino).collect::<Vec<_>>();
++                        let _ = idx.lookup_child(ino, b"x");
++                    }
++                    let _ = idx.roots().collect::<Vec<_>>();
++                    let _ = idx.lookup_root(b"x");
++                }
++            }
++        }
++    }
++}
+diff --git a/snix/castore/src/fs/index/mmap.rs b/snix/castore/src/fs/index/mmap.rs
+new file mode 100644
+index 0000000..757fd7b
+--- /dev/null
++++ b/snix/castore/src/fs/index/mmap.rs
+@@ -0,0 +1,88 @@
++//! A read-only shared memory map of a file.
++//!
++//! The whole point of the shared index is that N daemons serving the same
++//! immutable content map *one* copy of its metadata, so the mapping must be
++//! backed by the host page cache rather than copied onto each daemon's heap.
++//! A read-only file mapping is exactly that: every process mapping the same
++//! file resolves the same page-cache pages.
++//!
++//! This is a few lines of `libc` rather than a dependency: the crate already
++//! links `libc` for the filesystem layer, the mapping is created once and never
++//! changed, and nothing here needs the ergonomics a general-purpose crate would
++//! add.
++
++use std::{fs::File, io, os::fd::AsRawFd, ptr, slice};
++
++/// A read-only `mmap` of a whole file.
++///
++/// Dereferences to the mapped bytes. The mapping is private and read-only, so
++/// several processes mapping the same file share its page-cache pages without
++/// any of them being able to disturb the others.
++pub struct Mmap {
++    ptr: *mut libc::c_void,
++    len: usize,
++}
++
++// The mapping is immutable for its whole life, so handing out `&[u8]` from
++// several threads is sound.
++unsafe impl Send for Mmap {}
++unsafe impl Sync for Mmap {}
++
++impl Mmap {
++    /// Maps the entire contents of `file`.
++    ///
++    /// An empty file cannot be mapped (`mmap` rejects a zero length); callers
++    /// treat that as a malformed index, since a valid one always has at least a
++    /// header.
++    pub fn of_file(file: &File) -> io::Result<Self> {
++        let len = file.metadata()?.len();
++        let len: usize = len
++            .try_into()
++            .map_err(|_| io::Error::other("file too large to map"))?;
++        if len == 0 {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "cannot map an empty file",
++            ));
++        }
++
++        // SAFETY: a fresh anonymous request for `len` bytes against a valid fd.
++        // MAP_PRIVATE read-only never writes back, so it cannot corrupt the
++        // file, and the kernel shares the underlying pages between mappers.
++        let ptr = unsafe {
++            libc::mmap(
++                ptr::null_mut(),
++                len,
++                libc::PROT_READ,
++                libc::MAP_PRIVATE,
++                file.as_raw_fd(),
++                0,
++            )
++        };
++
++        if ptr == libc::MAP_FAILED {
++            return Err(io::Error::last_os_error());
++        }
++
++        Ok(Self { ptr, len })
++    }
++}
++
++impl std::ops::Deref for Mmap {
++    type Target = [u8];
++
++    fn deref(&self) -> &[u8] {
++        // SAFETY: `ptr`/`len` come from a successful `mmap` and the mapping is
++        // live for as long as `self`, which outlives the returned slice.
++        unsafe { slice::from_raw_parts(self.ptr as *const u8, self.len) }
++    }
++}
++
++impl Drop for Mmap {
++    fn drop(&mut self) {
++        // SAFETY: unmapping exactly what `of_file` mapped.
++        unsafe {
++            libc::munmap(self.ptr, self.len);
++        }
++    }
++}
+diff --git a/snix/castore/src/fs/index/mod.rs b/snix/castore/src/fs/index/mod.rs
+new file mode 100644
+index 0000000..471121f
+--- /dev/null
++++ b/snix/castore/src/fs/index/mod.rs
+@@ -0,0 +1,75 @@
++//! A shared, mmapable, read-only metadata index for the castore filesystem.
++//!
++//! Serving a store over virtio-fs, snix-castore assigns an inode to every
++//! distinct file, directory and symlink identity it meets, and remembers each
++//! one's digest, size, declared attributes and directory listing on its heap.
++//! For a large immutable tree that replica is a few megabytes, and every daemon
++//! serving the same content builds its own private copy.
++//!
++//! This module lets that metadata be computed once, offline, into a flat file
++//! that many daemons [map][SharedIndex::open] read-only and share through the
++//! host page cache. An indexed daemon answers `lookup`, `getattr`, `readdir`,
++//! the extended attributes and the per-inode DAX hint straight from the mapping,
++//! touching neither its heap nor the directory service.
++//!
++//! # Determinism
++//!
++//! The [writer][format::write] is a pure function of the records handed to it,
++//! so the same input always produces byte-identical output and every daemon
++//! mapping one file agrees on every inode by construction, without any hashing
++//! or coordination. The [builder][mod@self] that turns a store into those
++//! records is added on top of this format.
++
++mod format;
++mod mmap;
++
++pub use format::{
++    DIRENT_SIZE, HEADER_SIZE, INODE_BASE, Index, IndexError, Kind, RECORD_SIZE, Record,
++    RecordAttrs, RecordSpec, VERSION, write,
++};
++
++use std::{fs::File, io, path::Path};
++
++use self::mmap::Mmap;
++
++/// Where a [SharedIndex] keeps its bytes: an `mmap` of the index file in
++/// production, or an owned buffer for building and for tests.
++pub enum Backing {
++    Mapped(Mmap),
++    Owned(Vec<u8>),
++}
++
++impl AsRef<[u8]> for Backing {
++    fn as_ref(&self) -> &[u8] {
++        match self {
++            Backing::Mapped(m) => m,
++            Backing::Owned(v) => v,
++        }
++    }
++}
++
++/// A validated index backed by shared, read-only memory.
++///
++/// [Open][SharedIndex::open] the same file from several daemons and they map one
++/// copy of the metadata between them; the mapping is immutable, so sharing it
++/// across threads and processes needs no synchronisation.
++pub type SharedIndex = Index<Backing>;
++
++impl SharedIndex {
++    /// Maps `path` read-only and validates it.
++    ///
++    /// The mapping is shared through the host page cache, so pointing several
++    /// daemons at one index file has them share its pages rather than each
++    /// building a private replica on the heap.
++    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
++        let file = File::open(path)?;
++        let mmap = Mmap::of_file(&file)?;
++        Index::parse(Backing::Mapped(mmap)).map_err(io::Error::other)
++    }
++
++    /// Validates an owned buffer, without mapping a file. Used by the builder,
++    /// which produces the bytes in memory, and by tests.
++    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, IndexError> {
++        Index::parse(Backing::Owned(bytes))
++    }
++}
+diff --git a/snix/castore/src/fs/mod.rs b/snix/castore/src/fs/mod.rs
+index 9f50472..54ec66e 100644
+--- a/snix/castore/src/fs/mod.rs
++++ b/snix/castore/src/fs/mod.rs
+@@ -1,4 +1,5 @@
+ mod file_attr;
++pub mod index;
+ mod inode_tracker;
+ mod inodes;
+ pub mod root_nodes;

@@ -3,3 +3,4 @@ result-*
 .direnv/
 .misc/
 /benchmark-result/
+__pycache__/

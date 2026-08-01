@@ -1,77 +1,12 @@
 {
   "nodes": {
-    "crosvm-super": {
-      "inputs": {
-        "nixpkgs": [
-          "supervm",
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "path": "./flakes/crosvm",
-        "type": "path"
-      },
-      "original": {
-        "path": "./flakes/crosvm",
-        "type": "path"
-      },
-      "parent": [
-        "supervm"
-      ]
-    },
-    "microvm-lame": {
-      "inputs": {
-        "nixpkgs": [
-          "supervm",
-          "nixpkgs"
-        ],
-        "spectrum": "spectrum"
-      },
-      "locked": {
-        "lastModified": 1785356196,
-        "narHash": "sha256-KAnT/C2yAlaGZbzBMBcWvViZ0mpXfTk4f8nhLjJTfmo=",
-        "owner": "ToxicPine",
-        "repo": "microvm.nix",
-        "rev": "86ee28bd668ab285fe1b22a2673d9621f47b26ba",
-        "type": "github"
-      },
-      "original": {
-        "owner": "ToxicPine",
-        "ref": "lamevm",
-        "repo": "microvm.nix",
-        "type": "github"
-      }
-    },
-    "microvm-super": {
-      "inputs": {
-        "nixpkgs": [
-          "supervm",
-          "nixpkgs"
-        ],
-        "spectrum": "spectrum_2"
-      },
-      "locked": {
-        "lastModified": 1785356201,
-        "narHash": "sha256-O5oWcQWxFOaUs022RDzTDwI5fGns2WhyRVD0jzhKA3U=",
-        "owner": "ToxicPine",
-        "repo": "microvm.nix",
-        "rev": "a5b7fd67c7ad2674ff6dbd18d4aca6e17df644f3",
-        "type": "github"
-      },
-      "original": {
-        "owner": "ToxicPine",
-        "ref": "supervm",
-        "repo": "microvm.nix",
-        "type": "github"
-      }
-    },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1785090369,
-        "narHash": "sha256-m0pDuRJG7EDo9ri+4Ksu83VsI+PlxNC9lNBfydejce4=",
+        "lastModified": 1785454630,
+        "narHash": "sha256-LQy14TZp77TwbQf40gg1V3jo8FwJG0jGDkAH+zRHqg8=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "624af665418d3c65d544145b4d34ad696439570e",
+        "rev": "1559d3daa3ecc813a650b79375ea61b6741b8746",
         "type": "github"
       },
       "original": {
@@ -83,99 +18,8 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": [
-          "supervm",
-          "nixpkgs"
-        ],
-        "supervm": "supervm"
+        "nixpkgs": "nixpkgs"
       }
-    },
-    "snix": {
-      "inputs": {
-        "nixpkgs": [
-          "supervm",
-          "nixpkgs"
-        ],
-        "snix-src": "snix-src"
-      },
-      "locked": {
-        "path": "./flakes/snix",
-        "type": "path"
-      },
-      "original": {
-        "path": "./flakes/snix",
-        "type": "path"
-      },
-      "parent": [
-        "supervm"
-      ]
-    },
-    "snix-src": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1785179429,
-        "narHash": "sha256-Xk8+Yr+ZAJ1le7grjIhztW15vtprwUOuaaXdI29IJ9I=",
-        "ref": "refs/heads/canon",
-        "rev": "efbc95558ac72105dce13ee7bef679b766d0c69a",
-        "revCount": 22594,
-        "type": "git",
-        "url": "https://git.snix.dev/snix/snix.git"
-      },
-      "original": {
-        "rev": "efbc95558ac72105dce13ee7bef679b766d0c69a",
-        "type": "git",
-        "url": "https://git.snix.dev/snix/snix.git"
-      }
-    },
-    "spectrum": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1783694892,
-        "narHash": "sha256-xO8f7Qng+18FK2UlB9vcrkxCaQMCt5WjCH24aW/11eg=",
-        "ref": "refs/heads/main",
-        "rev": "24c4346e30fdea8d8e80f34aec3554a15a667d24",
-        "revCount": 1410,
-        "type": "git",
-        "url": "https://spectrum-os.org/git/spectrum"
-      },
-      "original": {
-        "type": "git",
-        "url": "https://spectrum-os.org/git/spectrum"
-      }
-    },
-    "spectrum_2": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1783694892,
-        "narHash": "sha256-xO8f7Qng+18FK2UlB9vcrkxCaQMCt5WjCH24aW/11eg=",
-        "ref": "refs/heads/main",
-        "rev": "24c4346e30fdea8d8e80f34aec3554a15a667d24",
-        "revCount": 1410,
-        "type": "git",
-        "url": "https://spectrum-os.org/git/spectrum"
-      },
-      "original": {
-        "type": "git",
-        "url": "https://spectrum-os.org/git/spectrum"
-      }
-    },
-    "supervm": {
-      "inputs": {
-        "crosvm-super": "crosvm-super",
-        "microvm-lame": "microvm-lame",
-        "microvm-super": "microvm-super",
-        "nixpkgs": "nixpkgs",
-        "snix": "snix"
-      },
-      "locked": {
-        "path": "..",
-        "type": "path"
-      },
-      "original": {
-        "path": "..",
-        "type": "path"
-      },
-      "parent": []
     }
   },
   "root": "root",

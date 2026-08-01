@@ -1,0 +1,271 @@
+From b5e73f17968bd90458f3b202a08105654be0c0f1 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Fri, 31 Jul 2026 17:12:05 +0100
+Subject: [PATCH] feat(cli): build and serve a shared metadata index
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Expose the shared index on the two virtio-fs command surfaces. `snix
+store index` and `snix castore index` build one — the former over the
+store paths a PathInfoService lists, reading the `nix-support/fsmeta`
+declaration convention; the latter over the children of a directory,
+which carry no convention — and write it atomically. `snix store
+virtiofs` and `snix castore virtiofs` gain `--metadata-index PATH`, which
+attaches it so several daemons over the same content map one copy of the
+metadata through the host page cache instead of each replicating it.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Change-Id: I96f9ff0702f6a178e12e8654dd5cf65f44912686
+---
+ snix/cli/castore/src/main.rs | 76 ++++++++++++++++++++++++++++++++++
+ snix/cli/store/src/main.rs   | 79 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 155 insertions(+)
+
+diff --git a/snix/cli/castore/src/main.rs b/snix/cli/castore/src/main.rs
+index e846b87c4..ea29ad84d 100644
+--- a/snix/cli/castore/src/main.rs
++++ b/snix/cli/castore/src/main.rs
+@@ -79,6 +79,13 @@ enum Commands {
+         #[clap(flatten)]
+         service_addrs: ServiceUrls,
+ 
++        /// A shared metadata index (built by `snix castore index`) to serve
++        /// inode metadata from, so several daemons over the same directory map
++        /// one copy of it through the host page cache. May also be set with
++        /// `SNIX_METADATA_INDEX`; an explicit flag takes precedence.
++        #[clap(long, env = "SNIX_METADATA_INDEX", value_name = "PATH")]
++        metadata_index: Option<PathBuf>,
++
+         /// uid:gid to use, instead of 0:0
+         #[clap(long, value_parser = parse_uid_gid)]
+         uid_gid: Option<(u32, u32)>,
+@@ -104,6 +111,25 @@ enum Commands {
+         #[clap(long, value_name = "PATH")]
+         dax_backing_dir: Option<PathBuf>,
+     },
++
++    #[cfg(feature = "virtiofs")]
++    /// Build a shared metadata index over a directory, by its B3Digest
++    ///
++    /// The index is a flat, mmapable file that `snix castore virtiofs
++    /// --metadata-index` serves inode metadata from, so several daemons over the
++    /// same directory share one copy of it. It is written atomically.
++    Index {
++        /// B3Digest of the directory to index (output of `snix-castore ingest`)
++        #[arg(value_name = "DIGEST")]
++        digest: String,
++
++        /// Where to write the index.
++        #[arg(value_name = "PATH")]
++        output: PathBuf,
++
++        #[clap(flatten)]
++        service_addrs: ServiceUrls,
++    },
+ }
+ 
+ #[tokio::main]
+@@ -270,6 +296,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+         Commands::Virtiofs {
+             digest,
+             socket,
++            metadata_index,
+             service_addrs,
+             uid_gid,
+             show_xattr,
+@@ -315,6 +342,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+                     }
+                     None => fs,
+                 };
++                // Attach a shared metadata index, if one was given.
++                let fs = match metadata_index {
++                    Some(path) => {
++                        tracing::info!(metadata_index=?path, "serving inode metadata from a shared index");
++                        fs.with_index(snix_castore::fs::index::SharedIndex::open(path)?)
++                    }
++                    None => fs,
++                };
+ 
+                 tracing::info!(socket_path=?socket, "starting virtiofs-daemon");
+ 
+@@ -322,6 +357,32 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+             })
+             .await??;
+         }
++        #[cfg(feature = "virtiofs")]
++        Commands::Index {
++            digest,
++            output,
++            service_addrs,
++        } => {
++            use snix_castore::fs::index::build_from_root_nodes;
++
++            let (blob_service, directory_service) =
++                snix_castore::utils::construct_services(service_addrs).await?;
++
++            let digest = digest.parse()?;
++            let directory = directory_service
++                .get(&digest)
++                .await?
++                .ok_or("Root directory not found")?;
++
++            // The roots are the directory's children, exactly as `snix castore
++            // virtiofs` serves them; castore carries no declaration convention.
++            let roots: Vec<_> = directory.into_nodes().collect();
++            let bytes =
++                build_from_root_nodes(&blob_service, &directory_service, roots, None).await?;
++
++            write_atomically(&output, &bytes)?;
++            tracing::info!(output = ?output, bytes = bytes.len(), "wrote metadata index");
++        }
+     }
+ 
+     Ok(tracing_handle.shutdown().await.inspect_err(|err| {
+@@ -329,6 +390,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+     })?)
+ }
+ 
++/// Writes `bytes` to `path` atomically: a reader sees either the old file or the
++/// complete new one, never a half-written index.
++#[cfg(feature = "virtiofs")]
++fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
++    use std::io::Write;
++
++    let tmp = path.with_extension(format!("index.tmp.{}", std::process::id()));
++    {
++        let mut file = std::fs::File::create(&tmp)?;
++        file.write_all(bytes)?;
++        file.sync_all()?;
++    }
++    std::fs::rename(&tmp, path)
++}
++
+ #[cfg(any(feature = "fuse", feature = "virtiofs"))]
+ fn parse_uid_gid(s: &str) -> Result<(u32, u32), &'static str> {
+     match s.split_once(":") {
+diff --git a/snix/cli/store/src/main.rs b/snix/cli/store/src/main.rs
+index 5b27e338f..653064eb6 100644
+--- a/snix/cli/store/src/main.rs
++++ b/snix/cli/store/src/main.rs
+@@ -183,6 +183,14 @@ enum Commands {
+         #[clap(flatten)]
+         service_addrs: snix_store::utils::ServiceUrlsGrpc,
+ 
++        /// A shared metadata index (built by `snix store index`) to serve inode
++        /// metadata from. Several daemons pointed at one index file map one copy
++        /// of the metadata through the host page cache instead of each building
++        /// a private replica on the heap. May also be set with
++        /// `SNIX_METADATA_INDEX`; an explicit flag takes precedence.
++        #[clap(long, env = "SNIX_METADATA_INDEX", value_name = "PATH")]
++        metadata_index: Option<PathBuf>,
++
+         /// Whether to list elements at the root of the mount point.
+         /// This is useful if your PathInfoService doesn't provide an
+         /// (exhaustive) listing.
+@@ -214,6 +222,21 @@ enum Commands {
+         #[clap(long, value_name = "PATH")]
+         dax_backing_dir: Option<PathBuf>,
+     },
++    /// Builds a shared metadata index over the store's root paths.
++    ///
++    /// The index is a flat, mmapable file that `snix store virtiofs
++    /// --metadata-index` serves inode metadata from, so several daemons over the
++    /// same store share one copy of it rather than each replicating it on the
++    /// heap. It is written atomically.
++    #[cfg(feature = "virtiofs")]
++    Index {
++        /// Where to write the index.
++        #[clap(value_name = "PATH")]
++        output: PathBuf,
++
++        #[clap(flatten)]
++        service_addrs: snix_store::utils::ServiceUrlsGrpc,
++    },
+ }
+ 
+ #[cfg(feature = "fuse")]
+@@ -692,6 +715,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+         Commands::VirtioFs {
+             socket,
+             service_addrs,
++            metadata_index,
+             list_root,
+             uid_gid,
+             show_xattr,
+@@ -728,6 +752,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                 None => fs,
+             };
+ 
++            // Attach a shared metadata index, if one was given. Inodes it covers
++            // are then served straight from the mapping.
++            let fs = match metadata_index {
++                Some(path) => {
++                    info!(metadata_index=?path, "serving inode metadata from a shared index");
++                    fs.with_index(snix_castore::fs::index::SharedIndex::open(path)?)
++                }
++                None => fs,
++            };
++
+             tokio::task::spawn_blocking(move || {
+                 info!(socket_path=?socket, "starting virtiofs-daemon");
+ 
+@@ -735,6 +769,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+             })
+             .await??;
+         }
++        #[cfg(feature = "virtiofs")]
++        Commands::Index {
++            output,
++            service_addrs,
++        } => {
++            use snix_castore::fs::{RootNodes, index::build_from_root_nodes};
++
++            let (blob_service, directory_service, path_info_service, _nar_calculation_service) =
++                snix_store::utils::construct_services(service_addrs).await?;
++
++            // The roots are the store paths the PathInfoService lists, exactly as
++            // `snix store virtiofs` serves them.
++            let root_nodes = pathinfoservice::RootNodesWrapper::from(path_info_service);
++            let roots: Vec<_> = root_nodes
++                .list()
++                .try_collect()
++                .await
++                .map_err(|e| format!("listing root paths: {e}"))?;
++
++            info!(count = roots.len(), "building metadata index");
++            // The Nix convention for out-of-band metadata about a store path.
++            let fsmeta_path: snix_castore::PathBuf =
++                "nix-support/fsmeta".parse().expect("valid path");
++            let bytes =
++                build_from_root_nodes(&blob_service, &directory_service, roots, Some(&fsmeta_path))
++                    .await?;
++
++            write_atomically(&output, &bytes)?;
++            info!(output=?output, bytes = bytes.len(), "wrote metadata index");
++        }
+     };
+ 
+     Ok(tracing_handle.shutdown().await.inspect_err(|err| {
+@@ -742,6 +806,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+     })?)
+ }
+ 
++/// Writes `bytes` to `path` atomically: a reader sees either the old file or the
++/// complete new one, never a half-written index.
++#[cfg(feature = "virtiofs")]
++fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
++    use std::io::Write;
++
++    let tmp = path.with_extension(format!("index.tmp.{}", std::process::id()));
++    {
++        let mut file = std::fs::File::create(&tmp)?;
++        file.write_all(bytes)?;
++        file.sync_all()?;
++    }
++    std::fs::rename(&tmp, path)
++}
++
+ #[cfg(any(feature = "fuse", feature = "virtiofs"))]
+ fn parse_uid_gid(s: &str) -> Result<(u32, u32), &'static str> {
+     match s.split_once(":") {

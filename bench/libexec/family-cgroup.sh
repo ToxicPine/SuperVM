@@ -52,7 +52,6 @@ create_family_cgroup() {
     "${FAMILY_CGROUP_SLICE}" \
     "AllowedCPUs=${TARGET_CPU_IDS}" \
     MemoryAccounting=yes \
-    CPUAccounting=yes \
     TasksAccounting=yes
   FAMILY_CGROUP_PATH=$(
     systemctl show --property=ControlGroup --value "${FAMILY_CGROUP_SLICE}"

@@ -47,6 +47,38 @@ these mechanisms need. Its stripped build has Firecracker-class overhead: 6.7
 MiB of measured host memory per VM outside guest RAM, versus 2.8 MiB for
 Firecracker.
 
+## How much memory it saves
+
+These figures were measured with `bench/` (idle fixed-count runs at 1, 4,
+and 32 VMs on 512 MiB minimal NixOS guests).
+
+### Per-VM savings
+
+Marginal cost of each additional VM, measured at 32 VMs:
+
+| Per VM                   | vanilla crosvm | SuperVM      |
+| ------------------------ | -------------- | ------------ |
+| Guest memory (resident)  | ~289 MiB       | ~289 MiB     |
+| KSM: kernel text, rodata | —              | −27 MiB      |
+| DAX: store content       | —              | −18 MiB      |
+| virtio-fs server         | —              | +3 MiB       |
+| Other host overhead      | ~10 MiB        | ~16 MiB      |
+| **Total**                | **~299 MiB**   | **~263 MiB** |
+
+At 32 VMs the deployments measure 9.5 GiB against 8.5 GiB.
+
+### Fixed overhead (not per-VM)
+
+| Shared, once per host             | SuperVM     |
+| --------------------------------- | ----------- |
+| DAX pool (this closure)           | ~54 MiB     |
+| Metadata index                    | ~11 MiB     |
+| Snix daemons                      | ~40 MiB     |
+
+## Charts
+
+![Net Memory Consumption](./media/memory_consumption.png)
+
 ## Run it
 
 Use a Linux host with Nix flakes and KVM.

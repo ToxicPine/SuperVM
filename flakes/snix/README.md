@@ -5,8 +5,9 @@ share only selected Nix store files across VMs: marked files are materialized
 by content digest and mapped from one host cache, while unmarked files continue
 through ordinary reads.
 
-The default build uses crosvm's standard vhost-user shared-memory protocol and
-supports per-inode DAX. The source is pinned to Snix revision
+The default build uses crosvm's standard vhost-user shared-memory protocol,
+per-inode DAX, and a shared, mmapable metadata index. The source is pinned to
+Snix revision
 `efbc95558ac72105dce13ee7bef679b766d0c69a`.
 
 ## Behavior
@@ -20,34 +21,28 @@ supports per-inode DAX. The source is pinned to Snix revision
   marked `snix.dax` use DAX.
 - Missing, invalid, unreadable, or oversized metadata is ignored. Unmarked
   files remain non-DAX.
+- `snix store index PATH` builds an immutable index over the served store.
+  Virtio-fs daemons read the path from `--metadata-index` or
+  `SNIX_METADATA_INDEX` and share its read-only pages through the host page
+  cache.
 - Without a configured cache, mapping requests return `ENOSYS` and guests fall
   back to normal reads.
 
 Because `nix-support/fsmeta` is part of the store path, its policy travels with
 the NAR and is covered by the NAR hash and existing signatures.
 
-## Packages
+## Package
 
-| Package                 | Mapping transport             | DAX policy  |
-| ----------------------- | ----------------------------- | ----------- |
-| `snix-fs-map`           | `SHARED_OBJECT_ADD` / `FsMap` | Whole mount |
-| `snix-shmem-map`        | `SHMEM_MAP` / `SHMEM_UNMAP`   | Whole mount |
-| `snix-fsmeta-fs-map`    | `SHARED_OBJECT_ADD` / `FsMap` | Per inode   |
-| `snix-fsmeta-shmem-map` | `SHMEM_MAP` / `SHMEM_UNMAP`   | Per inode   |
-
-`snix` and `default` select `snix-fsmeta-shmem-map`, the variant used by
-SuperVM with crosvm.
+The flake exposes one Snix composition: FUSE inode eviction, crosvm's
+`SHMEM_MAP` transport, per-inode DAX, declared attributes, and the shared
+metadata index. There are no non-index or alternate-transport package variants.
 
 ```sh
 nix build ./flakes/snix#snix
-nix build ./flakes/snix#snix-fs-map
-nix build ./flakes/snix#snix-shmem-map
-nix build ./flakes/snix#snix-fsmeta-fs-map
-nix build ./flakes/snix#snix-fsmeta-shmem-map
 ```
 
 The flake supports `x86_64-linux` and `aarch64-linux`. It also exposes the Snix
-libraries and `lib.depotsFor` for consumers that need the full patched depot.
+libraries and `lib.depotFor` for consumers that need the full patched depot.
 
 ## Overlay use
 
@@ -74,9 +69,14 @@ The overlay replaces `pkgs.snix` with the default package.
 ```sh
 snix store virtiofs \
   --dax-backing-dir /var/cache/snix/dax \
+  --metadata-index /run/user/1000/supervm/metadata.v1.index \
   --tag snix \
   /run/snix-store.sock
 ```
+
+`SNIX_METADATA_INDEX` supplies the same value without repeating the flag for
+each daemon. SuperVM sets it automatically and keeps the generated index on its
+runtime tmpfs.
 
 `--tag` applies to the `shmem-map` transport and advertises the virtio-fs tag
 that crosvm should mount.

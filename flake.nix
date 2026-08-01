@@ -26,7 +26,17 @@
       crosvm-super,
     }:
     let
-      sourceFlake = nixpkgs.legacyPackages.x86_64-linux.nix-gitignore.gitignoreSource [ "/bench/" ] ./.;
+      sourceFlake = nixpkgs.lib.cleanSourceWith {
+        src = ./.;
+        filter =
+          path: type:
+          let
+            relative = nixpkgs.lib.removePrefix "${toString ./.}/" (toString path);
+          in
+          nixpkgs.lib.cleanSourceFilter path type
+          && relative != "bench"
+          && !nixpkgs.lib.hasPrefix "bench/" relative;
+      };
       systems = [
         "x86_64-linux"
       ];
@@ -46,6 +56,15 @@
         overlayStoreModule = self.nixosModules.overlayStore;
         microvm = microvm-super;
       };
+
+      benchmarkFor =
+        system:
+        import ./bench/package.nix {
+          inherit (nixpkgs) lib;
+          pkgs = nixpkgs.legacyPackages.${system};
+          supervmPackage = self.packages.${system}.supervm;
+          lamevmPackage = self.packages.${system}.lamevm;
+        };
 
     in
     {
@@ -69,6 +88,8 @@
             self = sourceFlake;
           };
 
+          benchmark-suite = (benchmarkFor system).package;
+
           # Imported rather than callPackage'd: callPackage would replace the
           # kernel's own `.override` with its own, and NixOS overrides kernels
           # with `features` while evaluating `microvm.kernel`.
@@ -90,18 +111,26 @@
 
       overlays.default = vmPackagesOverlay;
 
-      apps = forAllSystems (system: {
-        default = self.apps.${system}.supervm;
-        supervm = {
-          type = "app";
-          program = "${self.packages.${system}.supervm}/bin/supervm";
-          meta.description = "Boot a SuperVM with persistent private state";
-        };
-        lamevm = {
-          type = "app";
-          program = "${self.packages.${system}.lamevm}/bin/lamevm";
-          meta.description = "Boot the vanilla microvm.nix baseline";
-        };
+      apps = forAllSystems (
+        system:
+        {
+          default = self.apps.${system}.supervm;
+          supervm = {
+            type = "app";
+            program = "${self.packages.${system}.supervm}/bin/supervm";
+            meta.description = "Boot a SuperVM with persistent private state";
+          };
+          lamevm = {
+            type = "app";
+            program = "${self.packages.${system}.lamevm}/bin/lamevm";
+            meta.description = "Boot the vanilla microvm.nix baseline";
+          };
+        }
+        // (benchmarkFor system).apps
+      );
+
+      checks = forAllSystems (system: {
+        benchmark-shellcheck = (benchmarkFor system).check;
       });
 
       # The prepare commands use this narrow evaluation API at run time so
