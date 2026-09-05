@@ -21,12 +21,19 @@
           {
             pname = "crosvm-super";
             # SuperVM uses raw block devices, serial, vsock, and a generic
-            # vhost-user virtio-fs frontend. Keep balloon solely because
-            # microvm.nix uses its --no-balloon flag when the device is off.
+            # vhost-user virtio-fs frontend. Keep balloon because microvm.nix
+            # uses its --no-balloon flag when the device is off, and net for
+            # guest profiles with TAP interfaces.
             cargoBuildNoDefaultFeatures = true;
-            cargoBuildFeatures = [ "balloon" ];
+            cargoBuildFeatures = [
+              "balloon"
+              "net"
+            ];
             cargoCheckNoDefaultFeatures = true;
-            cargoCheckFeatures = [ "balloon" ];
+            cargoCheckFeatures = [
+              "balloon"
+              "net"
+            ];
             patches = (old.patches or [ ]) ++ [
               ./patches/0001-base-add-private-anonymous-memory-mappings.patch
               ./patches/0002-vm_memory-support-private-anonymous-RAM-regions.patch

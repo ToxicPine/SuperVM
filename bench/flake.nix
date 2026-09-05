@@ -21,6 +21,7 @@
         lib.nixosSystem {
           inherit system;
           modules = [
+            ./minimal-guest.nix
             (import ./nginx-guest.nix {
               inherit index;
               address = "10.231.${toString thirdOctet}.${toString fourthOctet}";
@@ -40,7 +41,10 @@
       lib.guestProfiles = {
         idle = lib.nixosSystem {
           inherit system;
-          modules = [ ./idle-guest.nix ];
+          modules = [
+            ./minimal-guest.nix
+            ./idle-guest.nix
+          ];
         };
       }
       // loadProfiles;

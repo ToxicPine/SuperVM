@@ -17,8 +17,8 @@ let
 in
 {
   networking = {
+    firewall.enable = false;
     hostName = "svbench-${toString index}";
-    firewall.allowedTCPPorts = [ 80 ];
     useNetworkd = true;
   };
 
