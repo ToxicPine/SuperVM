@@ -75,12 +75,11 @@ start_vm_filesystem() {
   # never purges it, so whenever the kernel obliges with 2 MiB pages the
   # boot-burst peak (~16 MiB) stays resident for the life of the VM.
   #
-  # The window is guest RAM as much as it is address space: Linux backs the
-  # whole region with page metadata at boot, 16 MiB per GiB, so it is sized to
-  # the working set the guest maps at once and not to the store. The guest
-  # kernel maps files in 64 KiB ranges and reclaims idle ones once 80% of the
-  # window is in use, so 256 MiB holds about 200 MiB of concurrently mapped
-  # files for 4 MiB of guest RAM. A minimal NixOS guest maps under 80 MiB.
+  # The guest populates page metadata on demand in 16 MiB chunks, releasing
+  # empty chunks after range reclaim or inode eviction. The window limits
+  # concurrent mappings; unused capacity no longer allocates page metadata.
+  # 64 KiB ranges pack small files tightly. Reclaim starts at 80% occupancy,
+  # so the 1 GiB default starts reclaiming at about 819 MiB of assigned ranges.
   MIMALLOC_ALLOW_LARGE_OS_PAGES=0 MIMALLOC_PURGE_DELAY=0 \
     TOKIO_WORKER_THREADS=2 \
     snix store virtiofs \

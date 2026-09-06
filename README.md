@@ -51,31 +51,27 @@ Firecracker.
 
 ### Fleet measurements
 
-Measured with `bench/` (idle fixed-count runs at 1, 4, and 32 VMs on 512 MiB
-minimal NixOS guests) before the guest-side changes above.
+Measured in idle fixed-count runs at 1, 4, and 32 VMs on 512 MiB minimal NixOS
+guests, including runtime infrastructure and resident host caches.
 
-### Per-VM savings
+### Deployment memory
 
-Marginal cost of each additional VM, measured at 32 VMs:
+Aggregate physical memory, with shared pages counted once:
 
-| Per VM                   | vanilla crosvm | SuperVM      |
-| ------------------------ | -------------- | ------------ |
-| Guest memory (resident)  | ~289 MiB       | ~289 MiB     |
-| KSM: kernel text, rodata | —              | −27 MiB      |
-| DAX: store content       | —              | −18 MiB      |
-| virtio-fs server         | —              | +3 MiB       |
-| Other host overhead      | ~10 MiB        | ~16 MiB      |
-| **Total**                | **~299 MiB**   | **~263 MiB** |
+| VM count | LameVM     | SuperVM    |
+| -------- | ---------- | ---------- |
+| 1        | 416.7 MiB  | 480.0 MiB  |
+| 4        | 1183.6 MiB | 776.0 MiB  |
+| 32       | 8329.9 MiB | 3512.8 MiB |
 
-At 32 VMs the deployments measure 9.5 GiB against 8.5 GiB.
+At 32 VMs the deployments measure 8.1 GiB against 3.4 GiB.
 
-### Fixed overhead (not per-VM)
+### Shared mappings (not per-VM)
 
 | Shared, once per host             | SuperVM     |
 | --------------------------------- | ----------- |
-| DAX pool (this closure)           | ~54 MiB     |
-| Metadata index                    | ~11 MiB     |
-| Snix daemons                      | ~40 MiB     |
+| DAX pool (mapped)                 | ~50 MiB     |
+| Metadata index                    | ~9.8 MiB    |
 
 ### DAX window overhead
 
@@ -85,7 +81,7 @@ to 5 MiB; these measurements predate dynamic DAX metadata allocation.
 
 ## Charts
 
-![Idle Memory Consumption](./media/memory-consumption-idle.png)
+![Idle Memory Consumption](./media/memory_consumption.png)
 
 ## Run it
 
@@ -118,7 +114,7 @@ nix run .#supervm -- launch ./vm-web
 `launch` boots the last successfully prepared runner without evaluating the
 guest again.
 
-`launch --dax-window=BYTES` sets the DAX window size (default 256 MiB). It
+`launch --dax-window=BYTES` sets the DAX window size (default 1 GiB). It
 costs the guest 16 MiB of RAM per GiB, so size it to the files a guest maps at
 once, not to the store:
 

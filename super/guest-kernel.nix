@@ -26,6 +26,10 @@ linux_latest.override {
       name = "fuse-dax-configurable-range-size";
       patch = ./guest-kernel-patches/0001-fuse-dax-make-the-mapping-range-size-configurable.patch;
     }
+    {
+      name = "virtiofs-dynamic-dax-memmap";
+      patch = ./guest-kernel-patches/0002-virtiofs-populate-DAX-memmap-on-demand.patch;
+    }
   ];
 
   structuredExtraConfig = with lib.kernel; {
@@ -40,9 +44,9 @@ linux_latest.override {
 
     # The DAX window is handed out in ranges of this size, one range per file
     # at minimum. A store closure is mostly small files, so 2 MiB ranges need
-    # a window many times the mapped data, and the window costs the guest a
-    # struct page per 4 KiB whether used or not. 64 KiB ranges fit the same
-    # working set in a fraction of the window.
+    # a window many times the mapped data. 64 KiB ranges pack small files
+    # into fewer live memmap chunks. Unused chunks carry no struct pages;
+    # the dynamic-memmap patch releases them when their last range is freed.
     FUSE_DAX_SHIFT = freeform "16";
 
     # Drivers every SuperVM guest loads at boot. Built in, their text sits in

@@ -14,9 +14,9 @@ usage: supervm prepare [--dax=MODE] [--profile=FLAKE#CONFIG] <upper-store-dir>
 
   --dax-window
             Size of the DAX window offered to the guest, in bytes; a multiple
-            of 2 MiB. The guest spends 16 MiB of RAM per GiB of window on page
-            metadata, so keep it near the store working set. Defaults to
-            256 MiB, which holds about 200 MiB of concurrently mapped files.
+            of 2 MiB. Guest page metadata is allocated only for populated
+            16 MiB chunks and released when their last range is freed.
+            Defaults to 1 GiB. Range reclaim starts at 80% occupancy.
 
   upper-store-dir
             Directory holding this VM's persistent private state. Created if
@@ -42,7 +42,7 @@ parse_arguments() {
 
   dax_mode=inode
   dax_set=false
-  dax_window=$((256 * 1024 * 1024))
+  dax_window=$((1024 * 1024 * 1024))
   dax_window_set=false
   profile=
   positionals=()

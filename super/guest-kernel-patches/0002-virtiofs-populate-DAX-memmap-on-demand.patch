@@ -1,0 +1,761 @@
+From: SuperVM contributors <supervm@localhost>
+Subject: [PATCH] virtiofs: populate and release DAX memmaps on demand
+
+Allocate ZONE_DEVICE metadata only for chunks with assigned FUSE ranges.
+Pair optional DAX range lifetime callbacks with FUSE mapping allocation and
+reclaim, and replace the eager descriptor list with an IDA and per-use
+allocations. Inline reclaim retains its range pin; failed setup and
+redundant allocations unwind through the same release path. Use NOFS scope
+around memory hotplug allocations under filesystem locks.
+
+Expose a read-only dax_memmap snapshot under /sys/fs/virtiofs/<device>/
+to verify actual population and release. The capacity query is allocation
+free. Sixteen MiB chunks bound rounding cost to 256 KiB per live chunk on
+4 KiB / 64-byte struct page guests. Larger configured FUSE ranges increase
+the chunk size so ranges never span chunks.
+
+---
+diff --git a/include/linux/dax.h b/include/linux/dax.h
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@ -27,6 +27,13 @@
+ 	 */
+ 	long (*direct_access)(struct dax_device *, pgoff_t, long,
+ 			enum dax_access_mode, void **, unsigned long *);
++	/*
++	 * Optional dynamic memmap lifetime. The filesystem must acquire before
++	 * publishing a mapping, and release only after invalidating it and
++	 * draining all layout pins. Callbacks may sleep. Offsets are in bytes.
++	 */
++	int (*get_range)(struct dax_device *dax_dev, u64 offset, u64 len);
++	void (*put_range)(struct dax_device *dax_dev, u64 offset, u64 len);
+ 	/* zero_page_range: required operation. Zero page range   */
+ 	int (*zero_page_range)(struct dax_device *, pgoff_t, size_t);
+ 	/*
+@@ -52,8 +59,11 @@
+ #if IS_ENABLED(CONFIG_DAX)
+ struct dax_device *alloc_dax(void *private, const struct dax_operations *ops);
+ void *dax_holder(struct dax_device *dax_dev);
++void get_dax(struct dax_device *dax_dev);
+ void put_dax(struct dax_device *dax_dev);
+ void kill_dax(struct dax_device *dax_dev);
++int dax_get_range(struct dax_device *dax_dev, u64 offset, u64 len);
++void dax_put_range(struct dax_device *dax_dev, u64 offset, u64 len);
+ struct dax_device *dax_dev_get(dev_t devt);
+ void dax_write_cache(struct dax_device *dax_dev, bool wc);
+ bool dax_write_cache_enabled(struct dax_device *dax_dev);
+diff --git a/drivers/dax/super.c b/drivers/dax/super.c
+--- a/drivers/dax/super.c
++++ b/drivers/dax/super.c
+@@ -235,6 +235,37 @@
+ }
+ EXPORT_SYMBOL_GPL(dax_direct_access);
+ 
++/* Caller already holds a live reference while acquiring another owner. */
++void get_dax(struct dax_device *dax_dev)
++{
++	ihold(&dax_dev->inode);
++}
++EXPORT_SYMBOL_GPL(get_dax);
++
++/* Take SRCU internally: a driver can tear down its memmaps after kill_dax(). */
++int dax_get_range(struct dax_device *dax_dev, u64 offset, u64 len)
++{
++	int id = dax_read_lock();
++	int ret = -ENXIO;
++
++	if (dax_alive(dax_dev))
++		ret = dax_dev->ops->get_range ?
++			dax_dev->ops->get_range(dax_dev, offset, len) : 0;
++	dax_read_unlock(id);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(dax_get_range);
++
++void dax_put_range(struct dax_device *dax_dev, u64 offset, u64 len)
++{
++	int id = dax_read_lock();
++
++	if (dax_alive(dax_dev) && dax_dev->ops->put_range)
++		dax_dev->ops->put_range(dax_dev, offset, len);
++	dax_read_unlock(id);
++}
++EXPORT_SYMBOL_GPL(dax_put_range);
++
+ size_t dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
+ 		size_t bytes, struct iov_iter *i)
+ {
+diff --git a/fs/fuse/dax.c b/fs/fuse/dax.c
+--- a/fs/fuse/dax.c
++++ b/fs/fuse/dax.c
+@@ -12,6 +12,7 @@
+ #include <linux/pagemap.h>
+ #include <linux/iomap.h>
+ #include <linux/interval_tree.h>
++#include <linux/idr.h>
+ 
+ /*
+  * Memory range size, as log2 bytes. A power of 2 so it agrees with common
+@@ -37,7 +38,7 @@
+ 	/* Pointer to inode where this memory range is mapped */
+ 	struct inode *inode;
+ 
+-	/* Will connect in fcd->free_ranges to keep track of free memory */
++	/* Temporary list while removing mappings during inode eviction. */
+ 	struct list_head list;
+ 
+ 	/* For interval tree in file/inode */
+@@ -51,6 +52,9 @@
+ 
+ 	/** Length of mapping, in bytes */
+ 	loff_t length;
++
++	/* Holds the device memmap until the range is returned. */
++	bool range_pinned;
+ 
+ 	/* Is this mapping read-only or read-write */
+ 	bool writable;
+@@ -88,7 +92,7 @@
+ 
+ 	/* DAX Window Free Ranges */
+ 	long nr_free_ranges;
+-	struct list_head free_ranges;
++	struct ida range_ids;
+ 
+ 	unsigned long nr_ranges;
+ };
+@@ -129,18 +133,29 @@
+ static struct fuse_dax_mapping *alloc_dax_mapping(struct fuse_conn_dax *fcd)
+ {
+ 	struct fuse_dax_mapping *dmap;
+-
++	int id;
++
++	dmap = kzalloc_obj(*dmap, GFP_NOFS);
++	if (!dmap)
++		return ERR_PTR(-ENOMEM);
++
++	/* IDA grows on demand and fills low holes first, packing live chunks. */
++	id = ida_alloc_range(&fcd->range_ids, 0, fcd->nr_ranges - 1, GFP_NOFS);
++	if (id < 0) {
++		kfree(dmap);
++		kick_dmap_free_worker(fcd, 0);
++		return id == -ENOSPC ? NULL : ERR_PTR(id);
++	}
++
++	dmap->window_offset = (u64)id << FUSE_DAX_SHIFT;
++	dmap->length = FUSE_DAX_SZ;
++	INIT_LIST_HEAD(&dmap->list);
++	INIT_LIST_HEAD(&dmap->busy_list);
++	refcount_set(&dmap->refcnt, 1);
+ 	spin_lock(&fcd->lock);
+-	dmap = list_first_entry_or_null(&fcd->free_ranges,
+-					struct fuse_dax_mapping, list);
+-	if (dmap) {
+-		list_del_init(&dmap->list);
+-		WARN_ON(fcd->nr_free_ranges <= 0);
+-		fcd->nr_free_ranges--;
+-	}
++	fcd->nr_free_ranges--;
+ 	__kick_dmap_free_worker(fcd, 0);
+ 	spin_unlock(&fcd->lock);
+-
+ 	return dmap;
+ }
+ 
+@@ -161,22 +176,19 @@
+ 	spin_unlock(&fcd->lock);
+ }
+ 
+-/* This assumes fcd->lock is held */
+-static void __dmap_add_to_free_pool(struct fuse_conn_dax *fcd,
+-				struct fuse_dax_mapping *dmap)
+-{
+-	list_add_tail(&dmap->list, &fcd->free_ranges);
+-	fcd->nr_free_ranges++;
+-	wake_up(&fcd->range_waitq);
+-}
+-
+ static void dmap_add_to_free_pool(struct fuse_conn_dax *fcd,
+ 				struct fuse_dax_mapping *dmap)
+ {
+-	/* Return fuse_dax_mapping to free list */
++	/* May sleep: never called with fcd->lock held. */
++	if (dmap->range_pinned)
++		dax_put_range(fcd->dev, dmap->window_offset, dmap->length);
++	/* Publish the free ID and its count together for waiting allocators. */
+ 	spin_lock(&fcd->lock);
+-	__dmap_add_to_free_pool(fcd, dmap);
++	ida_free(&fcd->range_ids, dmap->window_offset >> FUSE_DAX_SHIFT);
++	fcd->nr_free_ranges++;
+ 	spin_unlock(&fcd->lock);
++	wake_up(&fcd->range_waitq);
++	kfree(dmap);
+ }
+ 
+ static int fuse_setup_one_mapping(struct inode *inode, unsigned long start_idx,
+@@ -192,6 +204,14 @@
+ 	ssize_t err;
+ 
+ 	WARN_ON(fcd->nr_free_ranges < 0);
++
++	/* Inline reclaim keeps its pin; permission upgrades do not acquire one. */
++	if (!dmap->range_pinned) {
++		err = dax_get_range(fcd->dev, dmap->window_offset, dmap->length);
++		if (err)
++			return err;
++		dmap->range_pinned = true;
++	}
+ 
+ 	/* Ask fuse daemon to setup mapping */
+ 	memset(&inarg, 0, sizeof(inarg));
+@@ -285,20 +305,15 @@
+ 	return ret;
+ }
+ 
+-/*
+- * Cleanup dmap entry and add back to free list. This should be called with
+- * fcd->lock held.
+- */
++/* Remove a quiesced mapping and release its descriptor and device memmap. */
+ static void dmap_reinit_add_to_free_pool(struct fuse_conn_dax *fcd,
+ 					    struct fuse_dax_mapping *dmap)
+ {
+ 	pr_debug("fuse: freeing memory range start_idx=0x%lx end_idx=0x%lx window_offset=0x%llx length=0x%llx\n",
+ 		 dmap->itn.start, dmap->itn.last, dmap->window_offset,
+ 		 dmap->length);
+-	__dmap_remove_busy_list(fcd, dmap);
+-	dmap->inode = NULL;
+-	dmap->itn.start = dmap->itn.last = 0;
+-	__dmap_add_to_free_pool(fcd, dmap);
++	dmap_remove_busy_list(fcd, dmap);
++	dmap_add_to_free_pool(fcd, dmap);
+ }
+ 
+ /*
+@@ -343,12 +358,10 @@
+ 		pr_warn("Failed to removemappings. start=0x%llx end=0x%llx\n",
+ 			start, end);
+ 	}
+-	spin_lock(&fcd->lock);
+ 	list_for_each_entry_safe(dmap, n, &to_remove, list) {
+ 		list_del_init(&dmap->list);
+ 		dmap_reinit_add_to_free_pool(fcd, dmap);
+ 	}
+-	spin_unlock(&fcd->lock);
+ }
+ 
+ static int dmap_removemapping_one(struct inode *inode,
+@@ -454,6 +467,8 @@
+ 	 */
+ 	if (flags & IOMAP_FAULT) {
+ 		alloc_dmap = alloc_dax_mapping(fcd);
++		if (IS_ERR(alloc_dmap))
++			return PTR_ERR(alloc_dmap);
+ 		if (!alloc_dmap)
+ 			return -EAGAIN;
+ 	} else {
+@@ -531,8 +546,8 @@
+ 	 * anymore. Drop it.
+ 	 */
+ 	if (refcount_dec_and_test(&dmap->refcnt)) {
+-		/* refcount should not hit 0. This object only goes
+-		 * away when fuse connection goes away
++		/* refcount should not hit 0. The allocation owns
++		 * the last reference until the mapping has been invalidated
+ 		 */
+ 		WARN_ON_ONCE(1);
+ 	}
+@@ -641,8 +656,8 @@
+ 
+ 	if (dmap) {
+ 		if (refcount_dec_and_test(&dmap->refcnt)) {
+-			/* refcount should not hit 0. This object only goes
+-			 * away when fuse connection goes away
++			/* refcount should not hit 0. The allocation owns
++			 * the last reference until the mapping has been invalidated
+ 			 */
+ 			WARN_ON_ONCE(1);
+ 		}
+@@ -950,6 +965,8 @@
+ 	node = interval_tree_iter_first(&fi->dax->tree, start_idx, start_idx);
+ 	/* Range already got reclaimed by somebody else */
+ 	if (!node) {
++		/* Layout-pin waiting can drop invalidate_lock and free dmap. */
++		dmap = NULL;
+ 		if (retry)
+ 			*retry = true;
+ 		goto out_write_dmap_sem;
+@@ -1059,9 +1076,7 @@
+ 		return ret;
+ 
+ 	/* Cleanup dmap entry and add back to free list */
+-	spin_lock(&fcd->lock);
+ 	dmap_reinit_add_to_free_pool(fcd, dmap);
+-	spin_unlock(&fcd->lock);
+ 	return ret;
+ }
+ 
+@@ -1171,23 +1186,12 @@
+ 	kick_dmap_free_worker(fcd, 1);
+ }
+ 
+-static void fuse_free_dax_mem_ranges(struct list_head *mem_list)
+-{
+-	struct fuse_dax_mapping *range, *temp;
+-
+-	/* Free All allocated elements */
+-	list_for_each_entry_safe(range, temp, mem_list, list) {
+-		list_del(&range->list);
+-		if (!list_empty(&range->busy_list))
+-			list_del(&range->busy_list);
+-		kfree(range);
+-	}
+-}
+-
+ void fuse_dax_conn_free(struct fuse_conn *fc)
+ {
+ 	if (fc->dax) {
+-		fuse_free_dax_mem_ranges(&fc->dax->free_ranges);
++		WARN_ON(!ida_is_empty(&fc->dax->range_ids));
++		ida_destroy(&fc->dax->range_ids);
++		put_dax(fc->dax->dev);
+ 		kfree(fc->dax);
+ 		fc->dax = NULL;
+ 	}
+@@ -1196,13 +1200,11 @@
+ static int fuse_dax_mem_range_init(struct fuse_conn_dax *fcd)
+ {
+ 	long nr_pages, nr_ranges;
+-	struct fuse_dax_mapping *range;
+-	int ret, id;
++	int id;
+ 	size_t dax_size = -1;
+-	unsigned long i;
+ 
+ 	init_waitqueue_head(&fcd->range_waitq);
+-	INIT_LIST_HEAD(&fcd->free_ranges);
++	ida_init(&fcd->range_ids);
+ 	INIT_LIST_HEAD(&fcd->busy_ranges);
+ 	INIT_DELAYED_WORK(&fcd->free_work, fuse_dax_free_mem_worker);
+ 
+@@ -1219,30 +1221,12 @@
+ 	pr_debug("%s: dax mapped %ld pages. nr_ranges=%ld\n",
+ 		__func__, nr_pages, nr_ranges);
+ 
+-	for (i = 0; i < nr_ranges; i++) {
+-		range = kzalloc_obj(struct fuse_dax_mapping);
+-		ret = -ENOMEM;
+-		if (!range)
+-			goto out_err;
+-
+-		/* TODO: This offset only works if virtio-fs driver is not
+-		 * having some memory hidden at the beginning. This needs
+-		 * better handling
+-		 */
+-		range->window_offset = i * FUSE_DAX_SZ;
+-		range->length = FUSE_DAX_SZ;
+-		INIT_LIST_HEAD(&range->busy_list);
+-		refcount_set(&range->refcnt, 1);
+-		list_add_tail(&range->list, &fcd->free_ranges);
+-	}
++	if (!nr_ranges || nr_ranges > INT_MAX)
++		return -E2BIG;
+ 
+ 	fcd->nr_free_ranges = nr_ranges;
+ 	fcd->nr_ranges = nr_ranges;
+ 	return 0;
+-out_err:
+-	/* Free All allocated elements */
+-	fuse_free_dax_mem_ranges(&fcd->free_ranges);
+-	return ret;
+ }
+ 
+ int fuse_dax_conn_alloc(struct fuse_conn *fc, enum fuse_dax_mode dax_mode,
+@@ -1268,6 +1252,8 @@
+ 		return err;
+ 	}
+ 
++	/* The device can disappear before the connection is destroyed. */
++	get_dax(dax_dev);
+ 	fc->dax = fcd;
+ 	return 0;
+ }
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -19,6 +19,8 @@
+ #include <linux/highmem.h>
+ #include <linux/cleanup.h>
+ #include <linux/uio.h>
++#include <linux/sched/mm.h>
++#include <linux/sizes.h>
+ #include "fuse_i.h"
+ #include "fuse_dev_i.h"
+ 
+@@ -73,10 +75,32 @@
+ 
+ 	unsigned int *mq_map; /* index = cpu id, value = request vq id */
+ 
+-	/* DAX memory window where file contents are mapped */
+-	void *window_kaddr;
+-	phys_addr_t window_phys_addr;
+-	size_t window_len;
++};
++
++/* Keep small-file memmaps bounded without hotplugging every 64 KiB range. */
++#ifdef CONFIG_FUSE_DAX
++#define VIRTIO_FS_DAX_CHUNK_SHIFT max_t(unsigned int, 24, CONFIG_FUSE_DAX_SHIFT)
++#else
++#define VIRTIO_FS_DAX_CHUNK_SHIFT 24
++#endif
++
++struct virtio_fs_dax_chunk {
++	struct dev_pagemap pgmap;
++	void *kaddr;
++	unsigned long users;
++};
++
++/* Owned by dax_dev, independently of the virtio_fs kobject and connection. */
++struct virtio_fs_dax {
++	struct mutex lock;
++	struct xarray chunks;
++	phys_addr_t phys;
++	u64 len;
++	int nid;
++	u64 mapped_bytes;
++	u64 active_ranges;
++	u64 map_events;
++	u64 unmap_events;
+ };
+ 
+ struct virtio_fs_forget_req {
+@@ -180,10 +204,41 @@
+ 	return sysfs_emit(buf, "%s\n", fs->tag);
+ }
+ 
++/* A single snapshot keeps growth/release tests independent of debug logs. */
++static ssize_t dax_memmap_show(struct kobject *kobj,
++		struct kobj_attribute *attr, char *buf)
++{
++	struct virtio_fs *fs = container_of(kobj, struct virtio_fs, kobj);
++	struct virtio_fs_dax *dax;
++	ssize_t ret;
++	int id;
++
++	if (!fs->dax_dev)
++		return -ENODEV;
++	id = dax_read_lock();
++	dax = dax_get_private(fs->dax_dev);
++	if (!dax) {
++		ret = -ENODEV;
++		goto out;
++	}
++	mutex_lock(&dax->lock);
++	ret = sysfs_emit(buf,
++		"window_bytes %llu\nchunk_bytes %llu\nmapped_bytes %llu\n"
++		"active_ranges %llu\nmap_events %llu\nunmap_events %llu\n",
++		dax->len, 1ULL << VIRTIO_FS_DAX_CHUNK_SHIFT, dax->mapped_bytes,
++		dax->active_ranges, dax->map_events, dax->unmap_events);
++	mutex_unlock(&dax->lock);
++out:
++	dax_read_unlock(id);
++	return ret;
++}
++
++static struct kobj_attribute virtio_fs_dax_memmap_attr = __ATTR_RO(dax_memmap);
+ static struct kobj_attribute virtio_fs_tag_attr = __ATTR_RO(tag);
+ 
+ static struct attribute *virtio_fs_attrs[] = {
+ 	&virtio_fs_tag_attr.attr,
++	&virtio_fs_dax_memmap_attr.attr,
+ 	NULL
+ };
+ ATTRIBUTE_GROUPS(virtio_fs);
+@@ -1024,19 +1079,142 @@
+  * been produced by .iomap_begin(), which maps a file offset to a window
+  * offset.
+  */
++#ifdef CONFIG_FUSE_DAX
++/* offset/len must describe one range entirely inside a chunk and window. */
++static bool virtio_fs_dax_valid_range(struct virtio_fs_dax *dax,
++				    u64 offset, u64 len)
++{
++	return len && IS_ALIGNED(offset, PAGE_SIZE) &&
++		IS_ALIGNED(len, PAGE_SIZE) && offset < dax->len &&
++		len <= dax->len - offset &&
++		(offset >> VIRTIO_FS_DAX_CHUNK_SHIFT) ==
++		((offset + len - 1) >> VIRTIO_FS_DAX_CHUNK_SHIFT);
++}
++
++static int virtio_fs_dax_get_range(struct dax_device *dax_dev, u64 offset, u64 len)
++{
++	struct virtio_fs_dax *dax = dax_get_private(dax_dev);
++	unsigned long index = offset >> VIRTIO_FS_DAX_CHUNK_SHIFT;
++	u64 start = (u64)index << VIRTIO_FS_DAX_CHUNK_SHIFT;
++	u64 size;
++	struct virtio_fs_dax_chunk *chunk;
++	unsigned int nofs;
++	int ret = 0;
++
++	/* kill_dax() can clear ALIVE after the core's initial liveness check. */
++	if (!dax)
++		return -ENXIO;
++	if (!virtio_fs_dax_valid_range(dax, offset, len))
++		return -EINVAL;
++	size = min(1ULL << VIRTIO_FS_DAX_CHUNK_SHIFT, dax->len - start);
++
++	/* memremap_pages() allocates with GFP_KERNEL under filesystem locks. */
++	nofs = memalloc_nofs_save();
++	mutex_lock(&dax->lock);
++	chunk = xa_load(&dax->chunks, index);
++	if (chunk)
++		goto got_chunk;
++
++	chunk = kzalloc_obj(*chunk);
++	if (!chunk) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	chunk->pgmap.type = MEMORY_DEVICE_FS_DAX;
++	chunk->pgmap.range.start = dax->phys + start;
++	chunk->pgmap.range.end = dax->phys + start + size - 1;
++	chunk->pgmap.nr_range = 1;
++	chunk->kaddr = memremap_pages(&chunk->pgmap, dax->nid);
++	if (IS_ERR(chunk->kaddr)) {
++		ret = PTR_ERR(chunk->kaddr);
++		kfree(chunk);
++		goto out;
++	}
++	ret = xa_err(xa_store(&dax->chunks, index, chunk, GFP_KERNEL));
++	if (ret) {
++		memunmap_pages(&chunk->pgmap);
++		kfree(chunk);
++		goto out;
++	}
++	dax->mapped_bytes += size;
++	dax->map_events++;
++got_chunk:
++	chunk->users++;
++	dax->active_ranges++;
++out:
++	mutex_unlock(&dax->lock);
++	memalloc_nofs_restore(nofs);
++	return ret;
++}
++
++static void virtio_fs_dax_put_range(struct dax_device *dax_dev, u64 offset, u64 len)
++{
++	struct virtio_fs_dax *dax = dax_get_private(dax_dev);
++	unsigned long index = offset >> VIRTIO_FS_DAX_CHUNK_SHIFT;
++	struct virtio_fs_dax_chunk *chunk;
++
++	/* Teardown releases all remaining chunks after the SRCU grace period. */
++	if (!dax)
++		return;
++	if (WARN_ON_ONCE(!virtio_fs_dax_valid_range(dax, offset, len)))
++		return;
++	mutex_lock(&dax->lock);
++	chunk = xa_load(&dax->chunks, index);
++	if (WARN_ON_ONCE(!chunk || !chunk->users))
++		goto out;
++	dax->active_ranges--;
++	if (--chunk->users)
++		goto out;
++
++	/*
++	 * FUSE has invalidated all entries and drained layout pins before
++	 * releasing the last range. Serialize hot-remove with the next get;
++	 * the ID is not reusable until this returns. No direct_access user
++	 * can still hold an iomap for this chunk.
++	 */
++	xa_erase(&dax->chunks, index);
++	memunmap_pages(&chunk->pgmap);
++	dax->mapped_bytes -= range_len(&chunk->pgmap.range);
++	dax->unmap_events++;
++	kfree(chunk);
++out:
++	mutex_unlock(&dax->lock);
++}
++
+ static long virtio_fs_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
+ 				    long nr_pages, enum dax_access_mode mode,
+ 				    void **kaddr, unsigned long *pfn)
+ {
+-	struct virtio_fs *fs = dax_get_private(dax_dev);
+-	phys_addr_t offset = PFN_PHYS(pgoff);
+-	size_t max_nr_pages = fs->window_len / PAGE_SIZE - pgoff;
+-
++	struct virtio_fs_dax *dax = dax_get_private(dax_dev);
++	struct virtio_fs_dax_chunk *chunk;
++	u64 offset = PFN_PHYS(pgoff);
++	unsigned long index = offset >> VIRTIO_FS_DAX_CHUNK_SHIFT;
++	u64 start = (u64)index << VIRTIO_FS_DAX_CHUNK_SHIFT;
++	long avail;
++
++	if (!dax)
++		return -ENXIO;
++	if (pgoff >= dax->len >> PAGE_SHIFT)
++		return -ERANGE;
++	/* FUSE's capacity query must not populate any metadata. */
++	if (!kaddr && !pfn)
++		return min_t(u64, nr_pages, (dax->len >> PAGE_SHIFT) - pgoff);
++
++	mutex_lock(&dax->lock);
++	chunk = xa_load(&dax->chunks, index);
++	if (!chunk) {
++		avail = -ENXIO;
++		goto out;
++	}
++	avail = min_t(u64, nr_pages,
++		(range_len(&chunk->pgmap.range) - (offset - start)) >> PAGE_SHIFT);
+ 	if (kaddr)
+-		*kaddr = fs->window_kaddr + offset;
++		*kaddr = chunk->kaddr + offset - start;
+ 	if (pfn)
+-		*pfn = PHYS_PFN(fs->window_phys_addr + offset);
+-	return nr_pages > max_nr_pages ? max_nr_pages : nr_pages;
++		*pfn = PHYS_PFN(dax->phys + offset);
++out:
++	mutex_unlock(&dax->lock);
++	return avail;
+ }
+ 
+ static int virtio_fs_zero_page_range(struct dax_device *dax_dev,
+@@ -1057,84 +1235,84 @@
+ 
+ static const struct dax_operations virtio_fs_dax_ops = {
+ 	.direct_access = virtio_fs_direct_access,
++	.get_range = virtio_fs_dax_get_range,
++	.put_range = virtio_fs_dax_put_range,
+ 	.zero_page_range = virtio_fs_zero_page_range,
+ };
+ 
+ static void virtio_fs_cleanup_dax(void *data)
+ {
+ 	struct dax_device *dax_dev = data;
+-
++	struct virtio_fs_dax *dax;
++	struct virtio_fs_dax_chunk *chunk;
++	unsigned long index;
++	int id = dax_read_lock();
++
++	dax = dax_get_private(dax_dev);
++	dax_read_unlock(id);
+ 	kill_dax(dax_dev);
++	/* Device removal also handles still-mounted/aborted connections. */
++	xa_for_each(&dax->chunks, index, chunk) {
++		memunmap_pages(&chunk->pgmap);
++		kfree(chunk);
++	}
++	xa_destroy(&dax->chunks);
++	kfree(dax);
+ 	put_dax(dax_dev);
+ }
+ 
+-DEFINE_FREE(cleanup_dax, struct dax_dev *, if (!IS_ERR_OR_NULL(_T)) virtio_fs_cleanup_dax(_T))
++DEFINE_FREE(cleanup_dax, struct dax_device *, if (!IS_ERR_OR_NULL(_T)) virtio_fs_cleanup_dax(_T))
+ 
+ static int virtio_fs_setup_dax(struct virtio_device *vdev, struct virtio_fs *fs)
+ {
+ 	struct dax_device *dax_dev __free(cleanup_dax) = NULL;
+ 	struct virtio_shm_region cache_reg;
+-	struct dev_pagemap *pgmap;
+-	bool have_cache;
+-
+-	if (!IS_ENABLED(CONFIG_FUSE_DAX))
+-		return 0;
+-
+-	dax_dev = alloc_dax(fs, &virtio_fs_dax_ops);
+-	if (IS_ERR(dax_dev)) {
+-		int rc = PTR_ERR(dax_dev);
+-		return rc == -EOPNOTSUPP ? 0 : rc;
+-	}
+-
+-	/* Get cache region */
+-	have_cache = virtio_get_shm_region(vdev, &cache_reg,
+-					   (u8)VIRTIO_FS_SHMCAP_ID_CACHE);
+-	if (!have_cache) {
++	struct virtio_fs_dax *dax;
++
++	if (!virtio_get_shm_region(vdev, &cache_reg, VIRTIO_FS_SHMCAP_ID_CACHE)) {
+ 		dev_notice(&vdev->dev, "%s: No cache capability\n", __func__);
+ 		return 0;
+ 	}
+ 
++	/* Hotplug and hot-remove operate on complete memory subsections. */
++	if (!cache_reg.len || !IS_ALIGNED(cache_reg.addr, SUBSECTION_SIZE) ||
++	    !IS_ALIGNED(cache_reg.len, SUBSECTION_SIZE) ||
++	    cache_reg.addr > PHYS_ADDR_MAX - (cache_reg.len - 1))
++		return -EINVAL;
++
+ 	if (!devm_request_mem_region(&vdev->dev, cache_reg.addr, cache_reg.len,
+-				     dev_name(&vdev->dev))) {
+-		dev_warn(&vdev->dev, "could not reserve region addr=0x%llx len=0x%llx\n",
+-			 cache_reg.addr, cache_reg.len);
++				     dev_name(&vdev->dev)))
+ 		return -EBUSY;
+-	}
+-
+-	dev_notice(&vdev->dev, "Cache len: 0x%llx @ 0x%llx\n", cache_reg.len,
+-		   cache_reg.addr);
+-
+-	pgmap = devm_kzalloc(&vdev->dev, sizeof(*pgmap), GFP_KERNEL);
+-	if (!pgmap)
++
++	dax = kzalloc_obj(*dax);
++	if (!dax)
+ 		return -ENOMEM;
+-
+-	pgmap->type = MEMORY_DEVICE_FS_DAX;
+-
+-	/* Ideally we would directly use the PCI BAR resource but
+-	 * devm_memremap_pages() wants its own copy in pgmap.  So
+-	 * initialize a struct resource from scratch (only the start
+-	 * and end fields will be used).
+-	 */
+-	pgmap->range = (struct range) {
+-		.start = (phys_addr_t) cache_reg.addr,
+-		.end = (phys_addr_t) cache_reg.addr + cache_reg.len - 1,
+-	};
+-	pgmap->nr_range = 1;
+-
+-	fs->window_kaddr = devm_memremap_pages(&vdev->dev, pgmap);
+-	if (IS_ERR(fs->window_kaddr))
+-		return PTR_ERR(fs->window_kaddr);
+-
+-	fs->window_phys_addr = (phys_addr_t) cache_reg.addr;
+-	fs->window_len = (phys_addr_t) cache_reg.len;
+-
+-	dev_dbg(&vdev->dev, "%s: window kaddr 0x%px phys_addr 0x%llx len 0x%llx\n",
+-		__func__, fs->window_kaddr, cache_reg.addr, cache_reg.len);
+-
++	mutex_init(&dax->lock);
++	xa_init(&dax->chunks);
++	dax->phys = cache_reg.addr;
++	dax->len = cache_reg.len;
++	dax->nid = dev_to_node(&vdev->dev);
++	dax_dev = alloc_dax(dax, &virtio_fs_dax_ops);
++	if (IS_ERR(dax_dev)) {
++		int ret = PTR_ERR(dax_dev);
++
++		kfree(dax);
++		return ret == -EOPNOTSUPP ? 0 : ret;
++	}
++
++	dev_notice(&vdev->dev, "Cache len: 0x%llx @ 0x%llx, dynamic memmap chunks: %llu MiB\n",
++		   cache_reg.len, cache_reg.addr,
++		   (1ULL << VIRTIO_FS_DAX_CHUNK_SHIFT) / SZ_1M);
+ 	fs->dax_dev = no_free_ptr(dax_dev);
+ 	return devm_add_action_or_reset(&vdev->dev, virtio_fs_cleanup_dax,
+ 					fs->dax_dev);
+ }
++#else
++static int virtio_fs_setup_dax(struct virtio_device *vdev, struct virtio_fs *fs)
++{
++	return 0;
++}
++#endif
+ 
+ static int virtio_fs_probe(struct virtio_device *vdev)
+ {
