@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Sun, 6 Sep 2026 03:30:00 +0100
+Subject: [PATCH] fuse: dax: make the mapping range size configurable
+
+The DAX window is carved into fixed 2 MiB ranges and a file occupies at
+least one, so a guest mapping many small files needs a window many
+times larger than the data: one system held 566 ranges, 1.1 GiB of
+window, for 53 MiB of files. The window is backed by a struct page per
+4 KiB at mount, 16 MiB of guest RAM per GiB, whether used or not.
+
+Expose the range size as CONFIG_FUSE_DAX_SHIFT so such guests can pick a
+smaller range and fit the same working set into a much smaller window.
+The default stays at 21. The range must still be at least the server's
+map_alignment, which fuse_dax_check_alignment() already verifies. Ranges
+below 2 MiB map with PTEs only; the PMD fault path already falls back
+when the iomap extent is shorter than PMD_SIZE.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+diff --git a/fs/fuse/Kconfig b/fs/fuse/Kconfig
+index 3a4ae63..9a8ae15 100644
+--- a/fs/fuse/Kconfig
++++ b/fs/fuse/Kconfig
+@@ -54,6 +54,28 @@ config FUSE_DAX
+ 	  If you want to allow mounting a Virtio Filesystem with the "dax"
+ 	  option, answer Y.
+ 
++config FUSE_DAX_SHIFT
++	int "Virtio Filesystem DAX mapping range size (log2 bytes)"
++	depends on FUSE_DAX
++	range 16 30
++	default 21
++	help
++	  The DAX window is handed out to files in fixed-size ranges of
++	  2^FUSE_DAX_SHIFT bytes. A file occupies at least one range however
++	  small it is, so with the 2 MiB default a window has to be many times
++	  larger than the data mapped through it once many small files are
++	  in use. A smaller range lets the same working set fit in a smaller
++	  window; the window itself costs a struct page per 4 KiB of guest
++	  RAM whether or not it is used, so this trades that fixed cost
++	  against more mapping requests for large files.
++
++	  Ranges of at least 2 MiB (21) let the guest map files with huge
++	  pages when the window is suitably aligned; smaller ranges use
++	  PTE-sized mappings only. The server's FUSE_INIT map_alignment must
++	  not exceed this value.
++
++	  If unsure, keep the default of 21.
++
+ config FUSE_PASSTHROUGH
+ 	bool "FUSE passthrough operations support"
+ 	default y
+diff --git a/fs/fuse/dax.c b/fs/fuse/dax.c
+index f6cf00a..0e65420 100644
+--- a/fs/fuse/dax.c
++++ b/fs/fuse/dax.c
+@@ -14,10 +14,11 @@
+ #include <linux/interval_tree.h>
+ 
+ /*
+- * Default memory range size.  A power of 2 so it agrees with common FUSE_INIT
+- * map_alignment values 4KB and 64KB.
++ * Memory range size, as log2 bytes. A power of 2 so it agrees with common
++ * FUSE_INIT map_alignment values 4KB and 64KB; the server's alignment is
++ * checked against it in fuse_dax_check_alignment().
+  */
+-#define FUSE_DAX_SHIFT	21
++#define FUSE_DAX_SHIFT	CONFIG_FUSE_DAX_SHIFT
+ #define FUSE_DAX_SZ	(1 << FUSE_DAX_SHIFT)
+ #define FUSE_DAX_PAGES	(FUSE_DAX_SZ / PAGE_SIZE)
+ 

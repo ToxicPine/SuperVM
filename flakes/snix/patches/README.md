@@ -11,6 +11,8 @@ composition: adding a file here does nothing until it is listed in that stack.
 | `shmem-map/`    | `GET_SHMEM_CONFIG` + `SHMEM_MAP`/`SHMEM_UNMAP` | DAX for the whole mount                      |
 | `fsmeta/`       | either                                         | per-inode DAX and served extended attributes |
 | `shared-index/` | either                                         | a shared, mmapable, read-only metadata index |
+| `dax-window/`   | `shmem-map`                                    | a configurable DAX window size               |
+| `grpc-drain/`   | none — a client fix                            | clean stream close in `DirectoryService::get` |
 
 `.old/` holds a superseded series, kept for reference and listed nowhere.
 
@@ -57,7 +59,8 @@ nix build ./flakes/snix#snix
 ```
 
 `snix`, `default`, the libraries, and the overlay all use
-`forget ++ shmem-map ++ fsmeta ++ shared-index`. This is the only packaged
+`forget ++ shmem-map ++ fsmeta ++ shared-index ++ dax-window ++ grpc-drain`.
+This is the only packaged
 stack: crosvm's generic vhost-user frontend is what SuperVM drives, per-inode
 DAX is its policy surface, and sharing the immutable metadata is part of the
 design rather than an optional variant. `fs-map/` remains only as an alternate
@@ -193,6 +196,37 @@ it atomically. `snix store virtiofs` and `snix castore virtiofs` gain
 is plumbed. They also accept the same path through `SNIX_METADATA_INDEX`, so a
 launcher can establish one shared index for every daemon without repeating the
 flag.
+
+## What the `dax-window` patch adds
+
+`shmem-map/` advertised a fixed 8 GiB shared-memory region for DAX. The guest
+pays for that region whether or not it maps anything into it: Linux memremaps
+the whole virtio-fs cache as device memory and backs it with a 64-byte
+`struct page` per 4 KiB, so an 8 GiB window costs every guest 128 MiB of RAM
+that is private to it and shared with nothing. On a 512 MiB guest it was the
+largest single consumer of guest memory.
+
+The patch takes the window size from the caller instead. `start_virtiofs_daemon`
+receives `Option<u64>`, both virtio-fs commands gain `--dax-window-size BYTES`
+(default 1 GiB), and the size must be a non-zero multiple of the 2 MiB range
+granularity the FUSE client carves the window into. The window only has to cover
+the working set mapped at one time, since the guest reclaims idle ranges when it
+fills, so it is sized to that and not to the store. The guest kernel's range
+granularity decides how small it can usefully go: with 2 MiB ranges every file
+holds a whole range, and a Nix closure of many small files needs a window many
+times its data; SuperVM's guest kernel therefore builds FUSE with 64 KiB
+ranges, and the wrapper's `launch --dax-window` picks the size.
+
+## What the `grpc-drain` patch fixes
+
+`GRPCDirectoryService::get` read the first message of its server stream and
+dropped the rest. Dropping an unfinished HTTP/2 stream is a `RST_STREAM`, and h2
+counts them: a client issuing thousands of gets back to back, which is what
+building the metadata index does, hits the client-side limit of 1024 pending
+resets and the server answers `GOAWAY ENHANCE_YOUR_CALM`, failing the build
+with `ResourceExhausted`. The fix reads on to the end of the (one-message)
+stream so it closes normally. It is a standalone client fix with no dependency
+on the rest of the stack.
 
 ## Why `fs-map` and `shmem-map` differ
 

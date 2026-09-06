@@ -49,8 +49,10 @@ Firecracker.
 
 ## How much memory it saves
 
-These figures were measured with `bench/` (idle fixed-count runs at 1, 4,
-and 32 VMs on 512 MiB minimal NixOS guests).
+### Fleet measurements
+
+Measured with `bench/` (idle fixed-count runs at 1, 4, and 32 VMs on 512 MiB
+minimal NixOS guests) before the guest-side changes above.
 
 ### Per-VM savings
 
@@ -75,9 +77,15 @@ At 32 VMs the deployments measure 9.5 GiB against 8.5 GiB.
 | Metadata index                    | ~11 MiB     |
 | Snix daemons                      | ~40 MiB     |
 
+### DAX window overhead
+
+Earlier guest-side changes cut an idle guest's host-resident RAM from 270 MiB
+to 118 MiB without KSM, mainly by reducing DAX window page metadata from 129 MiB
+to 5 MiB; these measurements predate dynamic DAX metadata allocation.
+
 ## Charts
 
-![Net Memory Consumption](./media/memory_consumption.png)
+![Idle Memory Consumption](./media/memory-consumption-idle.png)
 
 ## Run it
 
@@ -109,6 +117,14 @@ nix run .#supervm -- launch ./vm-web
 
 `launch` boots the last successfully prepared runner without evaluating the
 guest again.
+
+`launch --dax-window=BYTES` sets the DAX window size (default 256 MiB). It
+costs the guest 16 MiB of RAM per GiB, so size it to the files a guest maps at
+once, not to the store:
+
+```console
+nix run .#supervm -- launch --dax-window=536870912 ./vm-a
+```
 
 Select `--dax=never`, `--dax=inode` (the default), or `--dax=always` while
 preparing:

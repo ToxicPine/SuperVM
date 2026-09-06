@@ -45,6 +45,8 @@
         ./patches/shared-index/0002-feat-castore-fs-build-a-metadata-index-from-a-set-of.patch
         ./patches/shared-index/0003-feat-castore-fs-serve-indexed-inodes-from-a-shared-i.patch
         ./patches/shared-index/0004-feat-cli-build-and-serve-a-shared-metadata-index.patch
+        ./patches/dax-window/0001-feat-castore-fs-make-the-DAX-window-size-configurabl.patch
+        ./patches/grpc-drain/0001-fix-castore-directoryservice-drain-the-gRPC-get-strea.patch
       ];
 
       patchedSource =

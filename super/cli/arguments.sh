@@ -1,7 +1,7 @@
 usage() {
   cat >&2 <<'USAGE'
 usage: supervm prepare [--dax=MODE] [--profile=FLAKE#CONFIG] <upper-store-dir>
-       supervm launch <upper-store-dir>
+       supervm launch [--dax-window=BYTES] <upper-store-dir>
 
   prepare   Build the guest and populate the shared store without booting.
 
@@ -11,6 +11,12 @@ usage: supervm prepare [--dax=MODE] [--profile=FLAKE#CONFIG] <upper-store-dir>
 
   --profile NixOS guest configuration to boot, as FLAKE#NAME. SuperVM merges
             its guest template over it. Defaults to a minimal configuration.
+
+  --dax-window
+            Size of the DAX window offered to the guest, in bytes; a multiple
+            of 2 MiB. The guest spends 16 MiB of RAM per GiB of window on page
+            metadata, so keep it near the store working set. Defaults to
+            256 MiB, which holds about 200 MiB of concurrently mapped files.
 
   upper-store-dir
             Directory holding this VM's persistent private state. Created if
@@ -36,6 +42,8 @@ parse_arguments() {
 
   dax_mode=inode
   dax_set=false
+  dax_window=$((256 * 1024 * 1024))
+  dax_window_set=false
   profile=
   positionals=()
   while (($# > 0)); do
@@ -49,6 +57,17 @@ parse_arguments() {
         (($# >= 2)) || usage
         dax_mode=$2
         dax_set=true
+        shift 2
+        ;;
+      --dax-window=*)
+        dax_window=${1#--dax-window=}
+        dax_window_set=true
+        shift
+        ;;
+      --dax-window)
+        (($# >= 2)) || usage
+        dax_window=$2
+        dax_window_set=true
         shift 2
         ;;
       --profile=*)
@@ -85,9 +104,14 @@ parse_arguments() {
     *) usage ;;
   esac
   [[ -z ${profile} || ${profile} == ?*#?* ]] || usage
+  [[ ${dax_window} =~ ^[1-9][0-9]*$ ]] || usage
+  ((dax_window % (2 * 1024 * 1024) == 0)) || usage
   ((${#positionals[@]} == 1)) || usage
   if [[ ${subcommand} == launch &&
     (${dax_set} == true || -n ${profile}) ]]; then
+    usage
+  fi
+  if [[ ${subcommand} == prepare && ${dax_window_set} == true ]]; then
     usage
   fi
 }

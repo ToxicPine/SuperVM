@@ -21,6 +21,13 @@
 }:
 
 linux_latest.override {
+  kernelPatches = [
+    {
+      name = "fuse-dax-configurable-range-size";
+      patch = ./guest-kernel-patches/0001-fuse-dax-make-the-mapping-range-size-configurable.patch;
+    }
+  ];
+
   structuredExtraConfig = with lib.kernel; {
     # VIRTIO_FS cannot be `y` while FUSE_FS is `m`; kconfig re-asks and the
     # generator aborts on the repeated question. Building both in also means
@@ -30,6 +37,27 @@ linux_latest.override {
 
     FS_DAX = yes;
     FUSE_DAX = yes;
+
+    # The DAX window is handed out in ranges of this size, one range per file
+    # at minimum. A store closure is mostly small files, so 2 MiB ranges need
+    # a window many times the mapped data, and the window costs the guest a
+    # struct page per 4 KiB whether used or not. 64 KiB ranges fit the same
+    # working set in a fraction of the window.
+    FUSE_DAX_SHIFT = freeform "16";
+
+    # Drivers every SuperVM guest loads at boot. Built in, their text sits in
+    # the kernel image ranges that are shared between guests; as modules each
+    # guest would hold its own copy in vmalloc, and the initrd would have to
+    # carry and load them.
+    VIRTIO_PCI = yes;
+    VIRTIO_MMIO = yes;
+    VIRTIO_BLK = yes;
+    VIRTIO_BALLOON = yes;
+    VIRTIO_CONSOLE = yes;
+    VSOCKETS = yes;
+    VIRTIO_VSOCKETS = yes;
+    EXT4_FS = yes;
+    OVERLAY_FS = yes;
 
     # Keep the core executable and read-only data out of ordinary writable
     # mappings. Kernel-controlled text-patching paths can still create

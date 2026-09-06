@@ -76,22 +76,48 @@
         kernel.randstructSeed = lib.mkForce "";
       };
 
+      # The virtual hardware is fixed and its drivers are built into the guest
+      # kernel, so the stock initrd module set (SATA, USB, keyboards, LVM) is
+      # dead weight that is unpacked into guest RAM on every boot. The same
+      # goes for microvm.nix's own list: virtio, virtio-fs and overlayfs are
+      # built in, and 9p is not used. A module loaded at boot costs every guest
+      # its own copy of the text in vmalloc, where built-in text is shared
+      # through the kernel image ranges; dropping these took a guest from
+      # 13.7 MiB to 4.7 MiB of vmalloc. Callers needing initrd modules of
+      # their own still have `boot.initrd.availableKernelModules`.
+      boot.initrd.includeDefaultModules = lib.mkDefault false;
+      boot.initrd.kernelModules = lib.mkForce [ ];
+
+      # A microVM has no radio. cfg80211 (with rfkill in tow) is autoloaded
+      # regardless and is the largest module an idle guest carried.
+      boot.blacklistedKernelModules = [ "cfg80211" ];
+
+      # Free page reporting only returns free blocks of at least this order to
+      # the host. The default, the 2 MiB pageblock, leaves every smaller free
+      # fragment resident on the host: about 15 MiB on an idle 512 MiB guest,
+      # since post-boot free memory is fragmented. Order 0 reports everything;
+      # reporting is batched and delayed, so an idle guest pays nothing for it.
+      boot.kernelParams = [ "page_reporting.page_reporting_order=0" ];
+
       microvm = {
         hypervisor = "crosvm";
+        # Free page reporting is what lets a guest's freed memory leave the
+        # host; a balloon device alone only lets the host take memory back by
+        # asking. Reporting is on by default for the same reason DAX is: a
+        # guest that keeps every page it ever touched defeats the point.
         balloon = true;
         # The wrapper starts each runner in a private per-VM runtime directory,
         # making this relative control-socket name unique without embedding a
         # host runtime path in the Nix derivation.
         socket = "crosvm.sock";
 
-        crosvm = lib.mkIf isX86_64 {
-          extraArgs = [
-            "--disable-sandbox"
-            "--private-ram-map"
-            "${guestKernelImageRanges}/ranges.json"
-            "--private-ram-mergeable"
-          ];
-        };
+        crosvm.extraArgs = [ "--balloon-page-reporting" ]
+        ++ lib.optionals isX86_64 [
+          "--disable-sandbox"
+          "--private-ram-map"
+          "${guestKernelImageRanges}/ranges.json"
+          "--private-ram-mergeable"
+        ];
 
         # Carries the Nix daemon protocol to the shared lower store. A unix
         # socket cannot be reached across virtio-fs, since connect() resolves

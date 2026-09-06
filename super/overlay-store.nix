@@ -154,29 +154,41 @@ in
 
     # The guest end of the metadata transport. Nix speaks `unix://`, so the
     # vsock connection is presented as a socket at the expected path.
-    systemd.services.supervm-lower-store = {
-      description = "Proxy to the shared Snix lower store";
-      before = [ "nix-daemon.service" ];
-      wantedBy = [ "multi-user.target" ];
-      unitConfig.JoinsNamespaceOf = [ ];
-      serviceConfig = {
-        ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p ${builtins.dirOf cfg.lowerStoreDaemonSocket}";
-        ExecStart = lib.escapeShellArgs [
-          (lib.getExe pkgs.socat)
-          "UNIX-LISTEN:${cfg.lowerStoreDaemonSocket},fork,unlink-early,mode=0666"
-          "VSOCK-CONNECT:2:${toString cfg.lowerStoreDaemonPort}"
-        ];
-        Restart = "always";
+    #
+    # systemd holds the listening socket and starts one proxy per accepted
+    # connection, which exits with it. The Nix daemon is itself socket-
+    # activated, so an idle guest runs no proxy at all; a resident forwarder
+    # would be a few MiB per VM spent waiting for a client that may never come.
+    systemd.sockets.supervm-lower-store = {
+      description = "Socket for the shared Snix lower store";
+      wantedBy = [ "sockets.target" ];
+      socketConfig = {
+        ListenStream = cfg.lowerStoreDaemonSocket;
+        Accept = true;
+        SocketMode = "0666";
+        DirectoryMode = "0755";
       };
     };
 
-    # The daemon opens the lower store when it starts, so its proxy must already
-    # be listening. The socket may listen earlier: ordering this service before
-    # sockets.target would cycle through its own default dependency on
-    # basic.target.
+    systemd.services."supervm-lower-store@" = {
+      description = "Proxy to the shared Snix lower store";
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs [
+          (lib.getExe pkgs.socat)
+          "STDIO"
+          "VSOCK-CONNECT:2:${toString cfg.lowerStoreDaemonPort}"
+        ];
+        StandardInput = "socket";
+        StandardOutput = "socket";
+        StandardError = "journal";
+      };
+    };
+
+    # The daemon opens the lower store when it starts, so the socket must be
+    # listening first. Both are sockets.target units, so no cycle is involved.
     systemd.services.nix-daemon = {
-      after = [ "supervm-lower-store.service" ];
-      requires = [ "supervm-lower-store.service" ];
+      after = [ "supervm-lower-store.socket" ];
+      requires = [ "supervm-lower-store.socket" ];
     };
 
     # Nix must not be told to garbage collect or optimise a store whose lower

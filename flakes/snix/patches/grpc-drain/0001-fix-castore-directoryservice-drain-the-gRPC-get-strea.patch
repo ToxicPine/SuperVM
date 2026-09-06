@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arbion Halili <a.halili@protonmail.com>
+Date: Sun, 6 Sep 2026 03:45:00 +0100
+Subject: [PATCH] fix(castore/directoryservice): drain the gRPC get stream
+
+`GRPCDirectoryService::get` read one message and dropped the stream.
+Each drop is a RST_STREAM, and h2 counts them: thousands of gets in a
+row, as when building the metadata index, hit the 1024 pending-reset
+limit and the server answers GOAWAY ENHANCE_YOUR_CALM, failing the build
+with ResourceExhausted.
+
+A non-recursive request carries at most one Directory and then ends, so
+read on to the end. The stream closes cleanly at the cost of one extra
+read that returns end-of-stream immediately.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+diff --git a/snix/castore/src/directoryservice/grpc.rs b/snix/castore/src/directoryservice/grpc.rs
+index 4452d51..c0f0aee 100644
+--- a/snix/castore/src/directoryservice/grpc.rs
++++ b/snix/castore/src/directoryservice/grpc.rs
+@@ -47,8 +47,7 @@ where
+     #[instrument(level = "trace", skip_all, fields(directory.digest = %digest, instance_name = %self.instance_name))]
+     async fn get(&self, digest: &B3Digest) -> Result<Option<Directory>, super::Error> {
+         // clone the client, as it takes a &mut.
+-        // We retrieve the first message only, then close the stream (we set recursive to false)
+-        match self
++        let mut stream = self
+             .grpc_client
+             .clone()
+             .get(proto::GetDirectoryRequest {
+@@ -57,10 +56,21 @@ where
+             })
+             .await
+             .map_err(Error::Tonic)?
+-            .into_inner()
+-            .message()
+-            .await
+-        {
++            .into_inner();
++
++        // A non-recursive request answers with at most one Directory and then
++        // ends the stream. Read through to that end rather than dropping the
++        // stream after the first message: a dropped stream is a RST_STREAM,
++        // and a client issuing thousands of gets in a row (an index build, a
++        // closure walk) then trips the server's reset-flood protection and is
++        // sent GOAWAY. Draining costs one more read and leaves the stream
++        // closed cleanly.
++        let first = stream.message().await;
++        if let Ok(Some(_)) = &first {
++            while let Ok(Some(_)) = stream.message().await {}
++        }
++
++        match first {
+             Ok(Some(proto_directory)) => {
+                 // Validate the retrieved Directory indeed has the
+                 // digest we expect it to have, to detect corruptions.

@@ -74,10 +74,18 @@ start_vm_filesystem() {
   # advise MADV_HUGEPAGE, mimalloc treats the arena as hugepage-backed and
   # never purges it, so whenever the kernel obliges with 2 MiB pages the
   # boot-burst peak (~16 MiB) stays resident for the life of the VM.
+  #
+  # The window is guest RAM as much as it is address space: Linux backs the
+  # whole region with page metadata at boot, 16 MiB per GiB, so it is sized to
+  # the working set the guest maps at once and not to the store. The guest
+  # kernel maps files in 64 KiB ranges and reclaims idle ones once 80% of the
+  # window is in use, so 256 MiB holds about 200 MiB of concurrently mapped
+  # files for 4 MiB of guest RAM. A minimal NixOS guest maps under 80 MiB.
   MIMALLOC_ALLOW_LARGE_OS_PAGES=0 MIMALLOC_PURGE_DELAY=0 \
     TOKIO_WORKER_THREADS=2 \
     snix store virtiofs \
     --dax-backing-dir "${state_dir}/dax-backing" \
+    --dax-window-size "${dax_window}" \
     --tag "${lower_store_tag}" \
     "${lower_store_fs_socket}" >"${runtime_dir}/${vm_id}-fs.log" 2>&1 &
   fs_pid=$!
