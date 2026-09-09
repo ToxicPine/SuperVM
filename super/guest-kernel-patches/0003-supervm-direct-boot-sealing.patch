@@ -1,0 +1,144 @@
+From ee4b4aab71c6073f3380dc3f0b3da5b86893ae5c Mon Sep 17 00:00:00 2001
+From: SuperVM contributors <supervm@localhost>
+Date: Wed, 9 Sep 2026 02:06:47 +0100
+Subject: [PATCH] x86: coordinate immutable boot text with the VMM
+
+Request a one-way seal after kernel initialization and wait for the VMM
+before entering userspace. Disable runtime patching of core text while
+retaining out-of-line static-call trampolines, which the range producer
+excludes. Enable the handshake with the supervm_seal boot parameter.
+---
+ arch/x86/Kconfig              | 14 +++++++++--
+ arch/x86/kernel/alternative.c |  5 +++-
+ init/main.c                   | 47 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index f3f7cb0..6eae0fb 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -193,7 +193,7 @@ config X86
+ 	select HAVE_ARCH_AUDITSYSCALL
+ 	select HAVE_ARCH_HUGE_VMAP		if X86_64 || X86_PAE
+ 	select HAVE_ARCH_HUGE_VMALLOC		if X86_64
+-	select HAVE_ARCH_JUMP_LABEL
++	select HAVE_ARCH_JUMP_LABEL		if !SUPERVM_BOOT_SEAL
+ 	select HAVE_ARCH_JUMP_LABEL_RELATIVE
+ 	select HAVE_ARCH_KASAN			if X86_64
+ 	select HAVE_ARCH_KASAN_VMALLOC		if X86_64
+@@ -294,7 +294,7 @@ config X86
+ 	select HAVE_STACKPROTECTOR
+ 	select HAVE_STACK_VALIDATION		if HAVE_OBJTOOL
+ 	select HAVE_STATIC_CALL
+-	select HAVE_STATIC_CALL_INLINE		if HAVE_OBJTOOL
++	select HAVE_STATIC_CALL_INLINE		if HAVE_OBJTOOL && !SUPERVM_BOOT_SEAL
+ 	select HAVE_PREEMPT_DYNAMIC_CALL
+ 	select HAVE_RSEQ
+ 	select HAVE_RUST			if X86_64
+@@ -3182,3 +3182,13 @@ source "arch/x86/kvm/Kconfig"
+ source "arch/x86/Kconfig.cpufeatures"
+ 
+ source "arch/x86/Kconfig.assembler"
++
++config SUPERVM_BOOT_SEAL
++	bool "SuperVM direct boot immutable core text"
++	depends on X86_64 && STRICT_KERNEL_RWX
++	help
++	  Support the crosvm one-way boot memory sealing protocol. Runtime
++	  static-call patching is confined to trampolines, which the host range
++	  producer excludes. SMP lock-prefix replacement is disabled. Enable
++	  with the supervm_seal kernel command-line parameter. This parameter
++	  requires a compatible VMM and failure to seal is fatal.
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 62936a3..c24d160 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -1073,8 +1073,10 @@ void __init_or_module noinline apply_returns(s32 *start, s32 *end)
+ {
+ 	s32 *s;
+ 
++#ifdef CONFIG_HAVE_STATIC_CALL_INLINE
+ 	if (cpu_wants_rethunk())
+ 		static_call_force_reinit();
++#endif
+ 
+ 	for (s = start; s < end; s++) {
+ 		void *dest = NULL, *addr = (void *)s + *s;
+@@ -2442,7 +2444,8 @@ void __init alternative_instructions(void)
+ 
+ #ifdef CONFIG_SMP
+ 	/* Patch to UP if other cpus not imminent. */
+-	if (!noreplace_smp && (num_present_cpus() == 1 || setup_max_cpus <= 1)) {
++	if (!IS_ENABLED(CONFIG_SUPERVM_BOOT_SEAL) && !noreplace_smp &&
++	    (num_present_cpus() == 1 || setup_max_cpus <= 1)) {
+ 		uniproc_patched = true;
+ 		alternatives_smp_module_add(NULL, "core kernel",
+ 					    __smp_locks, __smp_locks_end,
+diff --git a/init/main.c b/init/main.c
+index 96f93bb..3c60c5a 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -1553,6 +1553,52 @@ static int __init set_debug_rodata(char *str)
+ early_param("rodata", set_debug_rodata);
+ #endif
+ 
++#ifdef CONFIG_SUPERVM_BOOT_SEAL
++#if defined(CONFIG_JUMP_LABEL) || defined(CONFIG_HAVE_STATIC_CALL_INLINE) || \
++    defined(CONFIG_FTRACE) || defined(CONFIG_KPROBES) || defined(CONFIG_BPF_JIT) || \
++    defined(CONFIG_KGDB) || defined(CONFIG_CALL_THUNKS)
++#error "SuperVM boot sealing requires the immutable text configuration"
++#endif
++
++enum {
++	SUPERVM_SEAL_PORT = 0x5050,
++	SUPERVM_SEAL_READY = 0x53564d01,
++	SUPERVM_SEAL_REQUEST = 0x5345414c,
++	SUPERVM_SEAL_DONE = 0x53564d02,
++	SUPERVM_SEAL_PENDING = 0x53564d03,
++};
++
++static bool supervm_seal_requested __ro_after_init;
++
++static int __init supervm_seal_setup(char *unused)
++{
++	supervm_seal_requested = true;
++	return 1;
++}
++__setup("supervm_seal", supervm_seal_setup);
++
++static void supervm_seal_boot_memory(void)
++{
++	if (!supervm_seal_requested)
++		return;
++	if (inl(SUPERVM_SEAL_PORT) != SUPERVM_SEAL_READY)
++		panic("SuperVM boot memory sealing protocol unavailable");
++	outl(SUPERVM_SEAL_REQUEST, SUPERVM_SEAL_PORT);
++	for (;;) {
++		u32 status = inl(SUPERVM_SEAL_PORT);
++
++		if (status == SUPERVM_SEAL_DONE)
++			break;
++		if (status != SUPERVM_SEAL_PENDING)
++			panic("SuperVM boot memory sealing failed");
++		cpu_relax();
++	}
++	pr_info("SuperVM core text sealed by VMM\n");
++}
++#else
++static inline void supervm_seal_boot_memory(void) { }
++#endif
++
+ static void mark_readonly(void)
+ {
+ 	if (IS_ENABLED(CONFIG_STRICT_KERNEL_RWX) && rodata_enabled) {
+@@ -1607,6 +1653,7 @@ static int __ref kernel_init(void *unused)
+ 	 * to finalize PTI.
+ 	 */
+ 	pti_finalize();
++	supervm_seal_boot_memory();
+ 
+ 	system_state = SYSTEM_RUNNING;
+ 	numa_default_policy();
+-- 
+2.54.0
+

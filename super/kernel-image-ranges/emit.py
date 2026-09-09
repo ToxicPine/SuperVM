@@ -9,14 +9,22 @@ from pathlib import Path
 
 
 PT_LOAD = 1
+PF_X = 1
 PF_W = 2
 PAGE_SIZE = 4096
 EM_X86_64 = 62
-X86_BOOT_HEADER_MAGIC = 0x53726448
-X86_MIN_BOOT_PROTOCOL = 0x020A
-CROSVM_COMPRESSED_LOAD_ADDRESS = 0x200000
+CROSVM_KERNEL_MIN_ADDRESS = 0x200000
+
 
 REQUIRED_CONFIG = {
+    "CONFIG_SUPERVM_BOOT_SEAL": "y",
+    "CONFIG_JUMP_LABEL": "n",
+    "CONFIG_HAVE_STATIC_CALL_INLINE": "n",
+    "CONFIG_CALL_THUNKS": "n",
+    "CONFIG_FTRACE": "n",
+    "CONFIG_KPROBES": "n",
+    "CONFIG_KGDB": "n",
+    "CONFIG_BPF_JIT": "n",
     "CONFIG_RANDOMIZE_BASE": "n",
     "CONFIG_KEXEC": "n",
     "CONFIG_KEXEC_FILE": "n",
@@ -137,41 +145,26 @@ def validate_kernel_config(values: dict[str, str]) -> None:
         )
 
 
-def x86_bzimage_runtime_start(path: Path) -> int:
+def validate_elf_boot(path: Path, segments: list[LoadSegment]) -> None:
     with path.open("rb") as file:
-        data = file.read(0x264)
-    if len(data) < 0x264:
-        raise ValueError(f"{path} is too short to contain an x86 bzImage header")
-
-    magic = struct.unpack_from("<I", data, 0x202)[0]
-    if magic != X86_BOOT_HEADER_MAGIC:
-        raise ValueError(f"{path} lacks the x86 bzImage HdrS signature")
-
-    protocol_version = struct.unpack_from("<H", data, 0x206)[0]
-    if protocol_version < X86_MIN_BOOT_PROTOCOL:
-        raise ValueError(
-            f"{path} uses boot protocol {protocol_version:#06x}; "
-            f"{X86_MIN_BOOT_PROTOCOL:#06x} or newer is required"
-        )
-
-    kernel_alignment = struct.unpack_from("<I", data, 0x230)[0]
-    relocatable = data[0x234] != 0
-    preferred_address = struct.unpack_from("<Q", data, 0x258)[0]
-    if not relocatable:
-        raise ValueError(
-            f"{path} is not relocatable and cannot be loaded by crosvm at "
-            f"{CROSVM_COMPRESSED_LOAD_ADDRESS:#x}"
-        )
-    if kernel_alignment == 0 or kernel_alignment & (kernel_alignment - 1):
-        raise ValueError(f"{path} has invalid kernel_alignment {kernel_alignment:#x}")
-    if preferred_address % kernel_alignment:
-        raise ValueError(
-            f"{path} preferred address {preferred_address:#x} is not aligned to "
-            f"{kernel_alignment:#x}"
-        )
-
-    load_address = max(CROSVM_COMPRESSED_LOAD_ADDRESS, preferred_address)
-    return align_up(load_address, kernel_alignment)
+        header = file.read(64)
+    if len(header) != 64 or header[:6] != b"\x7fELF\x02\x01":
+        raise ValueError("direct x86-64 boot requires a little-endian ELF64 image")
+    entry = struct.unpack_from("<Q", header, 24)[0]
+    if (
+        min(segment.physical_address for segment in segments)
+        < CROSVM_KERNEL_MIN_ADDRESS
+    ):
+        raise ValueError("ELF load segment is below crosvm's minimum kernel address")
+    # Linux's startup_64 can live in a RW init PT_LOAD segment. Crosvm loads
+    # physical segments without enforcing their ELF permission flags at boot.
+    if not any(
+        segment.physical_address
+        <= entry
+        < segment.physical_address + segment.memory_size
+        for segment in segments
+    ):
+        raise ValueError("ELF entry is not inside a physical load segment")
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -236,6 +229,46 @@ def image_range(
     }
 
 
+def immutable_text_ranges(
+    symbols: dict[str, int], segments: list[LoadSegment]
+) -> list[dict[str, int]]:
+    # Only core text is sealed. Runtime static-call trampolines must retain
+    # writable pages; rodata includes metadata and is deliberately not inferred
+    # immutable merely from ELF segment permissions.
+    text_range = image_range("kernel-text", "_text", "_etext", symbols, segments)
+    trampoline_start = align_down(symbols["__static_call_text_start"], PAGE_SIZE)
+    trampoline_end = align_up(symbols["__static_call_text_end"], PAGE_SIZE)
+    if not (
+        symbols["_text"]
+        <= symbols["__static_call_text_start"]
+        <= symbols["__static_call_text_end"]
+        <= symbols["_etext"]
+    ):
+        raise ValueError("static-call trampolines lie outside core text")
+    text_segment = segment_containing(symbols["_text"], segments)
+    if not text_segment.flags & PF_X:
+        raise ValueError("core text does not lie in an executable PT_LOAD segment")
+    excluded_start = (
+        text_segment.physical_address + trampoline_start - text_segment.virtual_address
+    )
+    excluded_end = (
+        text_segment.physical_address + trampoline_end - text_segment.virtual_address
+    )
+    start = text_range["guestPhysicalStart"]
+    end = start + text_range["length"]
+    ranges = []
+    for first, last in [
+        (start, min(end, excluded_start)),
+        (max(start, excluded_end), end),
+    ]:
+        if first < last:
+            ranges.append({"guestPhysicalStart": first, "length": last - first})
+    if not ranges:
+        raise ValueError("no immutable core text pages remain")
+
+    return ranges
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--vmlinux", required=True, type=Path)
@@ -253,25 +286,12 @@ def main() -> None:
         )
     symbols = system_map_symbols(args.system_map)
     validate_kernel_config(kernel_config(args.config))
-    runtime_start = x86_bzimage_runtime_start(args.kernel_image)
-
-    first_load_address = min(segment.physical_address for segment in segments)
-    if first_load_address != runtime_start:
+    if args.kernel_image.resolve() != args.vmlinux.resolve():
         raise ValueError(
-            "vmlinux first PT_LOAD physical address "
-            f"{first_load_address:#x} does not match the bzImage runtime start "
-            f"{runtime_start:#x}"
+            "kernel-image must point to the exact vmlinux used for the ranges"
         )
-    ranges = [
-        image_range("kernel-text", "_text", "_etext", symbols, segments),
-        image_range(
-            "kernel-rodata",
-            "__start_rodata",
-            "__end_rodata",
-            symbols,
-            segments,
-        ),
-    ]
+    validate_elf_boot(args.vmlinux, segments)
+    ranges = immutable_text_ranges(symbols, segments)
 
     document = {
         "schemaVersion": 1,

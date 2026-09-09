@@ -46,7 +46,7 @@
     let
       isX86_64 = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
       guestKernelImageRanges = pkgs.callPackage ./kernel-image-ranges {
-        inherit guestKernel;
+        guestKernel = config.microvm.kernel;
       };
     in
     {

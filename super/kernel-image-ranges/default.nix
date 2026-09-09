@@ -11,7 +11,7 @@ runCommand "guest-kernel-image-ranges"
   ''
     out="''${out:?Nix did not set the output path}"
     mkdir -p "''${out}"
-    ln -s ${guestKernel}/bzImage "''${out}/kernel-image"
+    ln -s ${guestKernel.dev}/vmlinux "''${out}/kernel-image"
     python3 ${./emit.py} \
       --vmlinux ${guestKernel.dev}/vmlinux \
       --kernel-image "''${out}/kernel-image" \

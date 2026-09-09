@@ -5,11 +5,10 @@
 # stock kernel can do this. FS_DAX itself needs only MMU and ZONE_DEVICE, both
 # already enabled, so turning it on is enough.
 #
-# Selective host-side KSM does not require these pages to be immutable: KSM
-# gives a writer a private copy. Disabling boot relocation makes the linked
-# guest-physical addresses stable. The ranges become KSM-eligible before boot;
-# early text patching therefore writes private pages, and KSM can merge only
-# the pages whose final contents are identical.
+# Core text is writable and unmerged during initialization. The patched kernel
+# requests a one-way VMM seal before userspace. Only after KVM and host write
+# protection are applied may crosvm enable KSM. Runtime static-call trampolines
+# are excluded by the range producer; other text-patching paths are disabled.
 #
 # Worth checking the built config rather than assuming: where DAX is
 # unavailable the guest falls back to ordinary reads instead of failing, so a
@@ -22,6 +21,10 @@
 
 linux_latest.override {
   kernelPatches = [
+    {
+      name = "supervm-direct-boot-sealing";
+      patch = ./guest-kernel-patches/0003-supervm-direct-boot-sealing.patch;
+    }
     {
       name = "fuse-dax-configurable-range-size";
       patch = ./guest-kernel-patches/0001-fuse-dax-make-the-mapping-range-size-configurable.patch;
@@ -65,18 +68,25 @@ linux_latest.override {
 
     # Keep the core executable and read-only data out of ordinary writable
     # mappings. Kernel-controlled text-patching paths can still create
-    # temporary aliases; KSM copy-on-write keeps those updates correct.
+    # temporary aliases for the excluded static-call trampoline pages.
     STRICT_KERNEL_RWX = yes;
     STRICT_MODULE_RWX = yes;
     DEBUG_WX = yes;
 
-    # The generated map records linked physical addresses. The x86 bzImage
-    # decompressor uses those output addresses only when KASLR is disabled.
+    # Keep linked addresses stable for the direct ELF boot manifest.
     RANDOMIZE_BASE = lib.mkForce no;
 
     # Remove facilities which generate or deliberately rewrite executable
     # kernel text after boot. The dependent `unset` entries remove nixpkgs'
     # common-config assertions for options hidden when FTRACE is disabled.
+    # Keep runtime text updates outside the immutable core. Static-call
+    # trampolines remain patchable and are excluded by the range producer.
+    SUPERVM_BOOT_SEAL = yes;
+    JUMP_LABEL = lib.mkForce unset;
+    KGDB = lib.mkForce no;
+    # Optional retbleed=stuff uses lazily generated core call thunks. The
+    # immutable profile does not support it; other CPU mitigations remain enabled.
+    MITIGATION_CALL_DEPTH_TRACKING = lib.mkForce no;
     FTRACE = lib.mkForce no;
     KPROBES = lib.mkForce no;
     BPF_JIT = lib.mkForce no;

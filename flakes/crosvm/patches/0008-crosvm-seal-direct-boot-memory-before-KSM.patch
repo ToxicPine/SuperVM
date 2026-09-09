@@ -1,0 +1,602 @@
+From b368eb4ea9f2cde97ac0e31074fbac4a10804c21 Mon Sep 17 00:00:00 2001
+From: SuperVM contributors <supervm@localhost>
+Date: Wed, 9 Sep 2026 02:06:45 +0100
+Subject: [PATCH] crosvm: seal direct boot memory before enabling KSM
+
+Let Linux request a one-way seal after initialization. Stop all vCPUs,
+replace the private RAM slots with read-only registrations, protect the
+host mappings, and only then enable KSM. Reject protected writes and
+discard; terminate rather than resume after a partial seal.
+---
+ hypervisor/src/kvm/mod.rs               |  57 +++++++++++
+ hypervisor/src/lib.rs                   |  11 +++
+ src/crosvm/cmdline.rs                   |   4 +-
+ src/crosvm/sys/linux.rs                 |  25 ++---
+ src/crosvm/sys/linux/boot_memory.rs     | 122 ++++++++++++++++++++++++
+ src/crosvm/sys/linux/config.rs          |  11 +++
+ vm_control/src/device_id.rs             |   1 +
+ vm_control/src/lib.rs                   |  16 ++++
+ vm_memory/src/guest_memory.rs           |  27 ++++--
+ vm_memory/src/guest_memory/sys/linux.rs |  44 +++++++--
+ 10 files changed, 289 insertions(+), 29 deletions(-)
+ create mode 100644 src/crosvm/sys/linux/boot_memory.rs
+
+diff --git a/hypervisor/src/kvm/mod.rs b/hypervisor/src/kvm/mod.rs
+index d7e1e40..5235305 100644
+--- a/hypervisor/src/kvm/mod.rs
++++ b/hypervisor/src/kvm/mod.rs
+@@ -279,6 +279,7 @@ pub struct KvmVm {
+     mem_slot_gaps: Mutex<BinaryHeap<Reverse<MemSlot>>>,
+     caps: KvmVmCaps,
+     force_disable_readonly_mem: bool,
++    boot_sealed: std::sync::atomic::AtomicBool,
+ }
+ 
+ impl KvmVm {
+@@ -308,6 +309,7 @@ impl KvmVm {
+             mem_slot_gaps: Default::default(),
+             caps: Default::default(),
+             force_disable_readonly_mem: cfg.force_disable_readonly_mem,
++            boot_sealed: std::sync::atomic::AtomicBool::new(false),
+         };
+         vm.caps.kvmclock_ctrl = vm.check_raw_capability(KvmCap::KvmclockCtrl);
+         vm.caps.user_noncoherent_dma = vm.check_raw_capability(KvmCap::MemNoncoherentDma);
+@@ -663,6 +665,61 @@ impl Vm for KvmVm {
+         &self.guest_mem
+     }
+ 
++    fn boot_memory_sealed(&self) -> bool {
++        self.boot_sealed.load(std::sync::atomic::Ordering::Acquire)
++    }
++
++    fn seal_boot_memory(&self) -> anyhow::Result<()> {
++        anyhow::ensure!(!self.boot_memory_sealed(), "boot memory is already sealed");
++        anyhow::ensure!(
++            self.check_capability(VmCap::ReadOnlyMemoryRegion),
++            "KVM read-only memory is unavailable"
++        );
++        // These are the original, separately registered RAM slots. All guest CPU
++        // mappings must become read-only before any host mapping becomes mergeable.
++        for region in self.guest_mem.regions() {
++            if !matches!(region.backing, vm_memory::BackingObject::PrivateAnonymous) {
++                continue;
++            }
++            // SAFETY: all vCPUs are stopped by the caller. KVM requires deleting a
++            // slot before changing READONLY. Preserve its address, size and backing;
++            // a failure must terminate the VM without resuming any vCPU.
++            unsafe {
++                set_user_memory_region(
++                    self,
++                    region.index as MemSlot,
++                    false,
++                    false,
++                    MemCacheType::CacheCoherent,
++                    0,
++                    0,
++                    std::ptr::null_mut(),
++                )?;
++                set_user_memory_region(
++                    self,
++                    region.index as MemSlot,
++                    true,
++                    false,
++                    MemCacheType::CacheCoherent,
++                    region.guest_addr.offset(),
++                    region.size as u64,
++                    region.host_addr as *mut u8,
++                )
++            }?;
++        }
++        self.guest_mem.seal_private_regions()?;
++        let ranges = self
++            .guest_mem
++            .regions()
++            .filter(|r| matches!(r.backing, vm_memory::BackingObject::PrivateAnonymous))
++            .map(|r| (r.guest_addr, r.size as u64))
++            .collect::<Vec<_>>();
++        self.guest_mem.mark_mergeable_ranges(&ranges)?;
++        self.boot_sealed
++            .store(true, std::sync::atomic::Ordering::Release);
++        Ok(())
++    }
++
+     fn add_memory_region(
+         &self,
+         guest_addr: GuestAddress,
+diff --git a/hypervisor/src/lib.rs b/hypervisor/src/lib.rs
+index fd379d5..f3c3320 100644
+--- a/hypervisor/src/lib.rs
++++ b/hypervisor/src/lib.rs
+@@ -164,6 +164,17 @@ pub trait Vm: Send + Sync {
+     /// Gets the guest-mapped memory for the Vm.
+     fn get_memory(&self) -> &GuestMemory;
+ 
++    /// Permanently seals boot RAM, then permits KSM. All vCPUs must be stopped.
++    /// Unsupported hypervisors fail closed.
++    fn seal_boot_memory(&self) -> anyhow::Result<()> {
++        anyhow::bail!("boot memory sealing is unsupported")
++    }
++
++    /// True only after all boot slots and host mappings are sealed and KSM advice succeeds.
++    fn boot_memory_sealed(&self) -> bool {
++        false
++    }
++
+     /// Inserts the given `MappedRegion` into the VM's address space at `guest_addr`.
+     ///
+     /// The slot that was assigned the memory mapping is returned on success.  The slot can be given
+diff --git a/src/crosvm/cmdline.rs b/src/crosvm/cmdline.rs
+index c43be1d..5290e31 100644
+--- a/src/crosvm/cmdline.rs
++++ b/src/crosvm/cmdline.rs
+@@ -1671,8 +1671,8 @@ pub struct RunCommand {
+ 
+     #[cfg(any(target_os = "android", target_os = "linux"))]
+     #[argh(switch)]
+-    /// mark ranges selected by --private-ram-map as eligible for Linux KSM; startup fails if the
+-    /// kernel rejects MADV_MERGEABLE
++    /// seal private ranges read-only at the direct Linux boot handshake, then enable KSM.
++    /// Requires a compatible kernel; ranges remain unmerged until the handshake.
+     pub private_ram_mergeable: bool,
+ 
+     #[cfg(feature = "process-invariants")]
+diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
+index 5846e25..b15f67e 100644
+--- a/src/crosvm/sys/linux.rs
++++ b/src/crosvm/sys/linux.rs
+@@ -4,6 +4,8 @@
+ 
+ #[cfg(target_os = "android")]
+ mod android;
++#[cfg(target_arch = "x86_64")]
++mod boot_memory;
+ pub mod cmdline;
+ pub mod config;
+ mod device_helpers;
+@@ -1788,18 +1790,6 @@ fn create_guest_memory(
+     }
+     guest_mem.set_memory_policy(mem_policy);
+ 
+-    if cfg.private_ram_mergeable {
+-        let ranges = private_ranges
+-            .as_ref()
+-            .context("private RAM merging requires a private RAM map")?
+-            .iter()
+-            .map(|range| (GuestAddress(range.guest_physical_start), range.length))
+-            .collect::<Vec<_>>();
+-        guest_mem
+-            .mark_mergeable_ranges(&ranges)
+-            .context("failed to mark private guest RAM ranges mergeable")?;
+-    }
+-
+     if private_ranges.is_some() {
+         // Private RAM has no descriptor that a post-fork child could use to reconstruct the
+         // mapping. Make accidental child access fail instead of silently creating divergent COW
+@@ -2510,6 +2500,10 @@ fn run_vm(
+         })
+         .collect();
+ 
++    if cfg.private_ram_mergeable {
++        components.extra_kernel_params.push("supervm_seal".into());
++    }
++
+     let mut linux = Arch::build_vm(
+         components,
+         arch_memory_layout,
+@@ -2538,6 +2532,13 @@ fn run_vm(
+     )
+     .context("the architecture failed to build the vm")?;
+ 
++    if cfg.private_ram_mergeable {
++        #[cfg(target_arch = "x86_64")]
++        boot_memory::install(&mut linux)?;
++        #[cfg(not(target_arch = "x86_64"))]
++        bail!("boot memory sealing requires x86-64");
++    }
++
+     for tube in linux.vm_request_tubes.drain(..) {
+         add_control_tube(AnyControlTube::Vm(tube));
+     }
+diff --git a/src/crosvm/sys/linux/boot_memory.rs b/src/crosvm/sys/linux/boot_memory.rs
+new file mode 100644
+index 0000000..237ba0b
+--- /dev/null
++++ b/src/crosvm/sys/linux/boot_memory.rs
+@@ -0,0 +1,122 @@
++// Copyright 2026 The ChromiumOS Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++//! One-way direct Linux boot protocol: writable/unmerged -> sealed/mergeable.
++//! Port 0x5050 lies outside PCI I/O allocation (0xc000..0xffff); bus insertion
++//! rejects collisions with fixed devices.
++//! A compatible kernel requests sealing after mark_readonly(), before userspace.
++use std::sync::Arc;
++
++use anyhow::Context;
++use arch::RunnableLinuxVm;
++use base::{error, info, Tube};
++use devices::{BusAccessInfo, BusDevice, Suspendable};
++use hypervisor::{VmArch, VmCap};
++use sync::Mutex;
++use vm_control::{DeviceId, PlatformDeviceId, VmRequest};
++use vm_memory::BackingObject;
++
++const PORT: u64 = 0x5050;
++const REQUEST: u32 = 0x5345414c;
++const READY: u32 = 0x53564d01;
++const SEALED: u32 = 0x53564d02;
++const PENDING: u32 = 0x53564d03;
++
++struct BootMemory {
++    vm: Arc<dyn VmArch>,
++    requested: bool,
++    control: Tube,
++}
++
++fn violation(message: &str) -> ! {
++    error!("boot memory protection violation: {}", message);
++    // Continuing after a partial seal or an attempted protected write is unsafe.
++    std::process::exit(1)
++}
++
++impl BusDevice for BootMemory {
++    fn device_id(&self) -> DeviceId {
++        PlatformDeviceId::BootMemory.into()
++    }
++    fn debug_label(&self) -> String {
++        "boot-memory-seal".into()
++    }
++    fn read(&mut self, access: BusAccessInfo, data: &mut [u8]) {
++        if access.offset != 0 || data.len() != 4 {
++            violation("invalid status read");
++        }
++        let status = if self.vm.boot_memory_sealed() {
++            SEALED
++        } else if self.requested {
++            PENDING
++        } else {
++            READY
++        };
++        data.copy_from_slice(&status.to_le_bytes());
++    }
++    fn write(&mut self, access: BusAccessInfo, data: &[u8]) {
++        if access.offset != 0 || data != REQUEST.to_le_bytes() || self.requested {
++            violation("invalid or repeated seal request");
++        }
++        self.requested = true;
++        info!("boot-memory state=sealing");
++        // Do not block this vCPU waiting for a reply: the main loop must suspend it.
++        if let Err(e) = self.control.send(&VmRequest::SealBootMemory) {
++            violation(&format!("cannot request seal: {e}"));
++        }
++    }
++}
++impl Suspendable for BootMemory {}
++
++struct ProtectedBootMemory;
++impl BusDevice for ProtectedBootMemory {
++    fn device_id(&self) -> DeviceId {
++        PlatformDeviceId::BootMemory.into()
++    }
++    fn debug_label(&self) -> String {
++        "protected-boot-memory".into()
++    }
++    fn write(&mut self, access: BusAccessInfo, _data: &[u8]) {
++        violation(&format!("guest write to {:#x}", access.address));
++    }
++    fn read(&mut self, _access: BusAccessInfo, _data: &mut [u8]) {
++        violation("unexpected MMIO read from boot RAM");
++    }
++}
++impl Suspendable for ProtectedBootMemory {}
++
++pub fn install(linux: &mut RunnableLinuxVm) -> anyhow::Result<()> {
++    anyhow::ensure!(
++        linux.vm.check_capability(VmCap::ReadOnlyMemoryRegion),
++        "boot memory sealing requires KVM read-only memory"
++    );
++    info!("boot-memory state=initializing (writable, not KSM-eligible)");
++    let (control, host) = Tube::pair()?;
++    linux.vm_request_tubes.push(host);
++    linux
++        .io_bus
++        .insert(
++            Arc::new(Mutex::new(BootMemory {
++                vm: linux.vm.clone(),
++                requested: false,
++                control,
++            })),
++            PORT,
++            4,
++        )
++        .context("reserve boot memory handshake port")?;
++    for region in linux.vm.get_memory().regions() {
++        if matches!(region.backing, BackingObject::PrivateAnonymous) {
++            linux
++                .mmio_bus
++                .insert(
++                    Arc::new(Mutex::new(ProtectedBootMemory)),
++                    region.guest_addr.offset(),
++                    region.size as u64,
++                )
++                .context("install protected RAM write trap")?;
++        }
++    }
++    Ok(())
++}
+diff --git a/src/crosvm/sys/linux/config.rs b/src/crosvm/sys/linux/config.rs
+index 07cf63a..7bb90af 100644
+--- a/src/crosvm/sys/linux/config.rs
++++ b/src/crosvm/sys/linux/config.rs
+@@ -54,6 +54,17 @@ pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
+         return Err("`private-ram-mergeable` requires `private-ram-map`".to_string());
+     }
+ 
++    if cfg.private_ram_mergeable {
++        if !cfg!(target_arch = "x86_64")
++            || cfg.restore_path.is_some()
++            || !matches!(
++                cfg.executable_path,
++                Some(crate::crosvm::config::Executable::Kernel(_))
++            )
++        {
++            return Err("boot memory sealing requires a fresh x86-64 direct kernel boot".into());
++        }
++    }
+     if cfg.private_ram_map.is_some() {
+         if cfg.jail_config.is_some() {
+             return Err("`private-ram-map` requires `disable-sandbox`".to_string());
+diff --git a/vm_control/src/device_id.rs b/vm_control/src/device_id.rs
+index 5363ef2..fcdf2ce 100644
+--- a/vm_control/src/device_id.rs
++++ b/vm_control/src/device_id.rs
+@@ -30,6 +30,7 @@ pub enum PlatformDeviceId {
+     FwCfg = 23,
+     SmcccTrng = 24,
+     HvcDevicePowerManager = 25,
++    BootMemory = 26,
+     Mock = 0xff,
+ }
+ 
+diff --git a/vm_control/src/lib.rs b/vm_control/src/lib.rs
+index dd27455..bda31ac 100644
+--- a/vm_control/src/lib.rs
++++ b/vm_control/src/lib.rs
+@@ -1610,6 +1610,8 @@ pub enum VmRequest {
+     Rtc { clear_evt: Event },
+     /// Suspend the VM's VCPUs until resume.
+     SuspendVcpus,
++    /// Complete the one-way direct boot memory transition with all vCPUs stopped.
++    SealBootMemory,
+     /// Swap the memory content into files on a disk
+     Swap(SwapCommand),
+     /// Resume the VM's VCPUs that were previously suspended.
+@@ -2010,6 +2012,20 @@ impl VmRequest {
+                     VmResponse::Err(SysError::new(ENOTSUP))
+                 }
+             }
++            VmRequest::SealBootMemory => {
++                // Never drop the guard and resume a partially protected VM on failure.
++                let guard = VcpuSuspendGuard::new(&kick_vcpus, vcpu_size).unwrap_or_else(|e| {
++                    error!("cannot stop vCPUs for boot memory sealing: {e:#}");
++                    std::process::exit(1);
++                });
++                if let Err(e) = vm.seal_boot_memory() {
++                    error!("boot memory sealing failed: {e:#}");
++                    std::process::exit(1);
++                }
++                info!("boot-memory state=sealed (read-only, KSM-eligible)");
++                drop(guard);
++                VmResponse::Ok
++            }
+             VmRequest::SuspendVcpus => {
+                 if !force_s2idle {
+                     kick_vcpus(VcpuControl::RunState(VmRunMode::Suspending));
+diff --git a/vm_memory/src/guest_memory.rs b/vm_memory/src/guest_memory.rs
+index d48c6fd..25c8b93 100644
+--- a/vm_memory/src/guest_memory.rs
++++ b/vm_memory/src/guest_memory.rs
+@@ -240,6 +240,7 @@ pub struct MemoryRegion {
+     backing_offset: u64,
+ 
+     options: MemoryRegionOptions,
++    sealed: std::sync::Mutex<bool>,
+ }
+ 
+ impl MemoryRegion {
+@@ -262,6 +263,7 @@ impl MemoryRegion {
+             backing: BackingObject::Shm(shm),
+             backing_offset: offset,
+             options: Default::default(),
++            sealed: std::sync::Mutex::new(false),
+         })
+     }
+ 
+@@ -284,6 +286,7 @@ impl MemoryRegion {
+             backing: BackingObject::File(file),
+             backing_offset: offset,
+             options: Default::default(),
++            sealed: std::sync::Mutex::new(false),
+         })
+     }
+ 
+@@ -446,6 +449,7 @@ impl GuestMemory {
+                 backing,
+                 backing_offset,
+                 options: options.clone(),
++                sealed: std::sync::Mutex::new(false),
+             });
+         }
+ 
+@@ -1210,6 +1214,12 @@ impl GuestMemory {
+     /// `r` doesn't produce exactly as many bytes as needed.
+     #[deny(unsafe_op_in_unsafe_fn)]
+     pub unsafe fn restore<T: Read>(&self, metadata: AnySnapshot, r: &mut T) -> anyhow::Result<()> {
++        anyhow::ensure!(
++            self.regions
++                .iter()
++                .all(|region| !*region.sealed.lock().unwrap()),
++            "cannot restore over sealed boot memory"
++        );
+         let metadata: MemorySnapshotMetadata = AnySnapshot::from_any(metadata)?;
+ 
+         let mut r: Box<dyn Read> = if metadata.compressed {
+@@ -1502,23 +1512,23 @@ mod tests {
+ 
+     #[cfg(any(target_os = "android", target_os = "linux"))]
+     #[test]
+-    fn private_memory_range_can_be_discarded() {
++    fn private_boot_memory_rejects_discard() {
+         let page_size = pagesize() as u64;
+         let gm =
+             GuestMemory::new_with_options(&[(GuestAddress(0), page_size, private_ram())]).unwrap();
+         let address = GuestAddress(64);
+ 
+         gm.write_all_at_addr(&[1, 2, 3, 4], address).unwrap();
+-        gm.remove_range(GuestAddress(0), page_size).unwrap();
++        assert!(gm.remove_range(GuestAddress(0), page_size).is_err());
+ 
+         let mut value = [0xff; 4];
+         gm.read_exact_at_addr(&mut value, address).unwrap();
+-        assert_eq!(value, [0; 4]);
++        assert_eq!(value, [1, 2, 3, 4]);
+     }
+ 
+     #[cfg(any(target_os = "android", target_os = "linux"))]
+     #[test]
+-    fn range_spanning_shared_and_private_memory_can_be_discarded() {
++    fn mixed_discard_fails_without_changing_either_region() {
+         let page_size = pagesize() as u64;
+         let gm = GuestMemory::new_with_options(&[
+             (GuestAddress(0), page_size, MemoryRegionOptions::new()),
+@@ -1530,7 +1540,7 @@ mod tests {
+ 
+         gm.write_all_at_addr(&[1; 4], shared_address).unwrap();
+         gm.write_all_at_addr(&[2; 4], private_address).unwrap();
+-        gm.remove_range(GuestAddress(0), page_size * 2).unwrap();
++        assert!(gm.remove_range(GuestAddress(0), page_size * 2).is_err());
+ 
+         let mut shared_value = [0xff; 4];
+         let mut private_value = [0xff; 4];
+@@ -1538,8 +1548,8 @@ mod tests {
+             .unwrap();
+         gm.read_exact_at_addr(&mut private_value, private_address)
+             .unwrap();
+-        assert_eq!(shared_value, [0; 4]);
+-        assert_eq!(private_value, [0; 4]);
++        assert_eq!(shared_value, [1; 4]);
++        assert_eq!(private_value, [2; 4]);
+     }
+ 
+     #[cfg(any(target_os = "android", target_os = "linux"))]
+@@ -1549,6 +1559,7 @@ mod tests {
+         let gm = GuestMemory::new_with_options(&[(GuestAddress(0), page_size * 2, private_ram())])
+             .unwrap();
+ 
++        gm.seal_private_regions().unwrap();
+         gm.mark_mergeable_ranges(&[(GuestAddress(0), page_size)])
+             .unwrap();
+         assert!(gm
+@@ -1569,6 +1580,7 @@ mod tests {
+             (GuestAddress(page_size), page_size, private_ram()),
+         ])
+         .unwrap();
++        split.seal_private_regions().unwrap();
+         split
+             .mark_mergeable_ranges(&[(GuestAddress(0), page_size * 2)])
+             .unwrap();
+@@ -1626,6 +1638,7 @@ mod tests {
+             .is_err());
+         assert!(!vm_flags(second_page).iter().any(|flag| flag == "mg"));
+ 
++        gm.seal_private_regions().unwrap();
+         gm.mark_mergeable_ranges(&[(GuestAddress(page_size as u64), page_size as u64)])
+             .unwrap();
+ 
+diff --git a/vm_memory/src/guest_memory/sys/linux.rs b/vm_memory/src/guest_memory/sys/linux.rs
+index 52ba921..10bd64b 100644
+--- a/vm_memory/src/guest_memory/sys/linux.rs
++++ b/vm_memory/src/guest_memory/sys/linux.rs
+@@ -56,6 +56,33 @@ pub(crate) fn create_private_anonymous_mapping(
+ }
+ 
+ impl GuestMemory {
++    /// Seal the host mapping as well as the discard path. The caller must first
++    /// make every corresponding KVM slot read-only. There is no unseal operation.
++    pub fn seal_private_regions(&self) -> anyhow::Result<()> {
++        for region in self.regions.iter() {
++            if !matches!(region.backing, BackingObject::PrivateAnonymous) {
++                continue;
++            }
++            let mut sealed = region.sealed.lock().unwrap();
++            if *sealed {
++                continue;
++            }
++            // SAFETY: the mapping owns this page-aligned range for its entire lifetime.
++            let result = unsafe {
++                libc::mprotect(
++                    region.mapping.as_ptr().cast(),
++                    region.mapping.size(),
++                    libc::PROT_READ,
++                )
++            };
++            if result != 0 {
++                return Err(std::io::Error::last_os_error().into());
++            }
++            *sealed = true;
++        }
++        Ok(())
++    }
++
+     /// Marks page-aligned guest-physical ranges as eligible for KSM.
+     ///
+     /// Every range is resolved and validated before any mapping is changed. If applying the advice
+@@ -83,6 +110,9 @@ impl GuestMemory {
+                     return Err(Error::MemoryRegionNotPrivateAnonymous);
+                 }
+ 
++                if !*region.sealed.lock().unwrap() {
++                    return Err(Error::InvalidGuestRange(addr, count));
++                }
+                 let chunk_end = std::cmp::min(region.end(), end);
+                 let offset = usize::try_from(current.offset_from(region.start()))
+                     .map_err(|_| Error::InvalidGuestRange(addr, count))?;
+@@ -120,6 +150,10 @@ impl GuestMemory {
+                 .iter()
+                 .find(|region| region.contains(current))
+                 .ok_or(Error::InvalidGuestRange(addr, count))?;
++            // Boot image pages are never reclaimable, including during the seal transition.
++            if matches!(region.backing, BackingObject::PrivateAnonymous) {
++                return Err(Error::InvalidGuestRange(addr, count));
++            }
+             let chunk_end = std::cmp::min(region.end(), end);
+             let offset = usize::try_from(current.offset_from(region.guest_base))
+                 .map_err(|_| Error::InvalidGuestRange(addr, count))?;
+@@ -130,14 +164,6 @@ impl GuestMemory {
+         }
+ 
+         for (region, chunk_addr, offset, size) in resolved {
+-            if matches!(&region.backing, BackingObject::PrivateAnonymous) {
+-                region
+-                    .mapping
+-                    .madvise_dontneed(offset, size)
+-                    .map_err(|error| Error::MemoryAccess(chunk_addr, error))?;
+-                continue;
+-            }
+-
+             // TODO: It is likely we could use fallocate for everything because, in the kernel,
+             // MADV_REMOVE mostly just delegates to FALLOC_FL_PUNCH_HOLE internally.
+             if self.use_punchhole_locked() {
+@@ -266,6 +292,8 @@ impl MemoryRegion {
+     }
+ 
+     pub(crate) fn zero_range(&self, offset: usize, size: usize) -> anyhow::Result<()> {
++        let sealed = self.sealed.lock().unwrap();
++        anyhow::ensure!(!*sealed, "cannot zero sealed boot memory");
+         if matches!(&self.backing, BackingObject::PrivateAnonymous) {
+             self.mapping.madvise_dontneed(offset, size)?;
+         } else {
+-- 
+2.54.0
+
