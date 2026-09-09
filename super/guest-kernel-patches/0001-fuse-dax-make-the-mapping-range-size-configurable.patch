@@ -1,20 +1,9 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arbion Halili <a.halili@protonmail.com>
-Date: Sun, 6 Sep 2026 03:30:00 +0100
-Subject: [PATCH] fuse: dax: make the mapping range size configurable
+Subject: [PATCH] fuse: make the DAX mapping range size configurable
 
-The DAX window is carved into fixed 2 MiB ranges and a file occupies at
-least one, so a guest mapping many small files needs a window many
-times larger than the data: one system held 566 ranges, 1.1 GiB of
-window, for 53 MiB of files. The window is backed by a struct page per
-4 KiB at mount, 16 MiB of guest RAM per GiB, whether used or not.
-
-Expose the range size as CONFIG_FUSE_DAX_SHIFT so such guests can pick a
-smaller range and fit the same working set into a much smaller window.
-The default stays at 21. The range must still be at least the server's
-map_alignment, which fuse_dax_check_alignment() already verifies. Ranges
-below 2 MiB map with PTEs only; the PMD fault path already falls back
-when the iomap extent is shorter than PMD_SIZE.
+Expose CONFIG_FUSE_DAX_SHIFT so small files need not occupy 2 MiB ranges.
+Keep the default at 21 and retain the server alignment check. Smaller
+ranges use PTE mappings through the existing PMD fallback.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 ---

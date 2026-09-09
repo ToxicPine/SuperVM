@@ -1,48 +1,34 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arbion Halili <a.halili@protonmail.com>
-Date: Sun, 6 Sep 2026 03:00:00 +0100
-Subject: [PATCH] feat(castore/fs): make the DAX window size configurable
+Subject: [PATCH] castore: make the DAX window size configurable
 
-The virtio-fs backend advertised a fixed 8 GiB DAX window. Linux backs
-the whole window with a struct page per 4 KiB at mount, so that costs
-every guest 128 MiB of private RAM before a file is mapped.
-
-Take the size from the caller: `start_virtiofs_daemon` receives
-`Option<u64>`, and both virtio-fs commands gain `--dax-window-size BYTES`
-(default 1 GiB). The value must be a non-zero multiple of the 2 MiB range
-the FUSE client carves the window into; `validate_dax_window_size`
-rejects anything else at start. The guest reclaims idle ranges when the
-window fills, so it needs to cover the mapped working set, not the store.
+Accept a window size in both virtio-fs commands, defaulting to 1 GiB.
+Require a non-zero multiple of 2 MiB for Linux DAX compatibility. Snix
+advertises capacity; the guest controls mapping granularity, metadata
+allocation, and reclamation.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 ---
 diff --git a/snix/castore/src/fs/virtiofs.rs b/snix/castore/src/fs/virtiofs.rs
-index 64e7653..120ac7d 100644
+index 64e7653..20d0901 100644
 --- a/snix/castore/src/fs/virtiofs.rs
 +++ b/snix/castore/src/fs/virtiofs.rs
-@@ -34,7 +34,28 @@ const QUEUE_SIZE: usize = 32_768;
+@@ -34,7 +34,22 @@ const QUEUE_SIZE: usize = 32_768;
  const VIRTIO_FS_TAG_LEN: usize = 36;
  const VIRTIO_FS_CONFIG_LEN: usize = VIRTIO_FS_TAG_LEN + size_of::<u32>();
  const VIRTIO_FS_SHMCAP_ID_CACHE: u8 = 0;
 -const DAX_WINDOW_SIZE: u64 = 1 << 33;
 +
-+/// Granularity at which the Linux FUSE client carves the DAX window into
-+/// mapping ranges (`FUSE_DAX_SHIFT`). A window that is not a multiple of it
-+/// leaves an unusable tail.
-+pub const DAX_RANGE_SIZE: u64 = 1 << 21;
++/// Window alignment compatible with Linux DAX memory subsections and the
++/// default FUSE mapping range. The guest chooses its actual mapping granularity.
++const DAX_WINDOW_ALIGNMENT: u64 = 1 << 21;
 +
-+/// Reject a DAX window the guest cannot use in full.
-+///
-+/// The window is not free for the guest: Linux backs the whole cache region
-+/// with `struct page` entries when it sets up the device, at 64 bytes per 4 KiB
-+/// page, so every GiB of window costs the guest 16 MiB of RAM whether or not
-+/// anything is ever mapped into it. Callers should therefore size the window
-+/// to the working set they expect to map, not to the size of the store.
++/// Validate the advertised window; mapping allocation and metadata belong to
++/// the guest kernel. Size the window for concurrent mappings, not the store.
 +pub fn validate_dax_window_size(size: u64) -> io::Result<u64> {
-+    if size == 0 || size % DAX_RANGE_SIZE != 0 {
++    if size == 0 || size % DAX_WINDOW_ALIGNMENT != 0 {
 +        return Err(io::Error::new(
 +            io::ErrorKind::InvalidInput,
-+            format!("DAX window size must be a non-zero multiple of {DAX_RANGE_SIZE} bytes"),
++            format!("DAX window size must be a non-zero multiple of {DAX_WINDOW_ALIGNMENT} bytes"),
 +        ));
 +    }
 +    Ok(size)
@@ -50,7 +36,7 @@ index 64e7653..120ac7d 100644
  
  fn device_config(tag: &str) -> io::Result<[u8; VIRTIO_FS_CONFIG_LEN]> {
      if tag.len() > VIRTIO_FS_TAG_LEN {
-@@ -353,11 +374,16 @@ where
+@@ -353,11 +368,16 @@ where
      }
  }
  
@@ -68,7 +54,7 @@ index 64e7653..120ac7d 100644
  ) -> io::Result<()>
  where
      FS: FileSystem + Send + Sync + 'static,
-@@ -365,6 +391,7 @@ where
+@@ -365,6 +385,7 @@ where
  {
      let guest_mem = GuestMemoryAtomic::new(GuestMemoryMmap::new());
      let config = device_config(tag)?;
@@ -76,7 +62,7 @@ index 64e7653..120ac7d 100644
  
      let server = Arc::new(fuse_backend_rs::api::server::Server::new(Arc::new(fs)));
  
-@@ -373,7 +400,7 @@ where
+@@ -373,7 +394,7 @@ where
          guest_mem: guest_mem.clone(),
          event_idx: false,
          config,
@@ -86,28 +72,24 @@ index 64e7653..120ac7d 100644
      }));
  
 diff --git a/snix/cli/castore/src/main.rs b/snix/cli/castore/src/main.rs
-index ea29ad8..bfc40ad 100644
+index ea29ad8..bf526a3 100644
 --- a/snix/cli/castore/src/main.rs
 +++ b/snix/cli/castore/src/main.rs
-@@ -110,6 +110,17 @@ enum Commands {
+@@ -110,6 +110,13 @@ enum Commands {
          /// ordinary reads.
          #[clap(long, value_name = "PATH")]
          dax_backing_dir: Option<PathBuf>,
 +
-+        /// Size in bytes of the DAX window advertised to the VMM, when
-+        /// `--dax-backing-dir` is set. Must be a multiple of 2 MiB, the
-+        /// granularity at which the guest maps files into it.
-+        ///
-+        /// The window costs the guest RAM even while empty: Linux allocates a
-+        /// `struct page` for every 4 KiB of it, 16 MiB per GiB of window. Size
-+        /// it to the working set the guest maps at once; the guest reclaims
-+        /// idle mappings when it runs out of window.
++        /// Size in bytes of the DAX window advertised to the VMM when
++        /// `--dax-backing-dir` is set. Must be a non-zero multiple of 2 MiB.
++        /// Size it for concurrent mappings; the guest kernel controls mapping
++        /// granularity, metadata allocation, and reclamation.
 +        #[clap(long, value_name = "BYTES", default_value_t = 1 << 30)]
 +        dax_window_size: u64,
      },
  
      #[cfg(feature = "virtiofs")]
-@@ -302,6 +313,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+@@ -302,6 +309,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
              show_xattr,
              tag,
              dax_backing_dir,
@@ -115,7 +97,7 @@ index ea29ad8..bfc40ad 100644
          } => {
              let (blob_service, directory_service) =
                  snix_castore::utils::construct_services(service_addrs).await?;
-@@ -334,7 +346,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+@@ -334,7 +342,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                      tokio::runtime::Handle::current(),
                  );
  
@@ -124,7 +106,7 @@ index ea29ad8..bfc40ad 100644
                  let fs = match dax_backing_dir {
                      Some(dir) => {
                          tracing::info!(dax_backing_dir=?dir, "serving DAX mappings");
-@@ -353,7 +365,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+@@ -353,7 +361,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
  
                  tracing::info!(socket_path=?socket, "starting virtiofs-daemon");
  
@@ -134,28 +116,24 @@ index ea29ad8..bfc40ad 100644
              .await??;
          }
 diff --git a/snix/cli/store/src/main.rs b/snix/cli/store/src/main.rs
-index 653064e..bedab49 100644
+index 653064e..2e90deb 100644
 --- a/snix/cli/store/src/main.rs
 +++ b/snix/cli/store/src/main.rs
-@@ -221,6 +221,17 @@ enum Commands {
+@@ -221,6 +221,13 @@ enum Commands {
          /// ordinary reads.
          #[clap(long, value_name = "PATH")]
          dax_backing_dir: Option<PathBuf>,
 +
-+        /// Size in bytes of the DAX window advertised to the VMM, when
-+        /// `--dax-backing-dir` is set. Must be a multiple of 2 MiB, the
-+        /// granularity at which the guest maps files into it.
-+        ///
-+        /// The window costs the guest RAM even while empty: Linux allocates a
-+        /// `struct page` for every 4 KiB of it, 16 MiB per GiB of window. Size
-+        /// it to the working set the guest maps at once; the guest reclaims
-+        /// idle mappings when it runs out of window.
++        /// Size in bytes of the DAX window advertised to the VMM when
++        /// `--dax-backing-dir` is set. Must be a non-zero multiple of 2 MiB.
++        /// Size it for concurrent mappings; the guest kernel controls mapping
++        /// granularity, metadata allocation, and reclamation.
 +        #[clap(long, value_name = "BYTES", default_value_t = 1 << 30)]
 +        dax_window_size: u64,
      },
      /// Builds a shared metadata index over the store's root paths.
      ///
-@@ -721,6 +732,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+@@ -721,6 +728,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
              show_xattr,
              tag,
              dax_backing_dir,
@@ -163,7 +141,7 @@ index 653064e..bedab49 100644
          } => {
              let (blob_service, directory_service, path_info_service, _nar_calculation_service) =
                  snix_store::utils::construct_services(service_addrs).await?;
-@@ -743,7 +755,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+@@ -743,7 +751,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                  tokio::runtime::Handle::current(),
              );
  
@@ -172,7 +150,7 @@ index 653064e..bedab49 100644
              let fs = match dax_backing_dir {
                  Some(dir) => {
                      info!(dax_backing_dir=?dir, "serving DAX mappings");
-@@ -765,7 +777,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+@@ -765,7 +773,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
              tokio::task::spawn_blocking(move || {
                  info!(socket_path=?socket, "starting virtiofs-daemon");
  
